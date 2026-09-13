@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+default-members = ["apps/client"]
+members = ["apps/*", "crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ChaoswareHQ/chaos"
+readme = "README.md"
+rust-version = "1.98.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+mimalloc = "0.1.52"
+windows = "0.62.2"
+zerocopy = { version = "0.8.57", features = ["derive"] }
