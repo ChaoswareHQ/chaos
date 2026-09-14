@@ -9,3 +9,15 @@ pub mod process;
 pub mod registry;
 pub mod rule;
 pub mod value;
+
+pub use alert::{Alert, AlertId, Severity};
+pub use dns::DnsQuery;
+pub use error::ModelError;
+pub use event::{EventId, Payload, ProviderId, RawEvent, TelemetryEvent};
+pub use file::{FileAction, FileEvent};
+pub use host::{Host, HostId};
+pub use network::{NetworkConnection, NetworkProtocol};
+pub use process::{Process, ProcessId};
+pub use registry::{RegistryAction, RegistryEvent};
+pub use rule::{Rule, RuleId};
+pub use value::Value;
