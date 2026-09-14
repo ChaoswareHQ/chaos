@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 pub mod callback;
 pub mod descriptor;
 pub mod error;

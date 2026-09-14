@@ -8,8 +8,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Etw",
 ] }
-zerocopy.workspace = true
