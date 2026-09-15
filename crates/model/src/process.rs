@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 pub struct ProcessId(u32);
 
 impl ProcessId {
+    #[inline]
     pub fn new(n: u32) -> Self {
         Self(n)
     }
+
+    #[inline]
     pub fn as_u32(&self) -> u32 {
         self.0
     }
@@ -17,9 +20,9 @@ impl ProcessId {
 pub struct Process {
     pub pid: ProcessId,
     pub parent_pid: Option<ProcessId>,
-    pub executable: Option<String>,
-    pub command_line: Option<String>,
-    pub user: Option<String>,
-    pub working_directory: Option<String>,
+    pub executable: Option<Box<str>>,
+    pub command_line: Option<Box<str>>,
+    pub user: Option<Box<str>>,
+    pub working_directory: Option<Box<str>>,
     pub started_at: Option<DateTime<Utc>>,
 }

@@ -7,7 +7,10 @@ pub enum ModelError {
     EmptyField { field: &'static str },
 
     #[error("field `{field}` has invalid value: {value}")]
-    InvalidValue { field: &'static str, value: String },
+    InvalidValue {
+        field: &'static str,
+        value: Box<str>,
+    },
 
     #[error("timestamp {0} is in the future")]
     TimestampInFuture(DateTime<Utc>),

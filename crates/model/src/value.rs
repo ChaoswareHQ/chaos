@@ -1,7 +1,9 @@
+use indexmap::IndexMap;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeMap;
 use std::fmt;
+
+pub type Map = IndexMap<Box<str>, Value>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -10,9 +12,9 @@ pub enum Value {
     Int(i64),
     Uint(u64),
     Float(f64),
-    String(String),
+    String(Box<str>),
     Array(Vec<Value>),
-    Object(BTreeMap<String, Value>),
+    Object(Map),
 }
 
 impl Value {
@@ -32,7 +34,7 @@ impl Value {
     #[inline]
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::String(s) => Some(s.as_str()),
+            Value::String(s) => Some(s),
             _ => None,
         }
     }
@@ -82,7 +84,7 @@ impl Value {
     }
 
     #[inline]
-    pub fn as_object(&self) -> Option<&BTreeMap<String, Value>> {
+    pub fn as_object(&self) -> Option<&Map> {
         match self {
             Value::Object(o) => Some(o),
             _ => None,
@@ -90,7 +92,7 @@ impl Value {
     }
 
     #[inline]
-    pub fn as_object_mut(&mut self) -> Option<&mut BTreeMap<String, Value>> {
+    pub fn as_object_mut(&mut self) -> Option<&mut Map> {
         match self {
             Value::Object(o) => Some(o),
             _ => None,
@@ -201,13 +203,19 @@ impl From<f32> for Value {
 impl From<String> for Value {
     #[inline]
     fn from(v: String) -> Self {
-        Value::String(v)
+        Value::String(v.into_boxed_str())
     }
 }
 impl From<&str> for Value {
     #[inline]
     fn from(v: &str) -> Self {
-        Value::String(v.to_owned())
+        Value::String(v.into())
+    }
+}
+impl From<Box<str>> for Value {
+    #[inline]
+    fn from(v: Box<str>) -> Self {
+        Value::String(v)
     }
 }
 impl From<Vec<Value>> for Value {
@@ -216,9 +224,9 @@ impl From<Vec<Value>> for Value {
         Value::Array(v)
     }
 }
-impl From<BTreeMap<String, Value>> for Value {
+impl From<Map> for Value {
     #[inline]
-    fn from(v: BTreeMap<String, Value>) -> Self {
+    fn from(v: Map) -> Self {
         Value::Object(v)
     }
 }
@@ -370,16 +378,16 @@ impl<'de> Deserialize<'de> for Value {
             #[inline]
             fn visit_char<E>(self, v: char) -> Result<Value, E> {
                 let mut buf = [0u8; 4];
-                Ok(Value::String(v.encode_utf8(&mut buf).to_owned()))
+                Ok(Value::String(v.encode_utf8(&mut buf).into()))
             }
 
             #[inline]
             fn visit_str<E>(self, v: &str) -> Result<Value, E> {
-                Ok(Value::String(v.to_owned()))
+                Ok(Value::String(v.into()))
             }
             #[inline]
             fn visit_string<E>(self, v: String) -> Result<Value, E> {
-                Ok(Value::String(v))
+                Ok(Value::String(v.into_boxed_str()))
             }
 
             #[inline]
@@ -388,7 +396,7 @@ impl<'de> Deserialize<'de> for Value {
                 E: de::Error,
             {
                 match std::str::from_utf8(v) {
-                    Ok(s) => Ok(Value::String(s.to_owned())),
+                    Ok(s) => Ok(Value::String(s.into())),
                     Err(e) => Err(E::custom(e)),
                 }
             }
@@ -398,7 +406,7 @@ impl<'de> Deserialize<'de> for Value {
                 E: de::Error,
             {
                 match String::from_utf8(v) {
-                    Ok(s) => Ok(Value::String(s)),
+                    Ok(s) => Ok(Value::String(s.into_boxed_str())),
                     Err(e) => Err(E::custom(e)),
                 }
             }
@@ -442,8 +450,8 @@ impl<'de> Deserialize<'de> for Value {
             where
                 A: MapAccess<'de>,
             {
-                let mut obj = BTreeMap::new();
-                while let Some((k, val)) = map.next_entry::<String, Value>()? {
+                let mut obj = Map::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((k, val)) = map.next_entry::<Box<str>, Value>()? {
                     obj.insert(k, val);
                 }
                 Ok(Value::Object(obj))

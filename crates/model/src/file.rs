@@ -1,4 +1,6 @@
+use crate::process::Process;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,9 +18,9 @@ pub enum FileAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEvent {
     pub action: FileAction,
-    pub path: String,
-    pub new_path: Option<String>,
-    pub process: Option<super::process::Process>,
+    pub path: Box<str>,
+    pub new_path: Option<Box<str>>,
+    pub process: Option<Arc<Process>>,
     pub size: Option<u64>,
-    pub hash: Option<String>,
+    pub hash: Option<Box<str>>,
 }

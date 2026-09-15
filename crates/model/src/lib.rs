@@ -20,4 +20,4 @@ pub use network::{NetworkConnection, NetworkProtocol};
 pub use process::{Process, ProcessId};
 pub use registry::{RegistryAction, RegistryEvent};
 pub use rule::{Rule, RuleId};
-pub use value::Value;
+pub use value::{Map, Value};
