@@ -1,7 +1,13 @@
 [workspace]
 resolver = "3"
 default-members = ["apps/client"]
-members = ["apps/*", "crates/*"]
+members = [
+    "apps/*",
+    "crates/adapters/*",
+    "crates/config",
+    "crates/model",
+    "crates/ports",
+]
 
 [workspace.package]
 edition = "2024"
@@ -12,6 +18,9 @@ rust-version = "1.98.0"
 version = "0.1.0"
 
 [workspace.dependencies]
+ebpf = { path = "crates/adapters/ebpf" }
+es = { path = "crates/adapters/es" }
+etw = { path = "crates/adapters/etw" }
 model = { path = "crates/model" }
 
 crossbeam-channel = "0.5.17"

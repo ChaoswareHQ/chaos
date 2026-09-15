@@ -30,6 +30,24 @@ pub struct Host {
     pub labels: crate::value::Map,
 }
 
+impl Host {
+    pub fn new(id: HostId, hostname: Box<str>, os: OperatingSystem, now: DateTime<Utc>) -> Self {
+        Self {
+            id,
+            hostname,
+            os,
+            first_seen: now,
+            last_seen: now,
+            labels: crate::value::Map::new(),
+        }
+    }
+
+    #[inline]
+    pub fn touch(&mut self, now: DateTime<Utc>) {
+        self.last_seen = now;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OperatingSystem {
     Windows,

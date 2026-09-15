@@ -6,12 +6,12 @@ pub struct ProcessId(u32);
 
 impl ProcessId {
     #[inline]
-    pub fn new(n: u32) -> Self {
+    pub const fn new(n: u32) -> Self {
         Self(n)
     }
 
     #[inline]
-    pub fn as_u32(&self) -> u32 {
+    pub const fn as_u32(&self) -> u32 {
         self.0
     }
 }

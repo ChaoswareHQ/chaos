@@ -1,7 +1,4 @@
-use crate::EventId;
-use crate::HostId;
-use crate::ModelError;
-use crate::RuleId;
+use crate::{EventId, HostId, ModelError, RuleId, Severity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -23,14 +20,20 @@ impl AlertId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Severity {
-    Info,
-    Low,
-    Medium,
-    High,
-    Critical,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertStatus {
+    New,
+    Investigating,
+    Closed,
+    FalsePositive,
+}
+
+impl Default for AlertStatus {
+    #[inline]
+    fn default() -> Self {
+        AlertStatus::New
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,4 +47,40 @@ pub struct Alert {
     pub host: HostId,
     pub events: Vec<EventId>,
     pub mitre_techniques: Vec<Box<str>>,
+    #[serde(default)]
+    pub status: AlertStatus,
+}
+
+impl Alert {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: AlertId,
+        rule_id: RuleId,
+        title: Box<str>,
+        description: Box<str>,
+        severity: Severity,
+        timestamp: DateTime<Utc>,
+        host: HostId,
+        events: Vec<EventId>,
+        mitre_techniques: Vec<Box<str>>,
+    ) -> Self {
+        Self {
+            id,
+            rule_id,
+            title,
+            description,
+            severity,
+            timestamp,
+            host,
+            events,
+            mitre_techniques,
+            status: AlertStatus::New,
+        }
+    }
+
+    #[inline]
+    pub fn with_status(mut self, status: AlertStatus) -> Self {
+        self.status = status;
+        self
+    }
 }

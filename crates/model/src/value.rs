@@ -150,6 +150,80 @@ impl Value {
             Value::Object(_) => "object",
         }
     }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        self.write_canonical(&mut out);
+        out
+    }
+
+    fn write_canonical(&self, out: &mut Vec<u8>) {
+        match self {
+            Value::Null => out.extend_from_slice(b"null"),
+            Value::Bool(true) => out.extend_from_slice(b"true"),
+            Value::Bool(false) => out.extend_from_slice(b"false"),
+            Value::Int(i) => out.extend_from_slice(i.to_string().as_bytes()),
+            Value::Uint(u) => out.extend_from_slice(u.to_string().as_bytes()),
+            Value::Float(f) => out.extend_from_slice(format!("{f:?}").as_bytes()),
+            Value::String(s) => write_json_str(out, s),
+            Value::Array(a) => {
+                out.push(b'[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    v.write_canonical(out);
+                }
+                out.push(b']');
+            }
+            Value::Object(o) => {
+                let mut keys: Vec<&Box<str>> = o.keys().collect();
+                keys.sort();
+                out.push(b'{');
+                for (i, k) in keys.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    write_json_str(out, k);
+                    out.push(b':');
+                    if let Some(v) = o.get(k.as_ref()) {
+                        v.write_canonical(out);
+                    }
+                }
+                out.push(b'}');
+            }
+        }
+    }
+}
+
+fn write_json_str(out: &mut Vec<u8>, s: &str) {
+    out.push(b'"');
+    for b in s.bytes() {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0C => out.extend_from_slice(b"\\f"),
+            0x00..=0x1F => {
+                out.extend_from_slice(b"\\u00");
+                out.push(hex_digit(b >> 4));
+                out.push(hex_digit(b & 0x0F));
+            }
+            _ => out.push(b),
+        }
+    }
+    out.push(b'"');
+}
+
+#[inline]
+fn hex_digit(n: u8) -> u8 {
+    match n {
+        0..=9 => b'0' + n,
+        _ => b'a' + (n - 10),
+    }
 }
 
 impl From<bool> for Value {
@@ -459,5 +533,66 @@ impl<'de> Deserialize<'de> for Value {
         }
 
         d.deserialize_any(ValueVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_bytes_stable_under_reorder() {
+        let mut m1 = Map::new();
+        m1.insert("b".into(), Value::Int(2));
+        m1.insert("a".into(), Value::Int(1));
+
+        let mut m2 = Map::new();
+        m2.insert("a".into(), Value::Int(1));
+        m2.insert("b".into(), Value::Int(2));
+
+        let v1 = Value::Object(m1);
+        let v2 = Value::Object(m2);
+
+        assert_eq!(v1.canonical_bytes(), v2.canonical_bytes());
+    }
+
+    #[test]
+    fn canonical_bytes_distinguishes_float_and_int() {
+        let i = Value::Int(1);
+        let f = Value::Float(1.0);
+        assert_ne!(i.canonical_bytes(), f.canonical_bytes());
+    }
+
+    #[test]
+    fn canonical_bytes_escapes_strings() {
+        let v = Value::String("a\"b\\c\n".into());
+        let b = v.canonical_bytes();
+        assert_eq!(b, b"\"a\\\"b\\\\c\\n\"");
+    }
+
+    #[test]
+    fn roundtrip_nested() {
+        let src = r#"{"a":[1,2,3],"b":{"c":"x"},"d":null}"#;
+        let v: Value = serde_json::from_str(src).unwrap();
+        assert_eq!(v.get_ref("a").unwrap().as_array().unwrap().len(), 3);
+        assert_eq!(
+            v.get_ref("b").unwrap().get_ref("c").unwrap().as_str(),
+            Some("x")
+        );
+        assert!(v.get_ref("d").unwrap().is_null());
+    }
+
+    #[test]
+    fn u64_above_i64_max() {
+        let big = u64::MAX;
+        let src = format!("{{\"n\":{big}}}");
+        let v: Value = serde_json::from_str(&src).unwrap();
+        assert_eq!(v.get_ref("n").unwrap().as_u64(), Some(big));
+    }
+
+    #[test]
+    fn float_stays_float() {
+        let v: Value = serde_json::from_str("1.0").unwrap();
+        assert!(matches!(v, Value::Float(_)));
     }
 }

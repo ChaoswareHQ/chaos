@@ -1,4 +1,4 @@
-use crate::ModelError;
+use crate::{ModelError, Severity};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,7 +24,7 @@ pub struct Rule {
     pub id: RuleId,
     pub title: Box<str>,
     pub description: Box<str>,
-    pub severity: super::alert::Severity,
+    pub severity: Severity,
     pub mitre_techniques: Vec<Box<str>>,
     pub sigma_yaml: Option<Box<str>>,
     pub enabled: bool,

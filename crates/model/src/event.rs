@@ -1,10 +1,11 @@
-use crate::HostId;
-use crate::ModelError;
-use crate::Value;
+use crate::{HostId, ModelError, Value};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::sync::Arc;
+
+pub const CURRENT_SCHEMA_VERSION: u16 = 1;
+pub const MAX_PAYLOAD_SIZE: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProviderId(Arc<str>);
@@ -26,17 +27,15 @@ pub struct EventId(u64);
 
 impl EventId {
     #[inline]
-    pub fn new(n: u64) -> Self {
+    pub const fn new(n: u64) -> Self {
         Self(n)
     }
 
     #[inline]
-    pub fn as_u64(&self) -> u64 {
+    pub const fn as_u64(&self) -> u64 {
         self.0
     }
 }
-
-pub const MAX_PAYLOAD_SIZE: usize = 65_536;
 
 struct LimitedCounter {
     written: usize,
@@ -65,7 +64,7 @@ impl Write for LimitedCounter {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Payload {
     value: Value,
-    size: usize,
+    value_size: usize,
 }
 
 impl Payload {
@@ -89,7 +88,7 @@ impl Payload {
         })?;
         Ok(Self {
             value,
-            size: counter.written,
+            value_size: counter.written,
         })
     }
 
@@ -99,8 +98,13 @@ impl Payload {
     }
 
     #[inline]
-    pub fn size(&self) -> usize {
-        self.size
+    pub fn into_value(self) -> Value {
+        self.value
+    }
+
+    #[inline]
+    pub fn value_size(&self) -> usize {
+        self.value_size
     }
 }
 
@@ -128,11 +132,66 @@ pub struct TelemetryEvent {
     pub id: EventId,
     pub host: HostId,
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub received_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u16,
     pub source: EventSource,
     pub provider: ProviderId,
     pub event_id: u16,
     pub pid: u32,
     pub tid: u32,
     pub level: u8,
+    pub kind: crate::kind::EventKind,
     pub payload: Payload,
+}
+
+impl TelemetryEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: EventId,
+        host: HostId,
+        timestamp: DateTime<Utc>,
+        source: EventSource,
+        provider: ProviderId,
+        event_id: u16,
+        pid: u32,
+        tid: u32,
+        level: u8,
+        kind: crate::kind::EventKind,
+        payload: Payload,
+    ) -> Self {
+        Self {
+            id,
+            host,
+            timestamp,
+            received_at: None,
+            schema_version: CURRENT_SCHEMA_VERSION,
+            source,
+            provider,
+            event_id,
+            pid,
+            tid,
+            level,
+            kind,
+            payload,
+        }
+    }
+
+    #[inline]
+    pub fn with_received_at(mut self, ts: DateTime<Utc>) -> Self {
+        self.received_at = Some(ts);
+        self
+    }
+
+    #[inline]
+    pub fn with_schema_version(mut self, v: u16) -> Self {
+        self.schema_version = v;
+        self
+    }
+}
+
+#[inline]
+fn default_schema_version() -> u16 {
+    CURRENT_SCHEMA_VERSION
 }
