@@ -1,5 +1,6 @@
 [package]
 name = "client"
+description = "Chaos endpoint agent: collects telemetry and runs the detection pipeline."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -7,9 +8,12 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[[bin]]
-name = "Chaos"
-path = "src/main.rs"
-
 [dependencies]
 mimalloc.workspace = true
+model.workspace = true
+pipeline.workspace = true
+
+chrono.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+etw.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "asmr-game"
+description = "A7 agents and games with A14 adversarial adaptation and A29 transfer learning."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

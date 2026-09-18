@@ -9,5 +9,4 @@ version.workspace = true
 
 [dependencies]
 model.workspace = true
-async-trait.workspace = true
 thiserror.workspace = true

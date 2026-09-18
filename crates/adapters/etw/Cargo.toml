@@ -1,5 +1,6 @@
 [package]
 name = "etw"
+description = "Windows ETW real-time sensor: session lifecycle, hot-path callback, and TDH decoding."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,9 +10,15 @@ version.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
+model.workspace = true
+ports.workspace = true
 thiserror.workspace = true
-zerocopy.workspace = true
+
+[target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Etw",
+    "Win32_System_Performance",
+    # EVENT_TRACE_LOGFILEW and OpenTraceW are gated behind this in windows-rs.
+    "Win32_System_Time",
 ] }

@@ -1,0 +1,11 @@
+[package]
+name = "asmr-resource"
+description = "A11 resource constraints: capacity, admissible action sets, and triage."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

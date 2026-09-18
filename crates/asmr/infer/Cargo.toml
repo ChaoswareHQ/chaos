@@ -1,0 +1,11 @@
+[package]
+name = "asmr-infer"
+description = "A5 uncertainty, A9 information sets, and the A24 aleatoric/epistemic split."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "asmr-trace"
+description = "A2 events and traces with A4 time and causality: vector clocks and Kleene patterns."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

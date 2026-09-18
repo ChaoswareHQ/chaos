@@ -1,0 +1,27 @@
+[package]
+name = "pipeline"
+description = "Wires the ASMR axioms to the ETW sensor: decode, project state, score, decide, govern, alert."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+asmr-action.workspace = true
+asmr-anomaly.workspace = true
+asmr-decay.workspace = true
+asmr-decision.workspace = true
+asmr-governance.workspace = true
+asmr-infer.workspace = true
+asmr-novelty.workspace = true
+asmr-observe.workspace = true
+asmr-privacy.workspace = true
+asmr-resource.workspace = true
+asmr-state.workspace = true
+asmr-trace.workspace = true
+asmr-trust.workspace = true
+
+chrono.workspace = true
+model.workspace = true

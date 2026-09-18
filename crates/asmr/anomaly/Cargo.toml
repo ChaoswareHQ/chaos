@@ -1,0 +1,11 @@
+[package]
+name = "asmr-anomaly"
+description = "A23 structural anomaly over the observed graph."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

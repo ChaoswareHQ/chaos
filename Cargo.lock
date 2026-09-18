@@ -12,15 +12,76 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-trait"
-version = "0.1.92"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.5",
-]
+name = "asmr-action"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-anomaly"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-compose"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-decay"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-deception"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-decision"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-game"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-governance"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-infer"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-novelty"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-observe"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-privacy"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-recovery"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-resource"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-scale"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-state"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-trace"
+version = "0.1.0"
+
+[[package]]
+name = "asmr-trust"
+version = "0.1.0"
 
 [[package]]
 name = "autocfg"
@@ -68,7 +129,11 @@ dependencies = [
 name = "client"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "etw",
  "mimalloc",
+ "model",
+ "pipeline",
 ]
 
 [[package]]
@@ -121,9 +186,10 @@ name = "etw"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "model",
+ "ports",
  "thiserror",
  "windows",
- "zerocopy",
 ]
 
 [[package]]
@@ -284,10 +350,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pipeline"
+version = "0.1.0"
+dependencies = [
+ "asmr-action",
+ "asmr-anomaly",
+ "asmr-decay",
+ "asmr-decision",
+ "asmr-governance",
+ "asmr-infer",
+ "asmr-novelty",
+ "asmr-observe",
+ "asmr-privacy",
+ "asmr-resource",
+ "asmr-state",
+ "asmr-trace",
+ "asmr-trust",
+ "chrono",
+ "model",
+]
+
+[[package]]
 name = "ports"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "model",
  "thiserror",
 ]
@@ -380,6 +466,10 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "sim"
+version = "0.1.0"
 
 [[package]]
 name = "slab"
@@ -634,26 +724,6 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
-
-[[package]]
-name = "zerocopy"
-version = "0.8.57"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
-dependencies = [
- "zerocopy-derive",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.8.57"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "zmij"

@@ -1,0 +1,11 @@
+[package]
+name = "asmr-compose"
+description = "A13 composition algebra: reachability and blast radius."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

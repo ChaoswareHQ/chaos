@@ -1,0 +1,11 @@
+[package]
+name = "sim"
+description = "Benign simulator of suspicious-looking Windows behaviour, for exercising the collector."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

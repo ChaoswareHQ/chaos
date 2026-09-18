@@ -1,0 +1,11 @@
+[package]
+name = "asmr-decay"
+description = "A16 temporal decay and half-life with A26 patch latency."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
