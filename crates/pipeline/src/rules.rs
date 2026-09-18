@@ -14,7 +14,7 @@
 //! (`hit` modest, `miss` not much lower), and a pipeline that cannot express
 //! the difference will drown in the second kind.
 
-use asmr_infer::Likelihood;
+use asmr::infer::Likelihood;
 use model::{EventKind, TelemetryEvent};
 
 /// One piece of evidence, with the rule that produced it.

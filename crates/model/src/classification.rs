@@ -56,6 +56,17 @@ impl std::fmt::Display for DataClass {
 
 #[inline]
 pub fn class_of(field: &str) -> DataClass {
+    class_of_known(field).unwrap_or(DataClass::Sensitive)
+}
+
+/// The explicit classification table, without the fail-closed default.
+///
+/// `None` means the field is not in the table. Callers that need a decision
+/// should use [`class_of`] instead; this exists because "we decided this is
+/// sensitive" and "we have never heard of this" are different situations that
+/// deserve different handling. Redaction in particular has to tell them apart,
+/// or a payload keyed by provider-specific names collapses entirely.
+pub fn class_of_known(field: &str) -> Option<DataClass> {
     match field {
         "pid" | "parent_pid" | "tid" | "exit_code" | "level" | "source_port"
         | "destination_port" | "bytes_sent" | "bytes_received" | "size" | "bytes_written"
@@ -64,19 +75,19 @@ pub fn class_of(field: &str) -> DataClass {
         | "image_hash" | "signed" | "signer" | "integrity_level" | "protocol" | "query_type"
         | "response_code" | "id" | "event_id" | "schema_version" | "source" | "rule_id"
         | "alert_id" | "severity" | "status" | "kind" | "mitre_techniques" | "enabled" => {
-            DataClass::Public
+            Some(DataClass::Public)
         }
 
         "source_ip" | "destination_ip" | "provider" | "hostname" | "os" | "labels"
-        | "first_seen" | "last_seen" => DataClass::Internal,
+        | "first_seen" | "last_seen" => Some(DataClass::Internal),
 
         "command_line" | "user" | "executable" | "image_path" | "path" | "old_path"
         | "new_path" | "working_directory" | "key_path" | "value_name" | "value_data"
         | "query_name" | "answers" | "title" | "description" | "host" | "host_id" | "events" => {
-            DataClass::Sensitive
+            Some(DataClass::Sensitive)
         }
 
-        _ => DataClass::Sensitive,
+        _ => None,
     }
 }
 
@@ -119,6 +130,22 @@ mod tests {
         assert_eq!(class_of("environment_variables"), DataClass::Sensitive);
         assert_eq!(class_of("some_future_field"), DataClass::Sensitive);
         assert_eq!(class_of(""), DataClass::Sensitive);
+    }
+
+    #[test]
+    fn the_explicit_table_reports_ignorance_as_ignorance() {
+        // `class_of` and `class_of_known` must agree on everything the table
+        // knows, and differ only on what it does not.
+        assert_eq!(class_of_known("pid"), Some(DataClass::Public));
+        assert_eq!(class_of_known("command_line"), Some(DataClass::Sensitive));
+        assert_eq!(class_of_known("hostname"), Some(DataClass::Internal));
+        assert_eq!(class_of_known("image_path"), Some(DataClass::Sensitive));
+
+        assert_eq!(class_of_known("environment_variables"), None);
+        assert_eq!(class_of_known("some_future_field"), None);
+        assert_eq!(class_of_known(""), None);
+
+        assert_eq!(class_of("some_future_field"), DataClass::Sensitive);
     }
 
     #[test]

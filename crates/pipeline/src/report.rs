@@ -13,8 +13,8 @@
 //! rates — is comparable across rules and across days, and it is the only
 //! defensible way to decide which rule to turn off when the queue is too long.
 
-use asmr_observe::{Channel, ObservationMap};
-use asmr_resource::{overload, utilization};
+use asmr::observe::{Channel, ObservationMap};
+use asmr::resource::{overload, utilization};
 use std::collections::BTreeMap;
 
 /// One rule's observed firing behaviour.

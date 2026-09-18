@@ -4,7 +4,7 @@ default-members = ["apps/client"]
 members = [
     "apps/*",
     "crates/adapters/*",
-    "crates/asmr/*",
+    "crates/asmr",
     "crates/config",
     "crates/model",
     "crates/pipeline",
@@ -21,6 +21,8 @@ rust-version = "1.98.0"
 version = "0.1.0"
 
 [workspace.dependencies]
+# --- infrastructure -------------------------------------------------------
+asmr = { path = "crates/asmr" }
 config = { path = "crates/config" }
 ebpf = { path = "crates/adapters/ebpf" }
 es = { path = "crates/adapters/es" }
@@ -29,25 +31,7 @@ model = { path = "crates/model" }
 pipeline = { path = "crates/pipeline" }
 ports = { path = "crates/ports" }
 
-asmr-action = { path = "crates/asmr/action" }
-asmr-anomaly = { path = "crates/asmr/anomaly" }
-asmr-compose = { path = "crates/asmr/compose" }
-asmr-decay = { path = "crates/asmr/decay" }
-asmr-deception = { path = "crates/asmr/deception" }
-asmr-decision = { path = "crates/asmr/decision" }
-asmr-game = { path = "crates/asmr/game" }
-asmr-governance = { path = "crates/asmr/governance" }
-asmr-infer = { path = "crates/asmr/infer" }
-asmr-novelty = { path = "crates/asmr/novelty" }
-asmr-observe = { path = "crates/asmr/observe" }
-asmr-privacy = { path = "crates/asmr/privacy" }
-asmr-recovery = { path = "crates/asmr/recovery" }
-asmr-resource = { path = "crates/asmr/resource" }
-asmr-scale = { path = "crates/asmr/scale" }
-asmr-state = { path = "crates/asmr/state" }
-asmr-trace = { path = "crates/asmr/trace" }
-asmr-trust = { path = "crates/asmr/trust" }
-
+# --- third party ----------------------------------------------------------
 crossbeam-channel = "0.5.17"
 mimalloc = "0.1.52"
 windows = "0.62.2"

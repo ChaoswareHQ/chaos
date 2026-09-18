@@ -25,18 +25,18 @@
 pub mod report;
 pub mod rules;
 
-use asmr_action::{Action, ActionId, ActionKind, ActionSpace};
-use asmr_anomaly::{EdgeKey, StructuralProfile};
-use asmr_decision::{Costs, Decision};
-use asmr_governance::{
+use asmr::action::{Action, ActionId, ActionKind, ActionSpace};
+use asmr::anomaly::{EdgeKey, StructuralProfile};
+use asmr::decision::{Costs, Decision};
+use asmr::governance::{
     ActionRequest, AuditLog, AutonomyLevel, GovernancePolicy, Severity as GovSeverity, Verdict,
 };
-use asmr_infer::LogOdds;
-use asmr_novelty::NoveltyModel;
-use asmr_observe::{ObsId, ObservationMap};
-use asmr_privacy::generalisation_bucket;
-use asmr_state::{AttrValue, Entity, EntityId, EntityKind, StateSpace};
-use asmr_trace::{EventId, Trace, TraceEvent};
+use asmr::infer::LogOdds;
+use asmr::novelty::NoveltyModel;
+use asmr::observe::{ObsId, ObservationMap};
+use asmr::privacy::generalisation_bucket;
+use asmr::state::{AttrValue, Entity, EntityId, EntityKind, StateSpace};
+use asmr::trace::{EventId, Trace, TraceEvent};
 use model::{Alert, AlertId, EventKind, HostId, RuleId, Severity as ModelSeverity, TelemetryEvent};
 use std::collections::BTreeMap;
 
@@ -169,7 +169,7 @@ impl Engine {
         let key = evidence_key(event);
         let probability = self.accumulate(key, &findings);
 
-        match asmr_decision::decide(probability, &self.cfg.costs) {
+        match asmr::decision::decide(probability, &self.cfg.costs) {
             Decision::Act => self.respond(event, &findings, probability),
             Decision::Abstain => {
                 // Only worth counting as a deliberate abstention when there was

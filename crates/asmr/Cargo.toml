@@ -1,6 +1,6 @@
 [package]
-name = "asmr-scale"
-description = "A18 abstraction, refinement, and multi-scale fusion."
+name = "asmr"
+description = "Algebraic Security for Monitoring and Response: the axiom core, A1 through A30."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

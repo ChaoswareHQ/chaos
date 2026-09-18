@@ -9,19 +9,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-asmr-action.workspace = true
-asmr-anomaly.workspace = true
-asmr-decay.workspace = true
-asmr-decision.workspace = true
-asmr-governance.workspace = true
-asmr-infer.workspace = true
-asmr-novelty.workspace = true
-asmr-observe.workspace = true
-asmr-privacy.workspace = true
-asmr-resource.workspace = true
-asmr-state.workspace = true
-asmr-trace.workspace = true
-asmr-trust.workspace = true
-
-chrono.workspace = true
+asmr.workspace = true
 model.workspace = true
+
+[dev-dependencies]
+# Only the tests need a clock; the engine itself takes timestamps from the
+# events it is handed, which is what keeps it deterministic.
+chrono.workspace = true
