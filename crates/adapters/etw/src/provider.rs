@@ -73,6 +73,15 @@ pub fn default_providers() -> Vec<ProviderSpec> {
             level: LEVEL_INFORMATIONAL,
             keywords: KERNEL_PROCESS_KEYWORD_PROCESS | KERNEL_PROCESS_KEYWORD_IMAGE,
         },
+        // Here because `T1547.001` reads a Run-key write and no other event
+        // carries one. Leaving it out made the rule unreachable on a live host
+        // while the synthetic stream kept it green.
+        ProviderSpec {
+            guid: KERNEL_REGISTRY,
+            name: "Microsoft-Windows-Kernel-Registry",
+            level: LEVEL_INFORMATIONAL,
+            keywords: 0,
+        },
         ProviderSpec {
             guid: DNS_CLIENT,
             name: "Microsoft-Windows-DNS-Client",
@@ -123,6 +132,17 @@ mod tests {
             kp.keywords & KERNEL_PROCESS_KEYWORD_THREAD,
             0,
             "thread churn is volume, not signal"
+        );
+    }
+
+    #[test]
+    fn the_registry_provider_is_enabled_so_run_keys_can_fire() {
+        // A rule whose only evidence source is not enabled is a rule that can
+        // never fire on a real host, however well it tests against a fixture.
+        let providers = default_providers();
+        assert!(
+            providers.iter().any(|p| p.guid == KERNEL_REGISTRY),
+            "T1547.001 reads a Run-key write and nothing else carries one"
         );
     }
 

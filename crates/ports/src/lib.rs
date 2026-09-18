@@ -1,3 +1,4 @@
+pub mod actuator;
 pub mod alert_sink;
 pub mod error;
 pub mod event_sink;
@@ -5,6 +6,7 @@ pub mod event_source;
 pub mod host_registry;
 pub mod rule_store;
 
+pub use actuator::{ActionError, Actuator, Response};
 pub use alert_sink::AlertSink;
 pub use error::{AlertError, HostError, RuleError, SinkError, SourceError};
 pub use event_sink::EventSink;

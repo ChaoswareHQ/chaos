@@ -51,6 +51,15 @@ pub struct Metrics {
     pub findings: u64,
     pub alerts: u64,
     pub abstained: u64,
+    /// Repeat firings folded into an earlier alert instead of emitted again.
+    pub suppressed: u64,
+    /// Firings that never cleared the severity floor.
+    ///
+    /// Counted rather than published. Reported separately from `suppressed`
+    /// because the two mean opposite things: a folded firing is one the analyst
+    /// has effectively been told about, and a below-floor one is a decision not
+    /// to tell them. Read this number before raising the floor.
+    pub below_floor: u64,
     /// Findings suppressed by A12 governance before they could become alerts.
     pub withheld_by_policy: u64,
     /// Sensitive fields replaced by A19 minimisation before leaving the host.

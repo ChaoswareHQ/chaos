@@ -391,6 +391,26 @@ fn process_fanout_burst(event: &TelemetryEvent, facts: &Facts<'_>) -> Option<Fin
     })
 }
 
+/// A human name for a rule, for an alert title.
+///
+/// Deliberately not the rule id. The alert table already carries the technique
+/// in its own column, so a title of `T1547.001: T1547.001: ...` spends the one
+/// place a person actually reads a sentence on repeating a code they have
+/// already been shown.
+pub fn rule_title(rule: &str) -> &'static str {
+    match rule {
+        "encoded_powershell" => "Encoded PowerShell command",
+        "interpreter_from_host_app" => "Interpreter spawned by a host application",
+        "masquerading_outside_system32" => "System binary name outside a system directory",
+        "lolbin_remote_fetch" => "Signed binary used against a remote location",
+        "run_key_persistence" => "Persistence via a Run key",
+        "high_abuse_tld" => "Resolution in a high-abuse namespace",
+        "novel_binary_in_writable_location" => "First sighting of a binary in a writable location",
+        "process_fanout_burst" => "Unusual process fan-out",
+        _ => "Suspicious activity",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +595,29 @@ mod tests {
             strong.likelihood.log_ratio(),
             weak.likelihood.log_ratio()
         );
+    }
+
+    #[test]
+    fn every_runnable_rule_has_a_human_title() {
+        // A rule that falls through to the generic title is a rule whose
+        // alerts read `Suspicious activity` and nothing else, which is the
+        // sort of row an analyst learns to skip.
+        const RULES: &[&str] = &[
+            "encoded_powershell",
+            "interpreter_from_host_app",
+            "masquerading_outside_system32",
+            "lolbin_remote_fetch",
+            "run_key_persistence",
+            "high_abuse_tld",
+            "novel_binary_in_writable_location",
+            "process_fanout_burst",
+        ];
+        for rule in RULES {
+            let title = rule_title(rule);
+            assert_ne!(title, "Suspicious activity", "{rule} has no title");
+            assert!(!title.contains(rule), "{title} repeats the rule id");
+        }
+        assert_eq!(rule_title("never-heard-of-it"), "Suspicious activity");
     }
 
     #[test]

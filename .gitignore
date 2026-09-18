@@ -1,1 +1,11 @@
+# Build output
 target/
+
+# A host token is a bearer credential: whoever can read the file can submit
+# telemetry as that host. It never belongs in a commit, and `--token-file` can
+# name one anywhere, so the pattern is the extension rather than one path.
+*.token
+
+# Local run logs
+*.out
+*.err

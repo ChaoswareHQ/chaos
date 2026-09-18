@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 asmr.workspace = true
 model.workspace = true
+ports.workspace = true
 
 [dev-dependencies]
 # Only the tests need a clock; the engine itself takes timestamps from the

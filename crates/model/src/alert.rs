@@ -47,8 +47,20 @@ pub struct Alert {
     pub host: HostId,
     pub events: Vec<EventId>,
     pub mitre_techniques: Vec<Box<str>>,
+    /// How many firings this alert stands for.
+    ///
+    /// Repeat detections of the same rule are folded into one alert rather than
+    /// emitted again, because a queue of two hundred near-identical rows is the
+    /// same as no queue at all: the analyst stops reading it. The count is what
+    /// preserves the magnitude that coalescing would otherwise hide.
+    #[serde(default = "one")]
+    pub count: u32,
     #[serde(default)]
     pub status: AlertStatus,
+}
+
+fn one() -> u32 {
+    1
 }
 
 impl Alert {
@@ -74,8 +86,16 @@ impl Alert {
             host,
             events,
             mitre_techniques,
+            count: 1,
             status: AlertStatus::New,
         }
+    }
+
+    /// The alert also stands for `count - 1` further firings of the same rule.
+    #[inline]
+    pub fn with_count(mut self, count: u32) -> Self {
+        self.count = count.max(1);
+        self
     }
 
     #[inline]

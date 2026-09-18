@@ -9,7 +9,8 @@ members = [
     "crates/model",
     "crates/pipeline",
     "crates/ports",
-    "tools/*",
+    "crates/protocol",
+    "crates/transport",
 ]
 
 [workspace.package]
@@ -30,6 +31,9 @@ etw = { path = "crates/adapters/etw" }
 model = { path = "crates/model" }
 pipeline = { path = "crates/pipeline" }
 ports = { path = "crates/ports" }
+protocol = { path = "crates/protocol" }
+respond = { path = "crates/adapters/respond" }
+transport = { path = "crates/transport" }
 
 # --- third party ----------------------------------------------------------
 crossbeam-channel = "0.5.17"

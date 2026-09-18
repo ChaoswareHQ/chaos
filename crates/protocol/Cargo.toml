@@ -1,0 +1,17 @@
+[package]
+name = "protocol"
+description = "The client/server wire contract: enrollment, batched ingest, and host-token format."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+model.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
