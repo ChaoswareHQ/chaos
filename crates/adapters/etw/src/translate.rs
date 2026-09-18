@@ -38,7 +38,7 @@ use crate::decode::Decoder;
 use chrono::{DateTime, Utc};
 use model::{
     DnsQueryPayload, EventId, EventKind, EventSource, HostId, Payload, ProcessId, ProcessStart,
-    RegistrySet, TelemetryEvent, Value,
+    RegistrySet, TelemetryEvent,
 };
 
 /// ETW's `TimeStamp` is a `FILETIME`: 100-nanosecond intervals since 1601-01-01.
@@ -219,7 +219,7 @@ impl Translator {
             // The decoded fields are what the rules read and they are already in
             // the kind, so shipping the raw provider payload as well would put
             // every string on the wire twice for no detection benefit.
-            Payload::new(Value::Null).expect("a null payload is always within limits"),
+            Payload::empty(),
         ))
     }
 

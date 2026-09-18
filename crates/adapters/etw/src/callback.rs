@@ -19,7 +19,6 @@
 use crate::stats::Stats;
 use crossbeam_channel::Sender;
 use model::{EventSource, ProviderId, RawEvent};
-use std::collections::HashMap;
 use std::slice;
 use windows::Win32::System::Diagnostics::Etw::{
     EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
@@ -79,9 +78,13 @@ pub struct ProcessIdentity {
 pub(crate) struct CallbackContext {
     pub(crate) tx: Sender<EtwRaw>,
     pub(crate) stats: Stats,
-    /// GUID to name, resolved once at session start so the hot path clones an
-    /// `Arc` instead of formatting a string.
-    pub(crate) providers: HashMap<GUID, ProviderId>,
+    /// The enabled providers, as `(guid, name)`.
+    ///
+    /// A `Vec` scanned linearly rather than a `HashMap`: the list is the four
+    /// providers the session was configured with, so four `GUID` comparisons beat
+    /// hashing a sixteen-byte key on every event, and there is one less
+    /// collection to reason about on the hottest path in the product.
+    pub(crate) providers: Vec<(GUID, ProviderId)>,
     pub(crate) max_level: u8,
 }
 
@@ -114,8 +117,13 @@ pub(crate) unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         return;
     }
 
-    let provider = match ctx.providers.get(&header.ProviderId) {
-        Some(p) => p.clone(),
+    let provider = match ctx
+        .providers
+        .iter()
+        .find(|(guid, _)| *guid == header.ProviderId)
+    {
+        // Cloning the name is an `Arc` increment, not an allocation.
+        Some((_, name)) => name.clone(),
         // A provider we did not ask for still arrives when another session
         // enables it. Paying one format per unknown provider beats dropping
         // evidence we cannot attribute.

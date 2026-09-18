@@ -15,9 +15,16 @@
 //!
 //! Field extraction is by name (`TdhGetProperty` addresses properties by
 //! `PCWSTR`, not by index), so the names are the one thing that has to be right.
-//! They come from the provider's manifest; the client's `--dump-schema` mode
-//! enumerates them on a real machine so the mapping table in `pipeline` can be
-//! checked rather than trusted.
+//! They come from the provider's manifest, and the shipped manifests can be read
+//! on any machine without elevation:
+//!
+//! ```text
+//! Get-WinEvent -ListProvider Microsoft-Windows-Kernel-Process
+//! wevtutil gp Microsoft-Windows-Kernel-Registry /ge:true
+//! ```
+//!
+//! That is how the table in `translate` was built, and it is how to check it
+//! rather than trust it.
 
 use crate::callback::EtwRaw;
 use std::ffi::c_void;

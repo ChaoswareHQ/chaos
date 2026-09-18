@@ -4,7 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::sync::Arc;
 
-pub const CURRENT_SCHEMA_VERSION: u16 = 1;
+/// The schema version every event carries.
+///
+/// Bumped to 2 when [`Payload`] stopped being two fields on the wire. It is one
+/// field now, so a `1` event and a `2` event are not interchangeable, and a
+/// number that says so is worth more than a comment nobody reads.
+pub const CURRENT_SCHEMA_VERSION: u16 = 2;
 pub const MAX_PAYLOAD_SIZE: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,10 +52,7 @@ impl Write for LimitedCounter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.written += buf.len();
         if self.written > self.limit {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "payload exceeds maximum size",
-            ));
+            return Err(io::Error::other("payload exceeds maximum size"));
         }
         Ok(buf.len())
     }
@@ -61,10 +63,24 @@ impl Write for LimitedCounter {
     }
 }
 
+/// The provider's own fields, as they came off the wire.
+///
+/// # Why this is transparent on the wire
+///
+/// It used to serialize as `{"value":...,"value_size":N}`, and the size was
+/// written and read by nobody: the measurement exists to *enforce* the ceiling,
+/// not to be stored. Carrying it cost about fifteen bytes on every event and
+/// bought nothing, so the struct is transparent and the JSON is just the value.
+///
+/// # Why the ceiling is measured while writing
+///
+/// The serialised size is the thing with a limit, and counting as the writer
+/// runs means an oversized payload is rejected without ever building the
+/// oversized buffer — which matters, because the input is attacker influenced.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Payload {
     value: Value,
-    value_size: usize,
 }
 
 impl Payload {
@@ -86,10 +102,19 @@ impl Payload {
                 }
             }
         })?;
-        Ok(Self {
-            value,
-            value_size: counter.written,
-        })
+        Ok(Self { value })
+    }
+
+    /// A payload with nothing in it.
+    ///
+    /// The ETW path ships no raw payload — the decoded fields *are* the event —
+    /// so this is the common case, and it should not pay for a serialisation
+    /// pass per event to rediscover that `null` fits in 64 KiB. The ceiling is
+    /// not being skipped, it is being answered: four bytes against sixty-five
+    /// thousand is not a measured thing.
+    #[inline]
+    pub const fn empty() -> Self {
+        Self { value: Value::Null }
     }
 
     #[inline]
@@ -100,11 +125,6 @@ impl Payload {
     #[inline]
     pub fn into_value(self) -> Value {
         self.value
-    }
-
-    #[inline]
-    pub fn value_size(&self) -> usize {
-        self.value_size
     }
 }
 
@@ -194,4 +214,118 @@ impl TelemetryEvent {
 #[inline]
 fn default_schema_version() -> u16 {
     CURRENT_SCHEMA_VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Map;
+
+    #[test]
+    fn a_payload_is_the_value_and_nothing_else_on_the_wire() {
+        // It used to be `{"value":...,"value_size":N}`. The size is a ceiling
+        // being enforced, not a fact worth shipping, and a wrapper that came back
+        // would put fifteen bytes on every event for nothing. This test is the
+        // only thing that would notice.
+        let payload = Payload::new(Value::Int(7)).expect("small enough");
+        assert_eq!(serde_json::to_string(&payload).expect("serializes"), "7");
+
+        let mut map = Map::new();
+        map.insert("ImageName".into(), Value::String("x".into()));
+        let payload = Payload::new(Value::Object(map)).expect("small enough");
+        assert_eq!(
+            serde_json::to_string(&payload).expect("serializes"),
+            r#"{"ImageName":"x"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Payload>(r#"{"ImageName":"x"}"#).expect("parses"),
+            payload
+        );
+    }
+
+    #[test]
+    fn a_positive_integer_is_canonicalised_to_unsigned_by_a_round_trip() {
+        // Not a property anyone would guess, and it used to be invisible. JSON
+        // has one number type, so the deserialiser picks a variant from the value
+        // alone: anything non-negative arrives as `visit_u64`, so `Int(7)` and
+        // `Uint(7)` are the same event on the wire and only the second one comes
+        // back. Worth pinning rather than discovering while comparing a decoded
+        // payload against a hand-built one.
+        assert_eq!(
+            serde_json::from_str::<Payload>("7")
+                .expect("parses")
+                .value(),
+            &Value::Uint(7),
+            "a non-negative integer is canonicalised to Uint"
+        );
+        // Negative values have only one representation, so they survive exactly.
+        let negative = Payload::new(Value::Int(-7)).expect("small enough");
+        assert_eq!(
+            serde_json::from_str::<Payload>("-7").expect("parses"),
+            negative
+        );
+        // And above i64::MAX only Uint can hold it.
+        let wide = Payload::new(Value::Uint(u64::MAX)).expect("small enough");
+        assert_eq!(
+            serde_json::from_str::<Payload>(&u64::MAX.to_string())
+                .expect("parses")
+                .value(),
+            wide.value()
+        );
+        assert_eq!(wide.value().as_u64(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn an_empty_payload_is_null_and_costs_nothing_to_build() {
+        let payload = Payload::empty();
+        assert!(payload.value().is_null());
+        assert_eq!(serde_json::to_string(&payload).expect("serializes"), "null");
+        assert_eq!(
+            serde_json::from_str::<Payload>("null").expect("parses"),
+            payload
+        );
+    }
+
+    #[test]
+    fn the_ceiling_is_still_enforced() {
+        // The reason `Payload::new` measures at all, and the one property that
+        // must survive making the struct transparent.
+        let huge = Value::String("x".repeat(MAX_PAYLOAD_SIZE + 1).into());
+        assert!(matches!(
+            Payload::new(huge),
+            Err(ModelError::PayloadTooLarge { .. })
+        ));
+
+        let fits = Value::String("x".repeat(1024).into());
+        assert!(Payload::new(fits).is_ok());
+    }
+
+    #[test]
+    fn a_payload_round_trips_through_a_whole_event() {
+        // The transparent attribute is on the type, but the field it lives in is
+        // what actually has to keep working.
+        let event = TelemetryEvent::new(
+            EventId::new(9),
+            HostId::new("host-a").expect("valid"),
+            DateTime::from_timestamp(1_700_000_000, 0).expect("valid instant"),
+            EventSource::WindowsEtw,
+            ProviderId::new("Microsoft-Windows-Kernel-Process"),
+            1,
+            42,
+            42,
+            4,
+            crate::EventKind::Unclassified,
+            Payload::empty(),
+        );
+
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert!(json.contains(r#""payload":null"#), "{json}");
+        assert!(json.contains(r#""schema_version":2"#), "{json}");
+
+        // Compared as JSON rather than as values: `TelemetryEvent` deliberately
+        // does not derive `PartialEq`, and adding it for a test would be the tail
+        // wagging the dog.
+        let reparsed = serde_json::from_str::<TelemetryEvent>(&json).expect("parses");
+        assert_eq!(serde_json::to_string(&reparsed).expect("serializes"), json);
+    }
 }

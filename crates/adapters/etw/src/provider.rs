@@ -34,9 +34,10 @@ pub const LEVEL_VERBOSE: u8 = 5;
 
 /// Event ids worth a name, for the providers a security pipeline reads first.
 ///
-/// These come from the shipped manifests. `--dump-schema` in the client
-/// enumerates the live manifests so this table can be checked against a real
-/// machine rather than trusted.
+/// These come from the shipped manifests, and the manifests can be read on any
+/// machine without elevation — `Get-WinEvent -ListProvider <provider>`, or
+/// `wevtutil gp <provider> /ge:true` — so this table can be checked against a
+/// real host rather than trusted.
 pub fn event_name(provider: &str, event_id: u16) -> Option<&'static str> {
     match (provider, event_id) {
         ("Microsoft-Windows-Kernel-Process", 1) => Some("ProcessStart"),
