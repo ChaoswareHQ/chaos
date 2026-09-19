@@ -32,34 +32,21 @@ pub const LEVEL_WARNING: u8 = 3;
 pub const LEVEL_INFORMATIONAL: u8 = 4;
 pub const LEVEL_VERBOSE: u8 = 5;
 
-/// Event ids worth a name, for the providers a security pipeline reads first.
-///
-/// These come from the shipped manifests, and the manifests can be read on any
-/// machine without elevation — `Get-WinEvent -ListProvider <provider>`, or
-/// `wevtutil gp <provider> /ge:true` — so this table can be checked against a
-/// real host rather than trusted.
-pub fn event_name(provider: &str, event_id: u16) -> Option<&'static str> {
-    match (provider, event_id) {
-        ("Microsoft-Windows-Kernel-Process", 1) => Some("ProcessStart"),
-        ("Microsoft-Windows-Kernel-Process", 2) => Some("ProcessStop"),
-        ("Microsoft-Windows-Kernel-Process", 3) => Some("ThreadStart"),
-        ("Microsoft-Windows-Kernel-Process", 4) => Some("ThreadStop"),
-        ("Microsoft-Windows-Kernel-Process", 5) => Some("ImageLoad"),
-        ("Microsoft-Windows-Kernel-Process", 6) => Some("ImageUnload"),
-        ("Microsoft-Windows-DNS-Client", 3006) => Some("DnsQuery"),
-        ("Microsoft-Windows-DNS-Client", 3008) => Some("DnsResponse"),
-        ("Microsoft-Windows-Kernel-Registry", 1) => Some("RegistryCreateKey"),
-        ("Microsoft-Windows-Kernel-Registry", 2) => Some("RegistryOpenKey"),
-        ("Microsoft-Windows-Kernel-Registry", 3) => Some("RegistryDeleteKey"),
-        ("Microsoft-Windows-Kernel-Registry", 4) => Some("RegistryQueryValue"),
-        ("Microsoft-Windows-Kernel-Registry", 5) => Some("RegistrySetValue"),
-        ("Microsoft-Windows-Kernel-Registry", 6) => Some("RegistryDeleteValue"),
-        ("Microsoft-Windows-Kernel-File", 12) => Some("FileCreate"),
-        ("Microsoft-Windows-Kernel-File", 14) => Some("FileWrite"),
-        ("Microsoft-Windows-Kernel-File", 15) => Some("FileDelete"),
-        _ => None,
-    }
-}
+// There is deliberately no event-id-to-name table in this module. There was one,
+// and it earned its removal twice over: nothing called it, and it was wrong.
+//
+// Checked against this machine's manifests, `Microsoft-Windows-Kernel-File` id 14
+// declares only `Irp, ThreadId, FileObject, FileKey` — no path, no length — so the
+// `FileWrite` name it carried is something the record cannot support. Id 15
+// carries `ByteOffset, IOSize, IOFlags`, which is the I/O family, not the
+// `FileDelete` it was labelled. The provider names roughly thirty events and the
+// table named three, so it was not complete either.
+//
+// A hand-copied subset of a manifest that changes with every Windows build reads
+// as knowledge and is really a guess. What decides which events matter is
+// `translate::shape_of`, and that stays short because it is the one that has to
+// be right. To see what a provider declares on the machine in front of you, run
+// `tools/dump-fields.ps1` rather than reading a copy of someone else's answer.
 
 /// The providers a Windows deployment should try to enable, in priority order.
 ///
@@ -89,6 +76,12 @@ pub fn default_providers() -> Vec<ProviderSpec> {
             level: LEVEL_INFORMATIONAL,
             keywords: 0,
         },
+        // Enabled because `translate::shape_of` decodes its 4104 script blocks:
+        // the kernel process provider carries no command line on any Windows
+        // build, so this is the only live source of what an interpreter was asked
+        // to run. It emits nothing at all until Script Block Logging is enabled
+        // on the host, which is a policy the operator sets and not a broken
+        // table; when the policy is off, this provider is silent.
         ProviderSpec {
             guid: POWERSHELL,
             name: "Microsoft-Windows-PowerShell",
@@ -145,15 +138,5 @@ mod tests {
             providers.iter().any(|p| p.guid == KERNEL_REGISTRY),
             "T1547.001 reads a Run-key write and nothing else carries one"
         );
-    }
-
-    #[test]
-    fn unknown_events_have_no_name_instead_of_a_wrong_one() {
-        assert_eq!(
-            event_name("Microsoft-Windows-Kernel-Process", 1),
-            Some("ProcessStart")
-        );
-        assert_eq!(event_name("Microsoft-Windows-Kernel-Process", 999), None);
-        assert_eq!(event_name("Some-Third-Party-Provider", 1), None);
     }
 }

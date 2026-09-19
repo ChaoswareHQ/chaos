@@ -18,6 +18,7 @@ pub enum EventKind {
     RegistryDelete(RegistryDelete),
     DnsQuery(DnsQueryPayload),
     ImageLoad(ImageLoad),
+    ScriptBlock(ScriptBlock),
     #[serde(other)]
     Unclassified,
 }
@@ -45,6 +46,7 @@ impl EventKind {
             EventKind::RegistryDelete(_) => "registry_delete",
             EventKind::DnsQuery(_) => "dns_query",
             EventKind::ImageLoad(_) => "image_load",
+            EventKind::ScriptBlock(_) => "script_block",
             EventKind::Unclassified => "unclassified",
         }
     }
@@ -193,4 +195,41 @@ pub struct ImageLoad {
     #[serde(default)]
     pub signer: Option<Box<str>>,
     pub loaded_at: DateTime<Utc>,
+}
+
+/// A script block an interpreter was asked to run (`Microsoft-Windows-PowerShell`
+/// id 4104).
+///
+/// This is what the interpreter was told to *execute*, which is a different and
+/// usually more useful thing than what was on its command line: an encoded
+/// command, a download cradle, or a whole script. It only exists when Script
+/// Block Logging is enabled on the host, so its absence proves nothing.
+///
+/// # Two honest caveats
+///
+/// A long script arrives in fragments sharing a [`ScriptBlock::script_block_id`],
+/// one per event, with `message_number` counting them and `message_total` saying
+/// how many there are. Nothing here reassembles them: a rule reading one fragment
+/// sees one fragment, and `message_total > 1` is how a reader can tell that the
+/// text in hand is a piece rather than the whole.
+///
+/// The sensor caps `text`, so a very long block is truncated. The cap is a
+/// property of what we ship, not of what the host ran.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScriptBlock {
+    pub pid: ProcessId,
+    /// The script text, capped by the sensor.
+    pub text: Box<str>,
+    /// Groups the fragments of one script, when the host supplies it.
+    #[serde(default)]
+    pub script_block_id: Option<Box<str>>,
+    /// The file the block came from, when it came from one. Absent for a block
+    /// typed at a prompt or built in memory.
+    #[serde(default)]
+    pub path: Option<Box<str>>,
+    #[serde(default)]
+    pub message_number: Option<u32>,
+    #[serde(default)]
+    pub message_total: Option<u32>,
+    pub recorded_at: DateTime<Utc>,
 }

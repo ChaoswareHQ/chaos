@@ -47,9 +47,9 @@ field must say `None` rather than invent a value. `payload` is the provider's ow
 fields, preserved so an analyst can see what the sensor saw without replaying
 the machine.
 
-`EventKind` is a tagged enum over thirteen shapes — process start and exit,
+`EventKind` is a tagged enum over fourteen shapes — process start and exit,
 network connect and disconnect, file create, write, delete and rename, registry
-set and delete, DNS query, image load, and `Unclassified`:
+set and delete, DNS query, image load, script block, and `Unclassified`:
 
 ```rust
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -59,7 +59,9 @@ pub enum EventKind { ... }
 It is tagged on the field name rather than the variant order, so a new event kind
 does not renumber the existing ones. `Unclassified` is the `#[serde(other)]`
 fallback and the `Default`: a newer agent talking to an older server must produce
-one recognised event rather than a parse failure for the whole batch.
+one recognised event rather than a parse failure for the whole batch. That is what
+makes adding a variant — `ScriptBlock` was the most recent — an additive change
+that does not need a schema bump.
 
 ### Alerts — what the pipeline concluded
 

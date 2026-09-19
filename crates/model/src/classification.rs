@@ -74,16 +74,25 @@ pub fn class_of_known(field: &str) -> Option<DataClass> {
         | "written_at" | "deleted_at" | "renamed_at" | "set_at" | "queried_at" | "loaded_at"
         | "image_hash" | "signed" | "signer" | "integrity_level" | "protocol" | "query_type"
         | "response_code" | "id" | "event_id" | "schema_version" | "source" | "rule_id"
-        | "alert_id" | "severity" | "status" | "kind" | "mitre_techniques" | "enabled" => {
+        | "alert_id" | "severity" | "status" | "kind" | "mitre_techniques" | "enabled"
+        | "message_number" | "message_total" | "recorded_at" => {
             Some(DataClass::Public)
         }
 
         "source_ip" | "destination_ip" | "provider" | "hostname" | "os" | "labels"
-        | "first_seen" | "last_seen" => Some(DataClass::Internal),
+        | "first_seen" | "last_seen"
+        // Identifies which block, not what was in it, and is the join key when a
+        // long script arrives in fragments.
+        | "script_block_id" => Some(DataClass::Internal),
 
         "command_line" | "user" | "executable" | "image_path" | "path" | "old_path"
         | "new_path" | "working_directory" | "key_path" | "value_name" | "value_data"
-        | "query_name" | "answers" | "title" | "description" | "host" | "host_id" | "events" => {
+        | "query_name" | "answers" | "title" | "description" | "host" | "host_id" | "events"
+        // Script text is the interpreter's input: the same class of secret as a
+        // command line, and in practice more of it. Naming it here rather than
+        // letting it fall through to the fail-closed default is about intent —
+        // the answer is the same, and a reader should not have to derive it.
+        | "text" => {
             Some(DataClass::Sensitive)
         }
 

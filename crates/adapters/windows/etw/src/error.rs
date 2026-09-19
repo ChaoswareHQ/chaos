@@ -36,6 +36,15 @@ pub enum EtwError {
 
     #[error("could not resolve a schema for the event: {0}")]
     Schema(String),
+
+    #[error("no trace session named {name}")]
+    NoSuchSession { name: String },
+
+    #[error("session {name} is not real-time (LogFileMode {mode:#010x})")]
+    NotRealTime { name: String, mode: u32 },
+
+    #[error("the registry would not open {path}: code {code}")]
+    Registry { path: String, code: u32 },
 }
 
 /// Turn a Win32 error code into something an operator can act on.
@@ -50,6 +59,7 @@ pub fn hint(code: u32) -> &'static str {
         87 => "ERROR_INVALID_PARAMETER",
         183 => "ERROR_ALREADY_EXISTS -- another process owns this session name",
         4201 => "ERROR_WMI_INSTANCE_NOT_FOUND -- provider manifest is not registered",
+        2 => "ERROR_FILE_NOT_FOUND -- the key or value does not exist",
         _ => "see winerror.h",
     }
 }
@@ -70,6 +80,18 @@ pub fn remedy(error: &EtwError) -> Option<&'static str> {
         EtwError::StartTrace { code: 183, .. } => Some(
             "another process already owns this session name; stop the other copy of \
              the agent, or let it exit on its own",
+        ),
+        // Attaching is what an agent does when the session was started at boot, so
+        // the two ways that fails both have a real answer.
+        EtwError::NoSuchSession { .. } => Some(
+            "nothing is publishing under that name: either the agent should start the \
+             session itself, or the autologger that was supposed to start it at boot is \
+             missing or not enabled",
+        ),
+        EtwError::NotRealTime { .. } => Some(
+            "only a real-time session can be consumed live. An autologger whose LogFileMode \
+             omits EVENT_TRACE_REAL_TIME_MODE (0x100) writes to a file and cannot be \
+             attached to; add the flag to the session's registry values",
         ),
         _ => None,
     }
@@ -99,7 +121,6 @@ mod tests {
             "{instruction} — an elevated prompt opens somewhere else, so the relative --token-file would not resolve"
         );
 
-        // A taken session name is the other case with an obvious answer.
         let taken = EtwError::StartTrace {
             code: 183,
             hint: hint(183),

@@ -1,0 +1,5141 @@
+//! Boot-time sessions: reading what is configured, and saying what to write.
+//!
+//! A session created by [`crate::EtwSession::start`] begins when the agent does.
+//! Everything before that — the services that started, the logon, the Run key
+//! that fired during it — happened before there was anything listening, and no
+//! amount of care in the consumer recovers it.
+//!
+//! Windows has a mechanism for exactly this. A subkey under
+//! `HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger` describes a session, and
+//! the kernel starts it during boot, before any user-mode code is in a position to
+//! interfere. That is what "system-managed session" means, and it is a real
+//! difference rather than a configuration preference:
+//!
+//! * the session exists from boot, so early-boot activity is captured;
+//! * it is not owned by the agent, so an agent restart does not interrupt it;
+//! * its buffers are sized by the registry, at boot, not by whatever process
+//!   happens to start first.
+//!
+//! # What this module does and does not do
+//!
+//! It **reads** the configuration and reports what is missing, and it **renders**
+//! the commands that would create it. It does not write: creating the key needs an
+//! elevated token, and a library that quietly rewrites `HKLM` at startup is a
+//! library nobody should trust. The operator gets the commands, the exact values
+//! they came from, and a verification that says whether they took effect.
+//!
+//! # The limit of the idea
+//!
+//! An autologger is not tamper-proof. It is started by the kernel, but it is
+//! *configured* by a registry key, and an administrator can stop the session
+//! (`logman stop -ets`) or edit the key and reboot. What it buys is that the
+//! tampering has to be done deliberately, with privilege, and leaves a trace —
+//! which is why [`AutologgerSpec::problems`] exists, so a host can be asked
+//! whether its own telemetry is still configured the way it was.
+
+use crate::{error::EtwError, session::Buffers};
+use std::collections::BTreeMap;
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_QWORD, REG_SZ,
+    REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
+};
+use windows::core::{GUID, PCWSTR, PWSTR};
+
+/// Where autologger sessions live, under `HKEY_LOCAL_MACHINE`.
+pub const AUTOLOGGER_ROOT: &str = r"SYSTEM\CurrentControlSet\Control\WMI\Autologger";
+
+/// `EVENT_TRACE_REAL_TIME_MODE`.
+///
+/// The flag that makes a session consumable while it runs. Without it the session
+/// writes to a file and [`crate::EtwSession::attach`] has nothing to join.
+pub const REAL_TIME_MODE: u32 = 0x0000_0100;
+
+/// One provider under a session key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderEntry {
+    pub enabled: Option<u32>,
+    pub level: Option<u32>,
+    pub match_any_keyword: Option<u64>,
+}
+
+/// What the registry says about a session, as read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AutologgerState {
+    /// Whether the session key exists at all.
+    pub present: bool,
+    /// `Start`: `1` means the session is started at boot.
+    pub start: Option<u32>,
+    /// The session's GUID, as a string.
+    pub guid: Option<String>,
+    pub log_file_mode: Option<u32>,
+    pub buffer_size_kb: Option<u32>,
+    pub minimum_buffers: Option<u32>,
+    pub maximum_buffers: Option<u32>,
+    pub flush_seconds: Option<u32>,
+    /// Provider subkeys, keyed by the subkey name (a `{guid}` string). Ordered so
+    /// that rendering it twice produces the same bytes.
+    pub providers: BTreeMap<String, ProviderEntry>,
+}
+
+impl AutologgerState {
+    /// Read the configuration for one session.
+    ///
+    /// A session that does not exist is `Ok` with `present == false`: an unconfigured
+    /// host is a fact to report, not a failure. A refusal is an error, because "there
+    /// is nothing here" and "I was not allowed to look" are different answers.
+    pub fn read(session: &str) -> Result<Self, EtwError> {
+        let path = format!("{AUTOLOGGER_ROOT}\\{session}");
+        let Some(key) = open_key(&path)? else {
+            return Ok(Self::default());
+        };
+        let guard = KeyGuard(key);
+
+        let mut state = Self {
+            present: true,
+            start: read_u32(guard.0, "Start"),
+            guid: read_string(guard.0, "Guid"),
+            log_file_mode: read_u32(guard.0, "LogFileMode"),
+            buffer_size_kb: read_u32(guard.0, "BufferSize"),
+            minimum_buffers: read_u32(guard.0, "MinimumBuffers"),
+            maximum_buffers: read_u32(guard.0, "MaximumBuffers"),
+            flush_seconds: read_u32(guard.0, "FlushTimer"),
+            providers: BTreeMap::new(),
+        };
+
+        for name in subkey_names(guard.0) {
+            if let Some(sub) = open_key(&format!("{path}\\{name}"))? {
+                let sub_guard = KeyGuard(sub);
+                state.providers.insert(
+                    name,
+                    ProviderEntry {
+                        enabled: read_u32(sub_guard.0, "Enabled"),
+                        level: read_u32(sub_guard.0, "EnableLevel"),
+                        match_any_keyword: read_u64(sub_guard.0, "MatchAnyKeyword"),
+                    },
+                );
+            }
+        }
+
+        Ok(state)
+    }
+
+    /// Whether this session is started at boot.
+    pub fn starts_at_boot(&self) -> bool {
+        self.start == Some(1)
+    }
+
+    /// Whether a live consumer could attach to it.
+    pub fn real_time(&self) -> bool {
+        self.log_file_mode
+            .is_some_and(|mode| mode & REAL_TIME_MODE != 0)
+    }
+}
+
+/// The session this deployment wants, and the commands that create it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutologgerSpec {
+    pub session: String,
+    /// The session's GUID as Windows will know it.
+    ///
+    /// Provided by the caller rather than derived, because a consumer attaches by
+    /// *name*: the GUID only has to be stable and unique, and inventing one by
+    /// hashing the name would be a guess about an implementation detail that
+    /// nothing here depends on.
+    pub guid: String,
+    pub buffers: Buffers,
+    /// `START` is always 1: a session that is not started at boot is not an
+    /// autologger.
+    pub providers: Vec<crate::session::ProviderSpec>,
+}
+
+impl AutologgerSpec {
+    pub fn new(session: impl Into<String>, guid: impl Into<String>) -> Self {
+        Self {
+            session: session.into(),
+            guid: guid.into(),
+            buffers: Buffers::default(),
+            providers: Vec::new(),
+        }
+    }
+
+    pub fn with_providers(mut self, providers: Vec<crate::session::ProviderSpec>) -> Self {
+        self.providers = providers;
+        self
+    }
+
+    pub fn with_buffers(mut self, buffers: Buffers) -> Self {
+        self.buffers = buffers;
+        self
+    }
+
+    /// The registry path of the session key.
+    pub fn key_path(&self) -> String {
+        format!("{AUTOLOGGER_ROOT}\\{}", self.session)
+    }
+
+    /// Every command needed to create the session, in order, for an elevated
+    /// prompt.
+    ///
+    /// Rendered rather than applied: see the module docs. The values come from this
+    /// struct, so a change to the buffer sizing or the provider list cannot drift
+    /// away from the instructions an operator was given.
+    pub fn reg_commands(&self) -> String {
+        let key = format!("HKLM\\{}", self.key_path());
+        let mut out = String::new();
+
+        let mut add = |path: &str, name: &str, kind: &str, value: String| {
+            out.push_str(&format!(
+                "reg add \"{path}\" /v {name} /t {kind} /d {value} /f\n"
+            ));
+        };
+
+        add(&key, "Start", "REG_DWORD", "1".into());
+        add(&key, "Guid", "REG_SZ", self.guid.clone());
+        add(
+            &key,
+            "LogFileMode",
+            "REG_DWORD",
+            format!("0x{:08x}", REAL_TIME_MODE),
+        );
+        add(
+            &key,
+            "BufferSize",
+            "REG_DWORD",
+            format!("0x{:x}", self.buffers.size_kb),
+        );
+        add(
+            &key,
+            "MinimumBuffers",
+            "REG_DWORD",
+            format!("0x{:x}", self.buffers.minimum),
+        );
+        add(
+            &key,
+            "MaximumBuffers",
+            "REG_DWORD",
+            format!("0x{:x}", self.buffers.maximum.max(self.buffers.minimum)),
+        );
+        add(
+            &key,
+            "FlushTimer",
+            "REG_DWORD",
+            format!("0x{:x}", self.buffers.flush_seconds.max(1)),
+        );
+
+        for spec in &self.providers {
+            let sub = format!("{key}\\{}", format_guid(&spec.guid));
+            add(&sub, "Enabled", "REG_DWORD", "1".into());
+            add(
+                &sub,
+                "EnableLevel",
+                "REG_DWORD",
+                format!("0x{:x}", spec.level),
+            );
+            add(
+                &sub,
+                "MatchAnyKeyword",
+                "REG_QWORD",
+                format!("0x{:016x}", spec.keywords),
+            );
+        }
+
+        out
+    }
+
+    /// What is wrong with a session that was read back, as sentences.
+    ///
+    /// Empty means the host telemetry is configured as this deployment expects. Each
+    /// string is a fact about a specific value, because "the autologger is broken" is
+    /// not something an operator can act on.
+    pub fn problems(&self, state: &AutologgerState) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        if !state.present {
+            problems.push(format!(
+                "no autologger session named `{}`; the host has no boot-time telemetry",
+                self.session
+            ));
+            return problems;
+        }
+        if !state.starts_at_boot() {
+            problems.push(format!(
+                "`Start` is {:?}, so the session is not started at boot",
+                state.start
+            ));
+        }
+        if !state.real_time() {
+            problems.push(format!(
+                "`LogFileMode` is {:?} and does not include EVENT_TRACE_REAL_TIME_MODE \
+                 ({REAL_TIME_MODE:#x}), so no consumer can attach",
+                state.log_file_mode
+            ));
+        }
+        if state.buffer_size_kb != Some(self.buffers.size_kb) {
+            problems.push(format!(
+                "`BufferSize` is {:?}, expected {}",
+                state.buffer_size_kb, self.buffers.size_kb
+            ));
+        }
+        if state.maximum_buffers != Some(self.buffers.maximum) {
+            problems.push(format!(
+                "`MaximumBuffers` is {:?}, expected {}",
+                state.maximum_buffers, self.buffers.maximum
+            ));
+        }
+        if state.flush_seconds != Some(self.buffers.flush_seconds) {
+            problems.push(format!(
+                "`FlushTimer` is {:?}, expected {}",
+                state.flush_seconds, self.buffers.flush_seconds
+            ));
+        }
+
+        for spec in &self.providers {
+            let name = format_guid(&spec.guid);
+            match state.providers.get(&name) {
+                None => problems.push(format!(
+                    "provider {name} ({}) is not in the session, so nothing it emits is collected",
+                    spec.name
+                )),
+                Some(entry) if entry.enabled != Some(1) => problems.push(format!(
+                    "provider {name} ({}) has `Enabled` = {:?}, expected 1",
+                    spec.name, entry.enabled
+                )),
+                Some(entry) => match entry.match_any_keyword {
+                    None => problems.push(format!(
+                        "provider {name} ({}) has no `MatchAnyKeyword`, so it is \
+                         subscribed to every keyword ({:#x} intended)",
+                        spec.name, spec.keywords
+                    )),
+                    // The check that was missing: an altered mask is a tamper,
+                    // and the whole module exists to notice one. Absent is the
+                    // only case that used to fire, and absent is not the shape
+                    // a tamper actually takes — the tamper narrows the mask,
+                    // which silently drops a subset of the traffic while the
+                    // check reports nothing.
+                    Some(actual) if spec.keywords != 0 && actual != spec.keywords => {
+                        problems.push(format!(
+                            "provider {name} ({}) has `MatchAnyKeyword` = {actual:#x}, \
+                             expected {:#x}; the session is dropping the difference",
+                            spec.name, spec.keywords
+                        ));
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+
+        problems
+    }
+}
+
+/// A GUID in the canonical `{8-4-4-4-12}` spelling, which is what the registry
+/// and every other Windows tool use.
+pub fn format_guid(guid: &GUID) -> String {
+    let b = guid.data4;
+    format!(
+        "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+        guid.data1, guid.data2, guid.data3, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
+    )
+}
+
+// ---------------------------------------------------------------------------
+// registry plumbing
+// ---------------------------------------------------------------------------
+
+/// Closes a key on every path out of the scope that opened it.
+struct KeyGuard(HKEY);
+
+impl Drop for KeyGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = RegCloseKey(self.0);
+        }
+    }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Open a key under `HKLM`, or `None` when it does not exist.
+fn open_key(path: &str) -> Result<Option<HKEY>, EtwError> {
+    let path = wide(path);
+    let mut key = HKEY::default();
+
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(path.as_ptr()),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+    };
+    match rc {
+        ERROR_SUCCESS => Ok(Some(key)),
+        ERROR_FILE_NOT_FOUND => Ok(None),
+        other => Err(EtwError::Registry {
+            path: path_to_string(&path),
+            code: other.0,
+        }),
+    }
+}
+
+fn path_to_string(units: &[u16]) -> String {
+    let trimmed = units.split(|u| *u == 0).next().unwrap_or(units);
+    String::from_utf16_lossy(trimmed)
+}
+
+/// Read a value's raw bytes and type.
+fn read_raw(key: HKEY, name: &str) -> Option<(Vec<u8>, REG_VALUE_TYPE)> {
+    let name = wide(name);
+    let mut kind = REG_VALUE_TYPE::default();
+    let mut size = 0u32;
+
+    // Size first: the values here are small and fixed, but a registry is not a
+    // place to assume, and `RegQueryValueExW` writes the needed size back.
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            None,
+            Some(&mut kind),
+            None,
+            Some(&mut size),
+        )
+    };
+    if rc != ERROR_SUCCESS || size == 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; size as usize];
+    let mut size2 = size;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            None,
+            Some(&mut kind),
+            Some(buf.as_mut_ptr()),
+            Some(&mut size2),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    buf.truncate(size2 as usize);
+    Some((buf, kind))
+}
+
+fn read_u32(key: HKEY, name: &str) -> Option<u32> {
+    let (bytes, kind) = read_raw(key, name)?;
+    match kind {
+        REG_DWORD => bytes
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        // Windows is happy to store a small number as a QWORD, and a reader that
+        // insists on exactly four bytes reports "not set" on a value that is set.
+        REG_QWORD => bytes
+            .get(..8)
+            .map(|b| u32::try_from(u64::from_le_bytes(b[..8].try_into().ok()?)).ok())
+            .unwrap_or(None),
+        _ => None,
+    }
+}
+
+fn read_u64(key: HKEY, name: &str) -> Option<u64> {
+    let (bytes, kind) = read_raw(key, name)?;
+    match kind {
+        REG_QWORD => bytes
+            .get(..8)
+            .map(|b| u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))),
+        REG_DWORD => bytes
+            .get(..4)
+            .map(|b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+        _ => None,
+    }
+}
+
+fn read_string(key: HKEY, name: &str) -> Option<String> {
+    let (bytes, kind) = read_raw(key, name)?;
+    if kind != REG_SZ && kind != REG_EXPAND_SZ {
+        return None;
+    }
+    // A `wstring` value: UTF-16, normally NUL-terminated, and with or without the
+    // terminator in the returned length depending on who wrote it.
+    let mut units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+    if units.is_empty() {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&units))
+    }
+}
+
+fn subkey_names(key: HKEY) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut index = 0u32;
+
+    loop {
+        let mut buf = [0u16; 128];
+        let mut len = buf.len() as u32;
+        let rc = unsafe {
+            RegEnumKeyExW(
+                key,
+                index,
+                Some(PWSTR(buf.as_mut_ptr())),
+                &mut len,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            // ERROR_NO_MORE_ITEMS and anything else end the walk: a partial list of
+            // subkeys is reported as what it is, not as a complete one.
+            break;
+        }
+        names.push(String::from_utf16_lossy(&buf[..len as usize]));
+        index += 1;
+    }
+
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider;
+    use crate::session::ProviderSpec;
+
+    /// A session name nothing should be using.
+    const ABSENT: &str = "chaos-no-such-autologger-7c41";
+
+    #[test]
+    fn an_unconfigured_session_is_reported_as_absent_not_as_an_error() {
+        // The distinction the whole self-check rests on.
+        let state = AutologgerState::read(ABSENT).expect("a missing key is not a failure");
+        assert!(!state.present);
+        assert!(!state.starts_at_boot());
+        assert!(!state.real_time());
+        assert!(state.providers.is_empty());
+    }
+
+    #[test]
+    fn a_boot_session_can_be_read_off_a_real_machine() {
+        // `EventLog-System` is an autologger that ships with Windows, so this
+        // exercises the whole read path against a key that exists — the only way to
+        // test registry plumbing without writing to the registry. Skips rather than
+        // fails on a host that does not have it, because that is a fact about the
+        // host and not about this code.
+        let Ok(state) = AutologgerState::read("EventLog-System") else {
+            return; // a refusal is a host fact; the absent-name test covers the API
+        };
+        if !state.present {
+            return;
+        }
+
+        assert_eq!(state.start, Some(1), "a shipping autologger starts at boot");
+        assert!(state.guid.is_some(), "a session key carries its GUID");
+        assert!(
+            !state.providers.is_empty(),
+            "a session with no providers could not be logging anything"
+        );
+        // Every subkey is a provider GUID, and they are readable as such.
+        for name in state.providers.keys() {
+            assert!(name.starts_with('{') && name.ends_with('}'), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_absent_session_names_every_value_it_is_missing() {
+        let spec = AutologgerSpec::new("chaos-sensor", "{11111111-2222-3333-4444-555555555555}")
+            .with_providers(provider::default_providers());
+        let problems = spec.problems(&AutologgerState::default());
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("no autologger session"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_configured_session_reports_no_problems_and_then_its_deviations() {
+        let spec = AutologgerSpec::new("chaos-sensor", "{11111111-2222-3333-4444-555555555555}")
+            .with_providers(vec![ProviderSpec {
+                guid: provider::KERNEL_PROCESS,
+                name: "Microsoft-Windows-Kernel-Process",
+                level: provider::LEVEL_INFORMATIONAL,
+                keywords: provider::KERNEL_PROCESS_KEYWORD_PROCESS
+                    | provider::KERNEL_PROCESS_KEYWORD_IMAGE,
+            }]);
+
+        let good = AutologgerState {
+            present: true,
+            start: Some(1),
+            guid: Some(spec.guid.clone()),
+            log_file_mode: Some(REAL_TIME_MODE),
+            buffer_size_kb: Some(spec.buffers.size_kb),
+            minimum_buffers: Some(spec.buffers.minimum),
+            maximum_buffers: Some(spec.buffers.maximum),
+            flush_seconds: Some(spec.buffers.flush_seconds),
+            providers: BTreeMap::from([(
+                format_guid(&provider::KERNEL_PROCESS),
+                ProviderEntry {
+                    enabled: Some(1),
+                    level: Some(u32::from(provider::LEVEL_INFORMATIONAL)),
+                    match_any_keyword: Some(
+                        provider::KERNEL_PROCESS_KEYWORD_PROCESS
+                            | provider::KERNEL_PROCESS_KEYWORD_IMAGE,
+                    ),
+                },
+            )]),
+        };
+        assert_eq!(spec.problems(&good), Vec::<String>::new());
+
+        // Now take it apart one value at a time. Each deviation has to be named
+        // separately: "the autologger is broken" is not actionable.
+        let disabled = AutologgerState {
+            start: Some(0),
+            ..good.clone()
+        };
+        assert!(
+            spec.problems(&disabled)[0].contains("not started at boot"),
+            "{:?}",
+            spec.problems(&disabled)
+        );
+
+        let to_a_file = AutologgerState {
+            log_file_mode: Some(0x0000_0001),
+            ..good.clone()
+        };
+        assert!(
+            spec.problems(&to_a_file)[0].contains("EVENT_TRACE_REAL_TIME_MODE"),
+            "{:?}",
+            spec.problems(&to_a_file)
+        );
+
+        let provider_gone = AutologgerState {
+            providers: BTreeMap::new(),
+            ..good.clone()
+        };
+        assert!(
+            spec.problems(&provider_gone)[0].contains("not in the session"),
+            "{:?}",
+            spec.problems(&provider_gone)
+        );
+
+        let provider_off = AutologgerState {
+            providers: BTreeMap::from([(
+                format_guid(&provider::KERNEL_PROCESS),
+                ProviderEntry {
+                    enabled: Some(0),
+                    ..Default::default()
+                },
+            )]),
+            ..good
+        };
+        assert!(
+            spec.problems(&provider_off)[0].contains("expected 1"),
+            "{:?}",
+            spec.problems(&provider_off)
+        );
+    }
+
+    #[test]
+    fn a_narrowed_keyword_mask_is_reported_even_though_the_value_is_present() {
+        // The tamper that used to slip through: `MatchAnyKeyword` present,
+        // `Enabled` 1, level correct — and the mask quietly narrowed so image
+        // loads stop arriving. An absent-value check cannot see this, and it is
+        // exactly the shape a tamper takes: nothing is missing, something is
+        // smaller.
+        let spec = AutologgerSpec::new("chaos-sensor", "{11111111-2222-3333-4444-555555555555}")
+            .with_providers(vec![ProviderSpec {
+                guid: provider::KERNEL_PROCESS,
+                name: "Microsoft-Windows-Kernel-Process",
+                level: provider::LEVEL_INFORMATIONAL,
+                keywords: provider::KERNEL_PROCESS_KEYWORD_PROCESS
+                    | provider::KERNEL_PROCESS_KEYWORD_IMAGE,
+            }]);
+
+        let narrowed = AutologgerState {
+            present: true,
+            start: Some(1),
+            guid: Some(spec.guid.clone()),
+            log_file_mode: Some(REAL_TIME_MODE),
+            buffer_size_kb: Some(spec.buffers.size_kb),
+            minimum_buffers: Some(spec.buffers.minimum),
+            maximum_buffers: Some(spec.buffers.maximum),
+            flush_seconds: Some(spec.buffers.flush_seconds),
+            providers: BTreeMap::from([(
+                format_guid(&provider::KERNEL_PROCESS),
+                ProviderEntry {
+                    enabled: Some(1),
+                    level: Some(u32::from(provider::LEVEL_INFORMATIONAL)),
+                    // Process only: image dropped.
+                    match_any_keyword: Some(provider::KERNEL_PROCESS_KEYWORD_PROCESS),
+                },
+            )]),
+        };
+
+        let problems = spec.problems(&narrowed);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("MatchAnyKeyword"),
+            "the message must name the value: {problems:?}"
+        );
+        assert!(
+            problems[0].contains("0x50"),
+            "and the expected mask: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_rendered_commands_carry_the_values_they_came_from() {
+        let spec = AutologgerSpec::new("chaos-sensor", "{11111111-2222-3333-4444-555555555555}")
+            .with_providers(vec![ProviderSpec {
+                guid: provider::KERNEL_PROCESS,
+                name: "Microsoft-Windows-Kernel-Process",
+                level: provider::LEVEL_INFORMATIONAL,
+                keywords: 0x50,
+            }]);
+        let commands = spec.reg_commands();
+
+        assert!(
+            commands.contains(r"HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\chaos-sensor")
+        );
+        assert!(
+            commands.contains("/v Start /t REG_DWORD /d 1 /f"),
+            "{commands}"
+        );
+        assert!(commands.contains("0x00000100"), "real time: {commands}");
+        assert!(
+            commands.contains("/v BufferSize /t REG_DWORD /d 0x80"),
+            "{commands}"
+        );
+        // The provider is a *subkey* of the session, so its GUID follows the
+        // separator rather than ending the path.
+        assert!(
+            commands.contains(r"chaos-sensor\{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"),
+            "the provider subkey is its GUID: {commands}"
+        );
+        assert!(commands.contains("/v MatchAnyKeyword /t REG_QWORD /d 0x0000000000000050"));
+
+        // One line per value, no blank lines, and nothing that runs by itself:
+        // seven session values plus three for the one provider.
+        assert_eq!(commands.lines().count(), 7 + 3, "{commands}");
+        assert!(commands.lines().all(|l| l.starts_with("reg add \"")));
+    }
+
+    #[test]
+    fn guids_are_spelled_the_way_windows_spells_them() {
+        let guid = GUID::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+        assert_eq!(format_guid(&guid), "{00112233-4455-6677-8899-aabbccddeeff}");
+        assert_eq!(
+            format_guid(&provider::KERNEL_PROCESS),
+            "{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"
+        );
+    }
+}
+//! The ETW callback: the hottest code in the product.
+//!
+//! Everything here runs on the consumer thread, once per event, with the whole
+//! session waiting on it. Two rules follow, and both are load-bearing:
+//!
+//! * **Never block.** A callback that waits on a full channel stalls
+//!   `ProcessTrace`, and the kernel responds by dropping events in bulk. Losing
+//!   one event to `try_send` is strictly cheaper than losing the buffer.
+//! * **Never panic.** Unwinding out of an `extern "system"` frame aborts the
+//!   process. Every operation below is total: checked lengths, saturating
+//!   arithmetic, no indexing that can go out of range.
+//!
+//! The callback does exactly one piece of real work: copy `UserData`. That
+//! pointer is only valid for the duration of the call, and the *copy* is what
+//! makes deferred decoding possible at all — TDH can rebuild a synthetic
+//! `EVENT_RECORD` over our own buffer later, but it can never survive the
+//! kernel recycling the original.
+//!
+//! # Legacy formats the callback filters before the decoder sees them
+//!
+//! Three event-header flags mark formats that TDH cannot decode:
+//!
+//! * `EVENT_HEADER_FLAG_CLASSIC_HEADER` (`0x0001`) — a pre-manifest event whose
+//!   descriptor is a legacy `EVENT_CLASSIC_HEADER` rather than an
+//!   `EVENT_DESCRIPTOR`. Counted as `classic`.
+//! * `EVENT_HEADER_FLAG_STRING_ONLY` (`0x0004`) — the event data is a bare
+//!   null-terminated Unicode string with no properties. TDH has no field names
+//!   to resolve, so an event like this counted as `undecodable` would be a
+//!   false positive in the failure counter. Counted as `string_only`.
+//! * `EVENT_HEADER_FLAG_TRACE_MESSAGE` (`0x0008`) — the provider used the WPP
+//!   trace-message function rather than a manifest. Also no named properties.
+//!   Counted as `trace_message`.
+//!
+//! Before this filter, the two legacy formats silently inflated `undecodable`
+//! on any host that still runs WPP providers — which is most of them.
+
+use crate::stats::Stats;
+use crossbeam_channel::Sender;
+use model::{EventSource, ProviderId, RawEvent};
+use std::slice;
+use windows::Win32::System::Diagnostics::Etw::{
+    EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
+    EVENT_HEADER_FLAG_CLASSIC_HEADER, EVENT_HEADER_FLAG_STRING_ONLY,
+    EVENT_HEADER_FLAG_TRACE_MESSAGE, EVENT_RECORD,
+};
+use windows::core::GUID;
+
+/// `EVENT_HEADER_FLAG_STRING_ONLY` from `evntcons.h`.
+///
+/// The windows-rs binding declares these flags as `u32` while the header
+/// field is `u16`. The alias is `u32` and the header field is widened at
+/// the read site, so the two sides of the comparison are the same width
+/// without a second cast.
+const FLAG_STRING_ONLY: u32 = EVENT_HEADER_FLAG_STRING_ONLY;
+
+/// `EVENT_HEADER_FLAG_TRACE_MESSAGE` from `evntcons.h`.
+const FLAG_TRACE_MESSAGE: u32 = EVENT_HEADER_FLAG_TRACE_MESSAGE;
+
+/// `EVENT_HEADER_FLAG_32_BIT_HEADER` from `evntcons.h`.
+///
+/// Not exposed as a named constant in this version of windows-rs. The value
+/// is stable: the event was logged by a 32-bit process (including a WOW64
+/// process on a 64-bit host).
+const FLAG_32_BIT_HEADER: u32 = 0x0020;
+
+/// An ETW event, paired with the routing detail the wire format deliberately
+/// does not carry.
+#[derive(Debug, Clone)]
+pub struct EtwRaw {
+    pub wire: RawEvent,
+    pub guid: GUID,
+    pub version: u8,
+    pub opcode: u8,
+    pub keyword: u64,
+    /// ETW's own correlation identifier. The kernel already computed a causal
+    /// graph here; A4 gets to start from it rather than reconstructing one.
+    pub activity_id: [u8; 16],
+    pub related_activity_id: Option<[u8; 16]>,
+    /// A kernel-generated process identity that survives PID reuse.
+    pub process_start_key: Option<u64>,
+    /// Whether the provider was 32-bit or a WOW64 process.
+    ///
+    /// From `EVENT_HEADER_FLAG_32_BIT_HEADER`. The header's ProcessId is
+    /// always a 32-bit PID; this flag is what distinguishes a native 64-bit
+    /// process from a WOW64 one that happens to share the PID space.
+    pub is_wow64: bool,
+}
+
+impl EtwRaw {
+    /// Stable identity for the process that emitted this event.
+    pub fn process_identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.wire.pid,
+            start_key: self.process_start_key,
+        }
+    }
+}
+
+/// A process reference that is safe to key state on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_key: Option<u64>,
+}
+
+/// Shared state the callback reaches through `EVENT_RECORD::UserContext`.
+pub(crate) struct CallbackContext {
+    pub(crate) tx: Sender<EtwRaw>,
+    pub(crate) stats: Stats,
+    pub(crate) providers: Vec<(GUID, ProviderId)>,
+    pub(crate) max_level: u8,
+}
+
+/// The callback itself.
+///
+/// # Safety
+/// Called by ETW with a valid `EVENT_RECORD` whose `UserContext` is the
+/// `Arc<CallbackContext>` kept alive by `EtwSession`.
+pub(crate) unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
+    if record.is_null() {
+        return;
+    }
+    let ctx = unsafe { (*record).UserContext as *const CallbackContext };
+    if ctx.is_null() {
+        return;
+    }
+    let (rec, ctx) = (unsafe { &*record }, unsafe { &*ctx });
+    let header = &rec.EventHeader;
+
+    // The SDK declares the flag constants as `u32` while the header field is
+    // `u16`. Widening once here means every subsequent comparison is against
+    // `u32` and the width mismatch lives in exactly one place.
+    let flags = u32::from(header.Flags);
+
+    // Classic header: pre-manifest, cannot be decoded.
+    if flags & EVENT_HEADER_FLAG_CLASSIC_HEADER != 0 {
+        ctx.stats.classic();
+        return;
+    }
+
+    // String-only: bare Unicode string, no properties. Previously fell
+    // through to the decoder and inflated `undecodable`.
+    if flags & FLAG_STRING_ONLY != 0 {
+        ctx.stats.string_only();
+        return;
+    }
+
+    // Trace message: WPP output, no properties. Same as above.
+    if flags & FLAG_TRACE_MESSAGE != 0 {
+        ctx.stats.trace_message();
+        return;
+    }
+
+    let descriptor = &header.EventDescriptor;
+    if descriptor.Level > ctx.max_level {
+        ctx.stats.filtered();
+        return;
+    }
+
+    let provider = match ctx
+        .providers
+        .iter()
+        .find(|(guid, _)| *guid == header.ProviderId)
+    {
+        Some((_, name)) => name.clone(),
+        None => ProviderId::new(crate::autologger::format_guid(&header.ProviderId)),
+    };
+
+    let len = (rec.UserDataLength as usize).min(model::MAX_PAYLOAD_SIZE);
+    let data = if len == 0 || rec.UserData.is_null() {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(rec.UserData as *const u8, len) }.to_vec()
+    };
+
+    let (related_activity_id, process_start_key) = unsafe { extended_data(rec) };
+
+    let is_wow64 = flags & FLAG_32_BIT_HEADER != 0;
+
+    let raw = EtwRaw {
+        wire: RawEvent {
+            source: EventSource::WindowsEtw,
+            provider,
+            event_id: descriptor.Id,
+            timestamp_raw: header.TimeStamp,
+            pid: header.ProcessId,
+            tid: header.ThreadId,
+            level: descriptor.Level,
+            data,
+        },
+        guid: header.ProviderId,
+        version: descriptor.Version,
+        opcode: descriptor.Opcode,
+        keyword: descriptor.Keyword,
+        activity_id: guid_bytes(&header.ActivityId),
+        related_activity_id,
+        process_start_key,
+        is_wow64,
+    };
+
+    ctx.stats.received(raw.wire.data.len());
+    match ctx.tx.try_send(raw) {
+        Ok(()) => ctx.stats.delivered(),
+        Err(_) => ctx.stats.dropped(),
+    }
+}
+
+/// Pull the two extended items worth the walk: the causal parent, and the
+/// process start key.
+unsafe fn extended_data(rec: &EVENT_RECORD) -> (Option<[u8; 16]>, Option<u64>) {
+    let mut related = None;
+    let mut start_key = None;
+
+    if rec.ExtendedData.is_null() || rec.ExtendedDataCount == 0 {
+        return (related, start_key);
+    }
+
+    let items = unsafe { slice::from_raw_parts(rec.ExtendedData, rec.ExtendedDataCount as usize) };
+
+    for item in items {
+        if item.DataPtr == 0 {
+            continue;
+        }
+        match u32::from(item.ExtType) {
+            EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID if item.DataSize >= 16 => {
+                let mut buf = [0u8; 16];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(item.DataPtr as *const u8, buf.as_mut_ptr(), 16)
+                };
+                related = Some(buf);
+            }
+            EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY if item.DataSize >= 8 => {
+                let mut buf = [0u8; 8];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(item.DataPtr as *const u8, buf.as_mut_ptr(), 8)
+                };
+                start_key = Some(u64::from_le_bytes(buf));
+            }
+            _ => {}
+        }
+    }
+
+    (related, start_key)
+}
+
+/// GUID as raw bytes, for the causal identifiers we keep opaquely.
+fn guid_bytes(guid: &GUID) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&guid.data1.to_le_bytes());
+    out[4..6].copy_from_slice(&guid.data2.to_le_bytes());
+    out[6..8].copy_from_slice(&guid.data3.to_le_bytes());
+    out[8..16].copy_from_slice(&guid.data4);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::GUID;
+
+    #[test]
+    fn guid_bytes_use_the_canonical_windows_layout() {
+        let g = GUID::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+        let b = guid_bytes(&g);
+
+        assert_eq!(b[0..4], 0x0011_2233u32.to_le_bytes());
+        assert_eq!(b[4..6], 0x4455u16.to_le_bytes());
+        assert_eq!(b[6..8], 0x6677u16.to_le_bytes());
+        assert_eq!(b[8..16], [0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+
+        assert_eq!(
+            b,
+            [
+                0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ]
+        );
+        assert_ne!(
+            u128::from_le_bytes(b),
+            0x0011_2233_4455_6677_8899_aabb_ccdd_eeff
+        );
+    }
+
+    #[test]
+    fn process_identity_distinguishes_reused_pids() {
+        let base = EtwRaw {
+            wire: RawEvent {
+                source: EventSource::WindowsEtw,
+                provider: ProviderId::new("p"),
+                event_id: 1,
+                timestamp_raw: 0,
+                pid: 4242,
+                tid: 1,
+                level: 4,
+                data: Vec::new(),
+            },
+            guid: GUID::from_u128(1),
+            version: 0,
+            opcode: 0,
+            keyword: 0,
+            activity_id: [0; 16],
+            related_activity_id: None,
+            process_start_key: Some(100),
+            is_wow64: false,
+        };
+
+        let first = base.process_identity();
+        let mut recycled = base.clone();
+        recycled.process_start_key = Some(200);
+        let second = recycled.process_identity();
+
+        assert_eq!(first.pid, second.pid, "same PID...");
+        assert_ne!(first, second, "...different process");
+        assert_eq!(first.start_key, Some(100));
+    }
+
+    #[test]
+    fn a_missing_start_key_still_yields_an_identity() {
+        let id = ProcessIdentity {
+            pid: 7,
+            start_key: None,
+        };
+        assert_eq!(id.pid, 7);
+        assert!(id.start_key.is_none());
+    }
+}
+//! TDH decoding: turning the opaque payload in an [`EtwRaw`] into named fields.
+//!
+//! The central trick is that TDH can only read a *live* `EVENT_RECORD`, and the
+//! kernel recycles the real one the moment the callback returns. Because the
+//! callback copied `UserData` into our own buffer, we can rebuild a synthetic
+//! record that points at that copy, restores the descriptor fields TDH keys its
+//! schema lookup on, and hand it over. Everything else here follows from that:
+//! the decode is deferred, so it costs nothing on the hot path, and it is free
+//! to be as slow as it needs to be.
+//!
+//! What went into the synthetic record is the reason `EtwRaw` carries a GUID, a
+//! version, an opcode and a keyword that the wire format does not: TDH resolves
+//! a schema from the provider GUID plus the event descriptor, and a provider
+//! *name* is not invertible back into either.
+//!
+//! # Why the schema is fetched, not guessed
+//!
+//! `TdhGetProperty` returns a byte buffer and nothing else; it does not say
+//! whether those bytes are a `UInt32`, four bytes of a `Binary` field, or the
+//! first half of a UTF-16 string. Guessing from the width works until it does
+//! not: the registry provider's `CapturedData` is declared `Binary`, and a
+//! `REG_DWORD` Run value is four bytes, so a width-based guess reads an integer
+//! where the manifest says bytes and never notices.
+//!
+//! `TdhGetEventInformation` *does* return the declared `InType` of every
+//! property, and the answer is stable per `(provider, event id, version)`.
+//! [`Decoder`] fetches it once per schema and caches it, so a field's type is a
+//! fact rather than a guess and the cost is one extra TDH call on the first
+//! event of each shape.
+//!
+//! [`Decoder::text`] uses the typed path *first*. A 26-byte UTF-16 DNS name
+//! looks like a 26-byte blob to the untyped path, and rendering it as hex is
+//! how the first live run printed `hif-leim.deepseek.com` as
+//! `6800690066002d006c00650069006d...`. The typed path knows the field is a
+//! `UnicodeString` and decodes accordingly.
+//!
+//! Field extraction is still by name (`TdhGetProperty` addresses properties by
+//! `PCWSTR`, not by index), so the names are the one thing that has to be right.
+//! They come from the provider's manifest, and the manifest can be read on any
+//! machine without elevation by running `../tools/dump-fields.ps1`:
+//!
+//! ```text
+//! powershell -NoProfile -ExecutionPolicy Bypass -File tools/dump-fields.ps1 `
+//!     -Provider Microsoft-Windows-Kernel-Process
+//! ```
+//!
+//! That is how the table in `translate` was built, and it is how to check it
+//! rather than trust it. Not `wevtutil gp`: it prints a provider's channels,
+//! levels, opcodes and tasks and says nothing at all about the data fields.
+
+use crate::callback::EtwRaw;
+use std::collections::HashMap;
+use std::ffi::c_void;
+use windows::Win32::System::Diagnostics::Etw::{
+    EVENT_DESCRIPTOR, EVENT_HEADER, EVENT_PROPERTY_INFO, EVENT_RECORD, PROPERTY_DATA_DESCRIPTOR,
+    TRACE_EVENT_INFO, TdhGetEventInformation, TdhGetProperty, TdhGetPropertySize,
+};
+use windows::core::{GUID, PCWSTR};
+
+/// Largest single property we will read. Command lines and image paths are the
+/// big ones and they are nowhere near this; anything larger is a malformed
+/// event and gets truncated rather than trusted.
+pub const MAX_FIELD_BYTES: usize = 4096;
+
+/// Largest schema buffer we will accept from TDH. A real template is a few
+/// hundred bytes; this is a sanity ceiling so a malformed manifest cannot make
+/// the sensor allocate a gigabyte.
+pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+
+/// A decoded property value.
+///
+/// The variants are the shapes TDH's `InType` actually resolves to for the
+/// providers this crate enables. `U8` rather than `Bool` because ETW's
+/// `Boolean` is a one-byte `0`/`1` on the wire and giving it its own variant
+/// would be inventing a type the manifest does not declare.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    Str(String),
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+    Guid([u8; 16]),
+    Binary(Vec<u8>),
+}
+
+/// The subset of TDH's `InType` that this crate acts on.
+///
+/// The numbers are the `TDH_INTYPE_*` constants from `tdh.h`; windows-rs does
+/// not expose them as named items, so they are spelled out here. Only the types
+/// a manifest provider actually declares in the fields this crate reads are
+/// matched; everything else becomes [`FieldType::Unknown`] and is kept as bytes,
+/// which is the honest answer for a type we do not decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldType {
+    UnicodeString,
+    AnsiString,
+    CountedString,
+    NonNullTerminatedString,
+    Int8,
+    UInt8,
+    Int16,
+    UInt16,
+    Int32,
+    UInt32,
+    Int64,
+    UInt64,
+    Float,
+    Double,
+    Boolean,
+    Binary,
+    Guid,
+    Pointer,
+    FileTime,
+    SystemTime,
+    HexInt32,
+    HexInt64,
+    Sid,
+    WbemSid,
+    Unknown(u16),
+}
+
+impl FieldType {
+    pub(crate) fn from_tdh(value: u16) -> Self {
+        match value {
+            1 => Self::UnicodeString,
+            2 => Self::AnsiString,
+            300 => Self::CountedString,
+            304 => Self::NonNullTerminatedString,
+            3 => Self::Int8,
+            4 => Self::UInt8,
+            5 => Self::Int16,
+            6 => Self::UInt16,
+            7 => Self::Int32,
+            8 => Self::UInt32,
+            9 => Self::Int64,
+            10 => Self::UInt64,
+            11 => Self::Float,
+            12 => Self::Double,
+            13 => Self::Boolean,
+            14 => Self::Binary,
+            15 => Self::Guid,
+            16 => Self::Pointer,
+            17 => Self::FileTime,
+            18 => Self::SystemTime,
+            19 => Self::Sid,
+            20 => Self::HexInt32,
+            21 => Self::HexInt64,
+            309 => Self::WbemSid,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Whether the type is a string whose bytes should be decoded as text
+    /// rather than kept as bytes. The string types TDH can return differ only
+    /// in their terminator convention, which [`utf16_to_string`] already
+    /// handles by stopping at the first NUL.
+    pub const fn is_string(self) -> bool {
+        matches!(
+            self,
+            Self::UnicodeString
+                | Self::CountedString
+                | Self::NonNullTerminatedString
+                | Self::WbemSid
+        )
+    }
+}
+
+/// A `(provider, event id, version)` triple. `Version` is in the key because a
+/// provider can declare two different templates for the same event id at
+/// different versions, and `EVENT_DESCRIPTOR::Version` is what selects one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SchemaKey {
+    provider: GUID,
+    event_id: u16,
+    version: u8,
+}
+
+/// A template's property names and their declared types, as TDH reported them.
+#[derive(Debug, Default)]
+struct Schema {
+    /// Property name to `InType` as TDH spelled it. Kept as a `BTreeMap` for
+    /// determinism across runs, which matters when a failure message is the
+    /// thing being diffed.
+    properties: std::collections::BTreeMap<Box<str>, u16>,
+    /// Set once TDH has refused the schema for a key. Without this, an event
+    /// from a provider whose manifest is not registered would pay a failed
+    /// `TdhGetEventInformation` call on every single event.
+    unresolvable: bool,
+}
+
+/// Reusable decode state.
+///
+/// Holds one scratch buffer so a run of events sharing a schema does not
+/// allocate per field, and one schema cache so the declared type of every
+/// property is fetched once per `(provider, event id, version)` rather than
+/// guessed from the byte width of each value.
+///
+/// `Decoder` is not `Sync`: it is meant to live on the single thread that
+/// consumes a session.
+#[derive(Debug, Default)]
+pub struct Decoder {
+    scratch: Vec<u8>,
+    name: Vec<u16>,
+    schemas: HashMap<SchemaKey, Schema>,
+}
+
+/// Rebuild a record TDH will accept from bytes we own.
+///
+/// `payload` must be the same buffer that `UserData` points at. The returned
+/// record borrows it, so it must not outlive this scope.
+fn synthetic_record(raw: &EtwRaw, payload: *mut u8) -> EVENT_RECORD {
+    let mut record = EVENT_RECORD::default();
+
+    record.EventHeader = EVENT_HEADER {
+        ProviderId: raw.guid,
+        EventDescriptor: EVENT_DESCRIPTOR {
+            Id: raw.wire.event_id,
+            Version: raw.version,
+            Level: raw.wire.level,
+            Opcode: raw.opcode,
+            ..Default::default()
+        },
+        ProcessId: raw.wire.pid,
+        ThreadId: raw.wire.tid,
+        TimeStamp: raw.wire.timestamp_raw,
+        ..Default::default()
+    };
+
+    record.UserDataLength = raw.wire.data.len().min(u16::MAX as usize) as u16;
+    record.UserData = payload as *mut c_void;
+    record
+}
+
+impl Decoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read a property as an owned value, using the schema's declared type to
+    /// decide what the bytes mean.
+    ///
+    /// Returns `None` when the schema does not know the field, when the event
+    /// cannot be resolved at all, or when TDH refuses the property call. A
+    /// missing field is a normal outcome — manifests differ between Windows
+    /// builds — so it is not an error, but callers should treat a `None` on a
+    /// field they depend on as a reason to lower confidence rather than to
+    /// guess.
+    ///
+    /// This is the accessor `translate` should use for every field whose
+    /// declared type is not obvious from the name alone, which is every
+    /// `Binary` field and every registry value.
+    pub fn typed_field(&mut self, raw: &EtwRaw, name: &str) -> Option<(FieldValue, FieldType)> {
+        let ty = self.declared_type(raw, name)?;
+        let bytes = self.raw_property(raw, name)?;
+        Some((classify_typed(&bytes, ty), ty))
+    }
+
+    /// Read a property as an owned value, classifying it by byte width.
+    ///
+    /// Kept for fields that are known by the caller to be fixed-width scalars
+    /// (a `ProcessID`, a `QueryType`) and for which the schema lookup would be
+    /// an extra call for no information. New code should prefer
+    /// [`Self::typed_field`] where the type is not obvious.
+    pub fn field(&mut self, raw: &EtwRaw, name: &str) -> Option<FieldValue> {
+        let bytes = self.raw_property(raw, name)?;
+        Some(classify(&bytes))
+    }
+
+    /// Look up the declared type of `property` in the event's schema.
+    ///
+    /// `None` means the schema does not resolve — no manifest registered, a
+    /// malformed payload, an event whose template has no such name. Callers
+    /// that *must* have an answer should treat that as a reason to skip the
+    /// event, not as a reason to fall back to the byte-width guess.
+    pub fn declared_type(&mut self, raw: &EtwRaw, property: &str) -> Option<FieldType> {
+        if raw.wire.data.is_empty() {
+            return None;
+        }
+
+        let key = SchemaKey {
+            provider: raw.guid,
+            event_id: raw.wire.event_id,
+            version: raw.version,
+        };
+
+        let schema = match self.schemas.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // The scratch is repopulated below for the property call;
+                // building it here and again there is the one place this
+                // happens twice, and it is only on a schema's first event.
+                self.scratch.clear();
+                self.scratch.extend_from_slice(&raw.wire.data);
+                let record = synthetic_record(raw, self.scratch.as_mut_ptr());
+                // SAFETY: `record` is a valid synthetic record for the duration
+                // of this scope, and `load_schema` does not retain it.
+                e.insert(unsafe { load_schema(&record) })
+            }
+        };
+
+        if schema.unresolvable {
+            return None;
+        }
+        let raw_type = *schema.properties.get(property)?;
+        Some(FieldType::from_tdh(raw_type))
+    }
+
+    /// The TDH round trip, unchanged: size, copy, return the bytes.
+    ///
+    /// Deliberately does *not* interpret the bytes. Two callers want the same
+    /// bytes for different reasons — the typed path wants to classify by
+    /// declared type, the untyped path by width — and this is the shared half.
+    fn raw_property(&mut self, raw: &EtwRaw, name: &str) -> Option<Vec<u8>> {
+        if raw.wire.data.is_empty() {
+            // TDH needs the payload to parse anything at all, but a header-only
+            // event is still legitimate.
+            return None;
+        }
+
+        self.name.clear();
+        self.name.extend(name.encode_utf16());
+        self.name.push(0);
+
+        let descriptor = PROPERTY_DATA_DESCRIPTOR {
+            PropertyName: self.name.as_ptr() as u64,
+            ArrayIndex: u32::MAX,
+            Reserved: 0,
+        };
+
+        // The payload must be mutable for the synthetic record's pointer, even
+        // though TDH only reads it. Copying into scratch also guarantees the
+        // borrow outlives the call.
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&raw.wire.data);
+
+        let record = synthetic_record(raw, self.scratch.as_mut_ptr());
+
+        let mut size: u32 = 0;
+        let rc = unsafe { TdhGetPropertySize(&record, None, &[descriptor], &mut size) };
+        if rc != 0 || size == 0 || size as usize > MAX_FIELD_BYTES {
+            return None;
+        }
+
+        let mut buffer = vec![0u8; size as usize];
+        let rc = unsafe { TdhGetProperty(&record, None, &[descriptor], &mut buffer) };
+        if rc != 0 {
+            return None;
+        }
+
+        Some(buffer)
+    }
+
+    /// Read a property as text.
+    ///
+    /// Uses the **typed** path first. TDH's declared type is what tells us a
+    /// field is a `UnicodeString` (decode as UTF-16) rather than a `Binary`
+    /// blob (render as hex). The untyped path can only guess from byte width,
+    /// and a 26-byte UTF-16 DNS name looks like a 26-byte blob to it — which
+    /// is why the first live run printed `hif-leim.deepseek.com` as
+    /// `6800690066002d006c00650069006d...`.
+    ///
+    /// Falls back to the untyped path when the schema does not resolve, which
+    /// is normal for a provider whose manifest is not registered on this
+    /// build.
+    pub fn text(&mut self, raw: &EtwRaw, name: &str) -> Option<String> {
+        if let Some((value, _ty)) = self.typed_field(raw, name) {
+            return Some(render_text(&value));
+        }
+        Some(render_text(&self.field(raw, name)?))
+    }
+
+    pub fn u32(&mut self, raw: &EtwRaw, name: &str) -> Option<u32> {
+        match self.field(raw, name)? {
+            FieldValue::U32(v) => Some(v),
+            FieldValue::U16(v) => Some(u32::from(v)),
+            FieldValue::U8(v) => Some(u32::from(v)),
+            FieldValue::U64(v) => u32::try_from(v).ok(),
+            FieldValue::I32(v) => u32::try_from(v).ok(),
+            FieldValue::I64(v) => u32::try_from(v).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn u64(&mut self, raw: &EtwRaw, name: &str) -> Option<u64> {
+        match self.field(raw, name)? {
+            FieldValue::U64(v) => Some(v),
+            FieldValue::U32(v) => Some(u64::from(v)),
+            FieldValue::U16(v) => Some(u64::from(v)),
+            FieldValue::U8(v) => Some(u64::from(v)),
+            FieldValue::I64(v) => u64::try_from(v).ok(),
+            FieldValue::I32(v) => u64::try_from(v).ok(),
+            _ => None,
+        }
+    }
+
+    /// Return the first field that resolves, trying `names` in order.
+    ///
+    /// Manifests rename fields between Windows versions (`ProcessID` versus
+    /// `ProcessId` versus `NewProcessId` are all real), and a lookup chain costs
+    /// a few failed `TdhGetPropertySize` calls only on the first event of a
+    /// schema.
+    pub fn text_any(&mut self, raw: &EtwRaw, names: &[&str]) -> Option<String> {
+        names.iter().find_map(|n| self.text(raw, n))
+    }
+
+    pub fn u32_any(&mut self, raw: &EtwRaw, names: &[&str]) -> Option<u32> {
+        names.iter().find_map(|n| self.u32(raw, n))
+    }
+}
+
+/// Ask TDH for a schema. First call discovers the buffer size; second fills it.
+///
+/// Both calls are cheap relative to the events that will reuse the result, and
+/// the result is cached per `(provider, event id, version)` by the caller.
+///
+/// # Safety
+///
+/// `record` must be a valid `EVENT_RECORD` whose `UserData` points at a live
+/// buffer for the duration of both calls.
+unsafe fn load_schema(record: &EVENT_RECORD) -> Schema {
+    let unresolvable = Schema {
+        properties: Default::default(),
+        unresolvable: true,
+    };
+
+    let mut size: u32 = 0;
+    // The first call is the size probe. `ERROR_INSUFFICIENT_BUFFER` is the
+    // success case here; TDH reports the needed size in `size` regardless of
+    // the return code, so we only check the size.
+    let _ = unsafe { TdhGetEventInformation(record, None, None, &mut size) };
+    if size == 0 || size as usize > MAX_SCHEMA_BYTES {
+        return unresolvable;
+    }
+
+    let mut buffer = vec![0u8; size as usize];
+    let rc = unsafe {
+        TdhGetEventInformation(
+            record,
+            None,
+            Some(buffer.as_mut_ptr() as *mut TRACE_EVENT_INFO),
+            &mut size,
+        )
+    };
+    if rc != 0 {
+        return unresolvable;
+    }
+    buffer.truncate(size as usize);
+
+    // SAFETY: `buffer` was filled by `TdhGetEventInformation` on the second
+    // call, which is the precondition `parse_schema` documents.
+    unsafe { parse_schema(&buffer) }.unwrap_or(unresolvable)
+}
+
+/// Walk a `TRACE_EVENT_INFO` buffer and pull out `name -> InType`.
+///
+/// The struct ends in a variable-length array of `EVENT_PROPERTY_INFO` (the
+/// C `ANYSIZE_ARRAY` idiom, which windows-rs declares as a one-element array),
+/// and every string it references lives in the same buffer as a NUL-terminated
+/// UTF-16 run at a byte offset. Both facts are why the parse walks bytes.
+///
+/// # Safety
+///
+/// `buffer` must be a buffer that TDH filled with a `TRACE_EVENT_INFO` and its
+/// associated strings, and its length must be the byte count TDH reported.
+unsafe fn parse_schema(buffer: &[u8]) -> Option<Schema> {
+    if buffer.len() < std::mem::size_of::<TRACE_EVENT_INFO>() {
+        return None;
+    }
+
+    // SAFETY: the length check above guarantees the fixed header is in range.
+    let info = buffer.as_ptr() as *const TRACE_EVENT_INFO;
+    let property_count = unsafe { (*info).PropertyCount } as usize;
+
+    // Where the variable-length array actually begins, relative to the buffer.
+    // windows-rs names this field `EventPropertyInfoArray` and declares it as
+    // `[EVENT_PROPERTY_INFO; 1]`, so `offset_of!` on the field gives the
+    // correct start of the array in both the single- and multi-element cases.
+    let array_offset = std::mem::offset_of!(TRACE_EVENT_INFO, EventPropertyInfoArray);
+
+    let mut properties = std::collections::BTreeMap::new();
+
+    for index in 0..property_count {
+        let prop_offset = array_offset
+            .checked_add(index.checked_mul(std::mem::size_of::<EVENT_PROPERTY_INFO>())?)?;
+        if prop_offset + std::mem::size_of::<EVENT_PROPERTY_INFO>() > buffer.len() {
+            return None;
+        }
+        // SAFETY: the offset arithmetic above bounds-checks both ends of the
+        // `EVENT_PROPERTY_INFO` this reads.
+        let prop = unsafe { &*(buffer.as_ptr().add(prop_offset) as *const EVENT_PROPERTY_INFO) };
+
+        // The name is a NUL-terminated UTF-16 string at a byte offset into the
+        // same buffer. A missing name means a struct or array property, which
+        // this crate does not decode: it has no single scalar type and TDH
+        // will not let you address it by name anyway.
+        let Some(name) = read_wide_at(buffer, prop.NameOffset as usize) else {
+            continue;
+        };
+
+        // `InType` is the first `u16` of the `nonStructType` arm of the union.
+        // The `structType` and `arrayType` arms share those two bytes, so the
+        // read is the same number regardless of which arm TDH filled in.
+        // windows-rs exposes the union as `Anonymous1`; the field names inside
+        // are `nonStructType` / `structType` / `arrayType`. Verify against the
+        // installed version if this does not compile.
+        // SAFETY: `prop` is a valid, aligned `EVENT_PROPERTY_INFO` and the
+        // union is initialized by TDH with the InType field in every arm.
+        let in_type: u16 = unsafe { prop.Anonymous1.nonStructType.InType };
+
+        properties.insert(name.into_boxed_str(), in_type);
+    }
+
+    Some(Schema {
+        properties,
+        unresolvable: false,
+    })
+}
+
+/// Read a NUL-terminated UTF-16 string at a byte offset into `buffer`.
+///
+/// Returns `None` for a zero offset, an odd offset, or an offset past the end.
+/// All three are how TDH says "this property has no name" — a struct property
+/// has `NameOffset == 0`, and a corrupted buffer has an offset that does not
+/// point at a string.
+fn read_wide_at(buffer: &[u8], offset: usize) -> Option<String> {
+    if offset == 0 || offset % 2 != 0 || offset >= buffer.len() {
+        return None;
+    }
+    let units: Vec<u16> = buffer[offset..]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|u| *u != 0)
+        .collect();
+    if units.is_empty() {
+        return None;
+    }
+    String::from_utf16(&units).ok()
+}
+
+/// Interpret a TDH property buffer given the schema's declared type.
+///
+/// Every branch here is a fact about the property, not a guess from its size.
+/// The `Binary` branch is the one that matters most in practice: the registry
+/// provider's `CapturedData` is a `Binary` field, and its bytes are whatever
+/// the writer wrote — a UTF-16 string, a `DWORD`, an embedded image. Hex is
+/// the honest rendering of "we know it is bytes and nothing more".
+fn classify_typed(buffer: &[u8], ty: FieldType) -> FieldValue {
+    match ty {
+        FieldType::UnicodeString
+        | FieldType::CountedString
+        | FieldType::NonNullTerminatedString
+        | FieldType::WbemSid => {
+            // A `REG_SZ` empty value arrives as just the terminator.
+            // `utf16_to_string` refuses that because for an *untyped* field
+            // "all NUL" is absence; for a typed string field, it is an empty
+            // string, which is a real value.
+            if !buffer.is_empty() && buffer.iter().all(|b| *b == 0) {
+                return FieldValue::Str(String::new());
+            }
+            utf16_to_string(buffer)
+                .map(FieldValue::Str)
+                .unwrap_or_else(|| FieldValue::Binary(buffer.to_vec()))
+        }
+
+        FieldType::AnsiString => {
+            let s = buffer
+                .split(|b| *b == 0)
+                .next()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .filter(|s| !s.is_empty());
+            s.map(FieldValue::Str)
+                .unwrap_or_else(|| FieldValue::Binary(buffer.to_vec()))
+        }
+
+        FieldType::Int8 => read::<1>(buffer)
+            .map(|b| FieldValue::I8(b[0] as i8))
+            .unwrap_or_else(empty_binary),
+        FieldType::UInt8 | FieldType::Boolean => read::<1>(buffer)
+            .map(|b| FieldValue::U8(b[0]))
+            .unwrap_or_else(empty_binary),
+        FieldType::Int16 => read::<2>(buffer)
+            .map(|b| FieldValue::I16(i16::from_le_bytes(b)))
+            .unwrap_or_else(empty_binary),
+        FieldType::UInt16 => read::<2>(buffer)
+            .map(|b| FieldValue::U16(u16::from_le_bytes(b)))
+            .unwrap_or_else(empty_binary),
+        FieldType::Int32 => read::<4>(buffer)
+            .map(|b| FieldValue::I32(i32::from_le_bytes(b)))
+            .unwrap_or_else(empty_binary),
+        FieldType::UInt32 | FieldType::HexInt32 => read::<4>(buffer)
+            .map(|b| FieldValue::U32(u32::from_le_bytes(b)))
+            .unwrap_or_else(empty_binary),
+        FieldType::Int64 => read::<8>(buffer)
+            .map(|b| FieldValue::I64(i64::from_le_bytes(b)))
+            .unwrap_or_else(empty_binary),
+        FieldType::UInt64 | FieldType::HexInt64 | FieldType::Pointer | FieldType::FileTime => {
+            read::<8>(buffer)
+                .map(|b| FieldValue::U64(u64::from_le_bytes(b)))
+                .unwrap_or_else(empty_binary)
+        }
+        FieldType::Float => read::<4>(buffer)
+            .map(|b| FieldValue::F32(f32::from_le_bytes(b)))
+            .unwrap_or_else(empty_binary),
+        FieldType::Double => read::<8>(buffer)
+            .map(|b| FieldValue::F64(f64::from_le_bytes(b)))
+            .unwrap_or_else(empty_binary),
+        FieldType::Guid => read::<16>(buffer)
+            .map(FieldValue::Guid)
+            .unwrap_or_else(empty_binary),
+        FieldType::Binary | FieldType::Sid | FieldType::SystemTime | FieldType::Unknown(_) => {
+            FieldValue::Binary(buffer.to_vec())
+        }
+    }
+}
+
+#[inline]
+fn read<const N: usize>(buffer: &[u8]) -> Option<[u8; N]> {
+    buffer.get(..N)?.try_into().ok()
+}
+
+#[inline]
+fn empty_binary() -> FieldValue {
+    FieldValue::Binary(Vec::new())
+}
+
+/// TDH returns a byte buffer whose interpretation depends on the property's
+/// declared type, which `TdhGetProperty` does not hand back. These are the
+/// widths we can distinguish without the schema.
+///
+/// Kept for callers that already know the field is a fixed-width scalar. New
+/// code that does not know should use [`Decoder::typed_field`], which asks the
+/// schema and does not have to guess. The ambiguity this documents — a 4-byte
+/// buffer could be a `U32` or four bytes of a `Binary` field — is why the
+/// typed path exists at all.
+fn classify(buffer: &[u8]) -> FieldValue {
+    match buffer.len() {
+        2 => FieldValue::U16(u16::from_le_bytes([buffer[0], buffer[1]])),
+        4 => FieldValue::U32(u32::from_le_bytes([
+            buffer[0], buffer[1], buffer[2], buffer[3],
+        ])),
+        8 => FieldValue::U64(u64::from_le_bytes([
+            buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
+        ])),
+        _ => FieldValue::Binary(buffer.to_vec()),
+    }
+}
+
+/// Render a [`FieldValue`] as text.
+///
+/// Split from [`Decoder::text`] so the untyped and typed paths share the same
+/// rendering, and so `text` stays small enough to read. This is the same
+/// rendering `translate::render_field` uses; the two are kept separate because
+/// `translate` renders values from an already-typed context and this renders
+/// whatever `Decoder` returns.
+fn render_text(value: &FieldValue) -> String {
+    match value {
+        FieldValue::Str(s) => s.clone(),
+        FieldValue::I8(v) => v.to_string(),
+        FieldValue::U8(v) => v.to_string(),
+        FieldValue::I16(v) => v.to_string(),
+        FieldValue::U16(v) => v.to_string(),
+        FieldValue::I32(v) => v.to_string(),
+        FieldValue::U32(v) => v.to_string(),
+        FieldValue::I64(v) => v.to_string(),
+        FieldValue::U64(v) => v.to_string(),
+        FieldValue::F32(v) => v.to_string(),
+        FieldValue::F64(v) => v.to_string(),
+        FieldValue::Guid(b) => hex(b),
+        FieldValue::Binary(b) => hex(b),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
+/// Decode a NUL-terminated UTF-16 string, which is how TDH returns `wstring`
+/// properties and how the manifests store every name we care about.
+pub fn utf16_to_string(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|u| *u != 0)
+        .collect();
+    if units.is_empty() {
+        return None;
+    }
+    String::from_utf16(&units).ok()
+}
+
+/// Point a `PCWSTR` at a UTF-16 name, for the TDH entry points that take one.
+pub fn wide(name: &str) -> Vec<u16> {
+    name.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Helper for callers building a `PCWSTR` from [`wide`].
+pub fn pcwstr(buf: &[u16]) -> PCWSTR {
+    PCWSTR(buf.as_ptr())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::{EventSource, ProviderId, RawEvent};
+    use windows::core::GUID;
+
+    fn raw(provider: &'static str, event_id: u16, data: Vec<u8>) -> EtwRaw {
+        EtwRaw {
+            wire: RawEvent {
+                source: EventSource::WindowsEtw,
+                provider: ProviderId::new(provider),
+                event_id,
+                timestamp_raw: 1,
+                pid: 10,
+                tid: 11,
+                level: 4,
+                data,
+            },
+            guid: GUID::from_u128(0),
+            version: 0,
+            opcode: 0,
+            keyword: 0,
+            activity_id: [0; 16],
+            related_activity_id: None,
+            process_start_key: Some(1),
+        }
+    }
+
+    #[test]
+    fn utf16_decoding_stops_at_the_terminator() {
+        let bytes = [b'h', 0, b'i', 0, 0, 0, b'x', 0];
+        assert_eq!(utf16_to_string(&bytes).as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn utf16_decoding_rejects_malformed_input() {
+        assert_eq!(utf16_to_string(&[]), None);
+        assert_eq!(utf16_to_string(&[b'a']), None, "odd length is not UTF-16");
+        assert_eq!(utf16_to_string(&[0, 0]), None, "empty string is absence");
+        assert_eq!(utf16_to_string(&[0x00, 0xd8]), None, "lone surrogate");
+    }
+
+    #[test]
+    fn wide_is_nul_terminated() {
+        let w = wide("ab");
+        assert_eq!(w, vec![0x61, 0x62, 0x00]);
+    }
+
+    #[test]
+    fn classify_maps_known_widths_and_falls_back_to_binary() {
+        assert_eq!(classify(&[1, 0]), FieldValue::U16(1));
+        assert_eq!(classify(&[1, 0, 0, 0]), FieldValue::U32(1));
+        assert_eq!(classify(&[1, 0, 0, 0, 0, 0, 0, 0]), FieldValue::U64(1));
+        assert_eq!(classify(&[1, 2, 3]), FieldValue::Binary(vec![1, 2, 3]));
+        assert_eq!(classify(&[]), FieldValue::Binary(Vec::new()));
+    }
+
+    #[test]
+    fn classify_typed_uses_the_declared_type_not_the_width() {
+        // Four bytes of `Binary` are bytes, even though four bytes of `UInt32`
+        // are an integer. This is the distinction the typed path exists for,
+        // and it is the whole reason the registry value is not shipped as the
+        // little-endian rendering of a `REG_SZ`'s first two characters.
+        assert_eq!(
+            classify_typed(&[1, 2, 3, 4], FieldType::Binary),
+            FieldValue::Binary(vec![1, 2, 3, 4])
+        );
+        assert_eq!(
+            classify_typed(&[1, 2, 3, 4], FieldType::UInt32),
+            FieldValue::U32(0x0403_0201)
+        );
+    }
+
+    #[test]
+    fn classify_typed_decodes_utf16_reg_sz_as_a_string_not_as_hex() {
+        // `REG_SZ` is a UTF-16 string. `classify` would have called eight bytes
+        // `U64` and shipped the encoding; the typed path is the reason it does
+        // not.
+        let bytes: Vec<u8> = "ab"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert_eq!(
+            classify_typed(&bytes, FieldType::UnicodeString),
+            FieldValue::Str("ab".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_typed_string_is_an_empty_string_not_absence() {
+        // A `REG_SZ` with an empty value arrives as just the terminator. That
+        // is a value, and reporting it as `Binary([0, 0])` would be wrong.
+        assert_eq!(
+            classify_typed(&[0, 0], FieldType::UnicodeString),
+            FieldValue::Str(String::new())
+        );
+    }
+
+    #[test]
+    fn classify_typed_refuses_a_truncated_scalar() {
+        // A scalar type on a buffer too short for it is a malformed event, not
+        // a value to be reinterpreted. The empty `Binary` is the honest answer.
+        assert_eq!(
+            classify_typed(&[1, 2], FieldType::UInt32),
+            FieldValue::Binary(Vec::new())
+        );
+    }
+
+    #[test]
+    fn field_type_from_tdh_covers_the_types_this_crate_decodes() {
+        assert_eq!(FieldType::from_tdh(1), FieldType::UnicodeString);
+        assert_eq!(FieldType::from_tdh(14), FieldType::Binary);
+        assert_eq!(FieldType::from_tdh(8), FieldType::UInt32);
+        assert_eq!(FieldType::from_tdh(10), FieldType::UInt64);
+        assert_eq!(FieldType::from_tdh(13), FieldType::Boolean);
+        assert_eq!(FieldType::from_tdh(99), FieldType::Unknown(99));
+    }
+
+    #[test]
+    fn an_empty_payload_yields_no_field_rather_than_a_guess() {
+        // Header-only events are legal; asking for a property on one must not
+        // invent a value.
+        let mut d = Decoder::new();
+        assert_eq!(d.field(&raw("p", 1, Vec::new()), "ImageName"), None);
+        assert_eq!(d.text(&raw("p", 1, Vec::new()), "ImageName"), None);
+        assert_eq!(d.u32(&raw("p", 1, Vec::new()), "ProcessID"), None);
+        assert_eq!(d.typed_field(&raw("p", 1, Vec::new()), "ImageName"), None);
+        assert_eq!(d.declared_type(&raw("p", 1, Vec::new()), "ImageName"), None);
+    }
+
+    #[test]
+    fn lookup_chains_return_the_first_hit() {
+        let mut d = Decoder::new();
+        // Resolution fails for every candidate on a payload TDH cannot parse,
+        // so the chain must degrade to None instead of looping or panicking.
+        let empty = raw("p", 1, Vec::new());
+        assert_eq!(d.text_any(&empty, &["A", "B", "C"]), None);
+        assert_eq!(d.u32_any(&empty, &["A", "B"]), None);
+        assert_eq!(d.text_any(&empty, &[]), None);
+    }
+
+    #[test]
+    fn synthetic_record_restores_what_tdh_keys_on() {
+        let mut payload = vec![0xABu8; 8];
+        let r = raw("Microsoft-Windows-Kernel-Process", 1, payload.clone());
+        let record = synthetic_record(&r, payload.as_mut_ptr());
+
+        assert_eq!(record.EventHeader.ProviderId, r.guid);
+        assert_eq!(record.EventHeader.EventDescriptor.Id, 1);
+        assert_eq!(record.EventHeader.EventDescriptor.Level, 4);
+        assert_eq!(record.EventHeader.ProcessId, 10);
+        assert_eq!(record.EventHeader.ThreadId, 11);
+        assert_eq!(record.EventHeader.TimeStamp, 1);
+        assert_eq!(record.UserDataLength, 8);
+        assert_eq!(record.UserData as *const u8, payload.as_ptr());
+
+        payload[0] = 0;
+        // The record aliases our buffer rather than owning a copy of it: that
+        // aliasing is the whole point, and it is why the buffer must outlive
+        // every TDH call made against the record.
+        assert_eq!(unsafe { *(record.UserData as *const u8) }, 0);
+    }
+
+    #[test]
+    fn read_wide_at_rejects_every_shape_of_absent_name() {
+        let buffer = [0x61u8, 0x00, 0x62, 0x00, 0x00, 0x00];
+        assert_eq!(read_wide_at(&buffer, 0), None, "zero offset is 'no name'");
+        assert_eq!(read_wide_at(&buffer, 1), None, "odd offset is not UTF-16");
+        assert_eq!(read_wide_at(&buffer, 100), None, "past the end");
+        assert_eq!(read_wide_at(&buffer, 2), Some("b".to_string()));
+        assert_eq!(read_wide_at(&buffer, 4), None, "all NUL is empty");
+    }
+
+    #[test]
+    fn render_text_renders_a_string_as_its_characters() {
+        // The property that made the first live run print hex: a
+        // `FieldValue::Str` must render as its characters, not as hex.
+        // The typed path produces the `Str`; this pins the render.
+        assert_eq!(
+            render_text(&FieldValue::Str("hif-leim.deepseek.com".into())),
+            "hif-leim.deepseek.com"
+        );
+        assert_eq!(render_text(&FieldValue::Binary(vec![0xab, 0xcd])), "abcd");
+        assert_eq!(render_text(&FieldValue::U32(42)), "42");
+    }
+}
+use thiserror::Error;
+use windows::core::GUID;
+
+/// Everything the sensor can fail at, with the OS error code preserved so a
+/// caller can tell "you are not elevated" apart from "someone already owns this
+/// session name".
+#[derive(Debug, Error)]
+pub enum EtwError {
+    #[error("StartTraceW failed with code {code} ({hint})")]
+    StartTrace { code: u32, hint: &'static str },
+
+    #[error("EnableTraceEx2 failed for provider {guid:?} with code {code} ({hint})")]
+    EnableProvider {
+        guid: GUID,
+        code: u32,
+        hint: &'static str,
+    },
+
+    #[error("OpenTraceW failed")]
+    OpenTrace,
+
+    #[error("ProcessTrace failed with code {0}")]
+    ProcessTrace(u32),
+
+    #[error("ControlTraceW failed with code {0}")]
+    ControlTrace(u32),
+
+    #[error("session name must not be empty")]
+    EmptySessionName,
+
+    #[error("channel capacity must be greater than zero")]
+    InvalidChannelCapacity,
+
+    #[error("failed to spawn the consumer thread: {0}")]
+    Spawn(String),
+
+    #[error("could not resolve a schema for the event: {0}")]
+    Schema(String),
+
+    #[error("no trace session named {name}")]
+    NoSuchSession { name: String },
+
+    #[error("session {name} is not real-time (LogFileMode {mode:#010x})")]
+    NotRealTime { name: String, mode: u32 },
+
+    #[error("the registry would not open {path}: code {code}")]
+    Registry { path: String, code: u32 },
+}
+
+/// Turn a Win32 error code into something an operator can act on.
+///
+/// Deliberately short: this is embedded inline in the error text *and* in the
+/// per-provider table the client prints, where a sentence would wreck the
+/// column alignment. The longer "what to do about it" belongs in [`remedy`].
+pub fn hint(code: u32) -> &'static str {
+    match code {
+        5 => "ERROR_ACCESS_DENIED -- trace sessions require an elevated token",
+        8 => "ERROR_NOT_ENOUGH_MEMORY -- reduce BufferSize or MaximumBuffers",
+        87 => "ERROR_INVALID_PARAMETER",
+        183 => "ERROR_ALREADY_EXISTS -- another process owns this session name",
+        4201 => "ERROR_WMI_INSTANCE_NOT_FOUND -- provider manifest is not registered",
+        2 => "ERROR_FILE_NOT_FOUND -- the key or value does not exist",
+        _ => "see winerror.h",
+    }
+}
+
+/// What the operator should actually do about a failure, when there is a
+/// specific answer.
+///
+/// Separate from [`hint`] because "you are not elevated" is only half an answer:
+/// the full one includes where to get an elevated prompt, and that does not fit
+/// in a table cell. Says nothing for errors whose remedy is not obvious — an
+/// invented instruction is worse than none.
+pub fn remedy(error: &EtwError) -> Option<&'static str> {
+    match error {
+        EtwError::StartTrace { code: 5, .. } => Some(
+            "open PowerShell as Administrator (Win+X, then \"Terminal (Admin)\"), \
+             cd to the same directory, and run the same command",
+        ),
+        EtwError::StartTrace { code: 183, .. } => Some(
+            "another process already owns this session name; stop the other copy of \
+             the agent, or let it exit on its own",
+        ),
+        // Attaching is what an agent does when the session was started at boot, so
+        // the two ways that fails both have a real answer.
+        EtwError::NoSuchSession { .. } => Some(
+            "nothing is publishing under that name: either the agent should start the \
+             session itself, or the autologger that was supposed to start it at boot is \
+             missing or not enabled",
+        ),
+        EtwError::NotRealTime { .. } => Some(
+            "only a real-time session can be consumed live. An autologger whose LogFileMode \
+             omits EVENT_TRACE_REAL_TIME_MODE (0x100) writes to a file and cannot be \
+             attached to; add the flag to the session's registry values",
+        ),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_denied_gets_an_actionable_hint() {
+        assert!(hint(5).contains("elevated"));
+        assert!(hint(183).contains("ALREADY_EXISTS"));
+        assert_eq!(hint(0xdead), "see winerror.h");
+    }
+
+    #[test]
+    fn a_remedy_says_where_to_get_an_elevated_prompt() {
+        let denied = EtwError::StartTrace {
+            code: 5,
+            hint: hint(5),
+        };
+        let instruction = remedy(&denied).expect("access denied has a remedy");
+        assert!(instruction.contains("Administrator"), "{instruction}");
+        assert!(
+            instruction.contains("cd to the same directory"),
+            "{instruction} — an elevated prompt opens somewhere else, so the relative --token-file would not resolve"
+        );
+
+        let taken = EtwError::StartTrace {
+            code: 183,
+            hint: hint(183),
+        };
+        assert!(remedy(&taken).expect("remedy").contains("another"));
+    }
+
+    #[test]
+    fn an_error_without_an_obvious_remedy_gets_none() {
+        // An invented instruction is worse than none: the reader follows it.
+        assert_eq!(
+            remedy(&EtwError::StartTrace {
+                code: 87,
+                hint: hint(87)
+            }),
+            None
+        );
+        assert_eq!(remedy(&EtwError::OpenTrace), None);
+    }
+}
+//! Windows ETW real-time sensor.
+//!
+//! * [`session`] owns the kernel session and the thread that blocks in
+//!   `ProcessTrace`. It is the only module that talks to the session API.
+//! * [`callback`] runs per event on that thread. It copies the payload, reads
+//!   the header, and hands off. It does no decoding, no allocation beyond the
+//!   payload copy, and no blocking.
+//! * [`decode`] runs on the consumer side, where being slow is affordable. It
+//!   rebuilds a synthetic `EVENT_RECORD` over the copied bytes, fetches the
+//!   schema TDH uses to name the fields, and reads each value by its declared
+//!   type rather than guessing from the byte width.
+//! * [`translate`] is where a decoded event becomes the wire format the
+//!   detection pipeline scores. It is the only module that knows which events
+//!   the product cares about.
+//! * [`paths`] translates the kernel's `\Device\HarddiskVolumeN\...` paths to
+//!   the DOS form (`C:\...`) that a rule author writes.
+//! * [`security`] is the self-check layer: `ntdll` prologue inspection, the
+//!   whole-`.text` comparison against disk, session health, and kernel
+//!   integrity. It turns an attack on the sensor into evidence.
+//! * [`stats`] counts what happened, including what was lost. Those counters
+//!   are what let the pipeline state an observation gap instead of assuming
+//!   one.
+//!
+//! [`error::remedy`] is the odd one out and earns its place: the two failures
+//! an operator actually hits — no elevated token, a session name already taken
+//! — have obvious answers that do not fit in the error's own line.
+//!
+//! The sensor emits [`EtwRaw`], not `RawEvent`, because local decoding needs
+//! the provider GUID, the descriptor and the extended data, none of which
+//! belong in the wire format. `EtwRaw::wire` is the part that ships.
+#![cfg(windows)]
+
+pub mod autologger;
+pub mod callback;
+pub mod decode;
+pub mod error;
+pub mod paths;
+pub mod provider;
+pub mod security;
+pub mod session;
+pub mod stats;
+pub mod translate;
+
+pub use autologger::{
+    AUTOLOGGER_ROOT, AutologgerSpec, AutologgerState, REAL_TIME_MODE, format_guid,
+};
+pub use callback::{EtwRaw, ProcessIdentity};
+pub use decode::{Decoder, FieldType, FieldValue, utf16_to_string};
+pub use error::{EtwError, hint, remedy};
+pub use paths::DevicePaths;
+pub use provider::{DNS_CLIENT, KERNEL_FILE, KERNEL_NETWORK, KERNEL_PROCESS, KERNEL_REGISTRY};
+pub use security::{
+    ExportIntegrity, JumpScan, KernelIntegrityStatus, SecurityReport, SessionHealth,
+    TextIntegrity, check_ntdll_exports, find_patch_in, full_report, query_kernel_integrity,
+    scan_for_jumps, session_health, verify_text_section,
+};
+pub use session::{
+    Buffers, EnableReport, EtwSession, ProviderSpec, SessionConfig, SessionState, is_running,
+    session_state,
+};
+pub use stats::{Stats, StatsSnapshot};
+pub use translate::{
+    GapSeverity, Shape, ShapeCounts, TelemetryGap, Translator, render_registry_value,
+};
+//! NT device path translation.
+//!
+//! The kernel reports paths as `\Device\HarddiskVolumeN\...` because that is
+//! what the kernel sees. Drive letters are a user-mode concept — the mount
+//! manager maintains the mapping, and the kernel's ETW providers do not
+//! consult it.
+//!
+//! Every tool that reads those events — Process Explorer, Sysmon, Defender —
+//! translates them to the DOS form (`C:\...`) before presenting them, because
+//! the DOS form is what a rule author writes. This module does that.
+//!
+//! # What it does not do
+//!
+//! The translation covers mounted volumes only. A path on a volume with no
+//! drive letter — a hidden recovery partition, a Windows Store app's package
+//! volume, a mounted VHD — is returned unchanged. That is the honest answer
+//! for a path the user's view of the filesystem does not include, and it
+//! keeps the caller from inventing a translation that would not resolve.
+//!
+//! # Two details that are load-bearing
+//!
+//! **The device string ends at its NUL.** `QueryDosDeviceW` reports the
+//! number of TCHARs written, and on this build that count includes the
+//! terminating NUL. Reading the whole reported length produces a device
+//! string ending in an invisible `\0`, which `strip_prefix` then fails to
+//! match against a path that has no NUL after the volume name. The string is
+//! therefore truncated at the first NUL, not at the reported length.
+//!
+//! **The root has no trailing backslash.** The suffix that `strip_prefix`
+//! returns already begins with a `\`, so the replacement root must not end
+//! with one. If both have it, the result is `C:\\Windows\...` — a path no
+//! user-mode API will resolve.
+
+use std::borrow::Cow;
+use std::sync::OnceLock;
+use windows::Win32::Storage::FileSystem::{GetLogicalDriveStringsW, QueryDosDeviceW};
+use windows::core::PCWSTR;
+
+/// A mapping from NT device paths to DOS drive roots.
+#[derive(Debug)]
+pub struct DevicePaths {
+    /// Device path to DOS drive root, sorted longest-first so a longer prefix
+    /// wins over a shorter one. `\Device\HarddiskVolume10` must be checked
+    /// before `\Device\HarddiskVolume1`.
+    ///
+    /// The root is stored **without** a trailing backslash.
+    mappings: Vec<(String, String)>,
+}
+
+impl DevicePaths {
+    /// The process-wide mapping.
+    pub fn global() -> &'static DevicePaths {
+        static INSTANCE: OnceLock<DevicePaths> = OnceLock::new();
+        INSTANCE.get_or_init(DevicePaths::build)
+    }
+
+    /// Build the mapping from the current drive table.
+    fn build() -> Self {
+        let mut mappings = Vec::new();
+
+        // `GetLogicalDriveStringsW` writes a sequence of NUL-terminated
+        // drive roots ("C:\\\0D:\\\0\0") into the buffer and returns the
+        // number of UTF-16 units written, not including the final NUL.
+        let mut buffer = vec![0u16; 1024];
+        let len = unsafe { GetLogicalDriveStringsW(Some(&mut buffer)) };
+        if len == 0 {
+            return Self { mappings };
+        }
+
+        let mut start = 0usize;
+        let end_of_buffer = len as usize;
+        while start < end_of_buffer {
+            let end = buffer[start..end_of_buffer]
+                .iter()
+                .position(|c| *c == 0)
+                .map(|i| start + i)
+                .unwrap_or(end_of_buffer);
+            if end == start {
+                break;
+            }
+            let drive = String::from_utf16_lossy(&buffer[start..end]);
+            start = end + 1;
+
+            // `QueryDosDeviceW("C:")` returns `\Device\HarddiskVolume3` for
+            // the system volume, or the appropriate device for removable
+            // media, network shares, and so on.
+            let drive_query: Vec<u16> = drive
+                .trim_end_matches('\\')
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let mut device_buffer = vec![0u16; 1024];
+            let device_len = unsafe {
+                QueryDosDeviceW(PCWSTR(drive_query.as_ptr()), Some(&mut device_buffer))
+            };
+            if device_len == 0 {
+                continue;
+            }
+
+            // The reported length can include the terminating NUL. The
+            // device string is what comes before it, so the units are read
+            // up to the first NUL rather than to `device_len`. A device
+            // string with a trailing `\0` would never match a path in
+            // `translate`, and the symptom is a silent failure to translate
+            // every image path.
+            let units: Vec<u16> = device_buffer
+                .iter()
+                .take(device_len as usize)
+                .take_while(|u| **u != 0)
+                .copied()
+                .collect();
+            if units.is_empty() {
+                continue;
+            }
+            let device = String::from_utf16_lossy(&units);
+
+            // `root` is `C:`, not `C:\`. The suffix from `strip_prefix`
+            // already starts with a backslash.
+            let root = drive.trim_end_matches('\\').to_string();
+            mappings.push((device, root));
+        }
+
+        // Longest device path first: `\Device\HarddiskVolume10` must win
+        // over `\Device\HarddiskVolume1` when both are prefixes of the path.
+        mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        Self { mappings }
+    }
+
+    /// Translate an NT device path to its DOS form.
+    pub fn translate<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        for (device, root) in &self.mappings {
+            if let Some(rest) = path.strip_prefix(device.as_str()) {
+                return Cow::Owned(format!("{root}{rest}"));
+            }
+        }
+        Cow::Borrowed(path)
+    }
+
+    /// Print the current mappings.
+    ///
+    /// Each line ends with `\` so a reader can see the exact boundary of the
+    /// stored root. A NUL in the device string does not render — this is why
+    /// the diagnostic prints the byte length alongside the text, so a
+    /// trailing NUL that survived the trim would be visible as a length one
+    /// greater than the number of characters shown.
+    pub fn debug_print(&self) {
+        if self.mappings.is_empty() {
+            println!("  (no mappings — GetLogicalDriveStringsW or QueryDosDeviceW failed)");
+            return;
+        }
+        for (device, root) in &self.mappings {
+            println!(
+                "  {device} ({} chars)  ->  {root}\\",
+                device.chars().count()
+            );
+        }
+    }
+
+    /// How many mappings were built.
+    pub fn len(&self) -> usize {
+        self.mappings.len()
+    }
+
+    /// Whether the mapping is empty.
+    pub fn is_empty(&self) -> bool {
+        self.mappings.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translating_a_path_on_a_mounted_volume_produces_a_dos_form() {
+        let paths = DevicePaths::global();
+        let raw = r"\Device\HarddiskVolume3\Windows\System32\notepad.exe";
+        let translated = paths.translate(raw);
+        if translated != raw {
+            assert!(
+                translated.starts_with(|c: char| c.is_ascii_alphabetic()),
+                "a translated path starts with a drive letter: {translated}"
+            );
+            assert!(translated.contains(":\\"), "{translated}");
+            assert!(
+                !translated.contains("\\\\"),
+                "a translated path has a double backslash: {translated}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmapped_path_is_returned_unchanged() {
+        let paths = DevicePaths::global();
+        let raw = r"\Device\SomeUnmappedVolume\foo\bar";
+        assert_eq!(paths.translate(raw), raw);
+    }
+
+    #[test]
+    fn a_dos_path_is_returned_unchanged() {
+        let paths = DevicePaths::global();
+        let raw = r"C:\Windows\System32\notepad.exe";
+        assert_eq!(paths.translate(raw), raw);
+    }
+
+    #[test]
+    fn a_longer_device_prefix_wins_over_a_shorter_one() {
+        let mut mappings = vec![
+            (r"\Device\HarddiskVolume1".to_string(), "C:".to_string()),
+            (r"\Device\HarddiskVolume10".to_string(), "D:".to_string()),
+        ];
+        mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        let paths = DevicePaths { mappings };
+        assert_eq!(
+            paths.translate(r"\Device\HarddiskVolume10\foo"),
+            r"D:\foo"
+        );
+        assert_eq!(
+            paths.translate(r"\Device\HarddiskVolume1\foo"),
+            r"C:\foo"
+        );
+    }
+
+    #[test]
+    fn a_synthetic_mapping_translates_as_expected() {
+        // The property every caller depends on: a device string and a path
+        // that begins with it produce a DOS path with exactly one backslash
+        // between the root and the suffix. This test builds the mapping by
+        // hand so it does not depend on the host's drive configuration.
+        let paths = DevicePaths {
+            mappings: vec![(
+                r"\Device\HarddiskVolume3".to_string(),
+                "C:".to_string(),
+            )],
+        };
+
+        assert_eq!(
+            paths.translate(r"\Device\HarddiskVolume3\Windows\System32\notepad.exe"),
+            r"C:\Windows\System32\notepad.exe"
+        );
+        assert_eq!(
+            paths.translate(r"\Device\HarddiskVolume3"),
+            r"C:"
+        );
+    }
+}
+//! Provider GUIDs and keyword masks.
+//!
+//! Keyword masks are not an optimisation you can skip. `matchanykeyword = 0`
+//! means "all keywords", and against a manifest provider that is the difference
+//! between a few thousand and a few hundred thousand events per second for the
+//! same amount of *useful* signal. The process and image keywords are what a
+//! security pipeline actually consumes; the thread keywords are mostly volume.
+
+use crate::session::ProviderSpec;
+use windows::core::GUID;
+
+pub const KERNEL_PROCESS: GUID = GUID::from_u128(0x22FB2CD6_0E7B_422B_A0C7_2FAD1FD0E716);
+pub const KERNEL_FILE: GUID = GUID::from_u128(0xEDD08927_9CC4_4E65_B970_C2560FB5C289);
+pub const KERNEL_REGISTRY: GUID = GUID::from_u128(0x70EB4F03_C1DE_4F73_A051_33D13D5413BD);
+pub const KERNEL_NETWORK: GUID = GUID::from_u128(0x7DD42A49_5329_4832_8DFD_43D979153A88);
+pub const DNS_CLIENT: GUID = GUID::from_u128(0x1C95126E_7EEA_49A9_A3FE_A378B03DDB4D);
+pub const POWERSHELL: GUID = GUID::from_u128(0xA0C1853B_5C40_4B15_8766_3CF1C58F985A);
+pub const THREAT_INTELLIGENCE: GUID = GUID::from_u128(0xF4E1897C_BB5D_5668_F1D8_040F4D8DD344);
+pub const AMSI: GUID = GUID::from_u128(0x2A576B87_09A7_520E_C21A_4942F0271D67);
+pub const DOTNET_RUNTIME: GUID = GUID::from_u128(0xE13C0D23_CCBC_4E12_931B_D9CC2EEE27E4);
+pub const WMI_ACTIVITY: GUID = GUID::from_u128(0x1418EF04_B0B4_4623_BF7E_D74AB47BBDAA);
+
+// Microsoft-Windows-Kernel-Process keywords.
+pub const KERNEL_PROCESS_KEYWORD_PROCESS: u64 = 0x10;
+pub const KERNEL_PROCESS_KEYWORD_THREAD: u64 = 0x20;
+pub const KERNEL_PROCESS_KEYWORD_IMAGE: u64 = 0x40;
+
+/// Trace levels, mirroring the SDK's `TRACE_LEVEL_*`.
+pub const LEVEL_CRITICAL: u8 = 1;
+pub const LEVEL_ERROR: u8 = 2;
+pub const LEVEL_WARNING: u8 = 3;
+pub const LEVEL_INFORMATIONAL: u8 = 4;
+pub const LEVEL_VERBOSE: u8 = 5;
+
+// There is deliberately no event-id-to-name table in this module. There was one,
+// and it earned its removal twice over: nothing called it, and it was wrong.
+//
+// Checked against this machine's manifests, `Microsoft-Windows-Kernel-File` id 14
+// declares only `Irp, ThreadId, FileObject, FileKey` — no path, no length — so the
+// `FileWrite` name it carried is something the record cannot support. Id 15
+// carries `ByteOffset, IOSize, IOFlags`, which is the I/O family, not the
+// `FileDelete` it was labelled. The provider names roughly thirty events and the
+// table named three, so it was not complete either.
+//
+// A hand-copied subset of a manifest that changes with every Windows build reads
+// as knowledge and is really a guess. What decides which events matter is
+// `translate::shape_of`, and that stays short because it is the one that has to
+// be right. To see what a provider declares on the machine in front of you, run
+// `tools/dump-fields.ps1` rather than reading a copy of someone else's answer.
+
+/// The providers a Windows deployment should try to enable, in priority order.
+///
+/// Callers should expect partial success: the kernel providers need privileges
+/// that an interactive session may not hold, and the correct behaviour is to
+/// run with what was granted and report the rest.
+pub fn default_providers() -> Vec<ProviderSpec> {
+    vec![
+        ProviderSpec {
+            guid: KERNEL_PROCESS,
+            name: "Microsoft-Windows-Kernel-Process",
+            level: LEVEL_INFORMATIONAL,
+            keywords: KERNEL_PROCESS_KEYWORD_PROCESS | KERNEL_PROCESS_KEYWORD_IMAGE,
+        },
+        // Here because `T1547.001` reads a Run-key write and no other event
+        // carries one. Leaving it out made the rule unreachable on a live host
+        // while the synthetic stream kept it green.
+        ProviderSpec {
+            guid: KERNEL_REGISTRY,
+            name: "Microsoft-Windows-Kernel-Registry",
+            level: LEVEL_INFORMATIONAL,
+            keywords: 0,
+        },
+        ProviderSpec {
+            guid: DNS_CLIENT,
+            name: "Microsoft-Windows-DNS-Client",
+            level: LEVEL_INFORMATIONAL,
+            keywords: 0,
+        },
+        // Enabled because `translate::shape_of` decodes its 4104 script blocks:
+        // the kernel process provider carries no command line on any Windows
+        // build, so this is the only live source of what an interpreter was asked
+        // to run. It emits nothing at all until Script Block Logging is enabled
+        // on the host, which is a policy the operator sets and not a broken
+        // table; when the policy is off, this provider is silent.
+        ProviderSpec {
+            guid: POWERSHELL,
+            name: "Microsoft-Windows-PowerShell",
+            level: LEVEL_INFORMATIONAL,
+            keywords: 0,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_default_provider_has_a_name_and_a_guid() {
+        let providers = default_providers();
+        assert!(!providers.is_empty());
+        for p in &providers {
+            assert!(!p.name.is_empty(), "{p:?}");
+            assert_ne!(p.guid, GUID::from_u128(0));
+        }
+    }
+
+    #[test]
+    fn the_kernel_process_provider_does_not_ask_for_every_keyword() {
+        // matchanykeyword = 0 means "all", which is how a deployment ends up
+        // dropping half its events because it enabled thread churn too.
+        let kp = default_providers()
+            .into_iter()
+            .find(|p| p.guid == KERNEL_PROCESS)
+            .expect("kernel process provider");
+        assert_ne!(kp.keywords, 0, "must not subscribe to every keyword");
+        assert_eq!(
+            kp.keywords & KERNEL_PROCESS_KEYWORD_PROCESS,
+            KERNEL_PROCESS_KEYWORD_PROCESS
+        );
+        assert_eq!(
+            kp.keywords & KERNEL_PROCESS_KEYWORD_IMAGE,
+            KERNEL_PROCESS_KEYWORD_IMAGE
+        );
+        assert_eq!(
+            kp.keywords & KERNEL_PROCESS_KEYWORD_THREAD,
+            0,
+            "thread churn is volume, not signal"
+        );
+    }
+
+    #[test]
+    fn the_registry_provider_is_enabled_so_run_keys_can_fire() {
+        // A rule whose only evidence source is not enabled is a rule that can
+        // never fire on a real host, however well it tests against a fixture.
+        let providers = default_providers();
+        assert!(
+            providers.iter().any(|p| p.guid == KERNEL_REGISTRY),
+            "T1547.001 reads a Run-key write and nothing else carries one"
+        );
+    }
+}
+//! ETW security self-checks.
+//!
+//! Five layers of detection, each assuming the one below it may have failed:
+//!
+//! 1. **ntdll export prologues** — matches the first 16 bytes of the ETW
+//!    exports against known patch patterns. Fast, and it *names* the
+//!    technique, but bypassed by a patch whose first byte lands past the scan
+//!    window. The whole-`.text` comparison below is the check that catches
+//!    those.
+//! 2. **ntdll `.text` comparison** — compares the entire code section of
+//!    `ntdll.dll` against the on-disk copy. Catches any byte modification
+//!    anywhere in the section, regardless of pattern.
+//! 3. **Jump scan** — flags trampolines in the prologue. The scan is
+//!    byte-level, not instruction-level, so it can false-positive on a jump
+//!    opcode that appears as part of a longer instruction. The `.text`
+//!    comparison is the check that has no false positives; the jump scan is a
+//!    *naming* convenience that surfaces trampolines for an operator.
+//! 4. **Session health** — detects a stopped or reconfigured trace session.
+//! 5. **Kernel integrity** — reports whether VBS/HVCI is constraining
+//!    kernel-level tampering.
+//!
+//! None of these *prevent* an attack. They make it **visible**. The goal is
+//! that a bypass requires privilege, is deliberate, and leaves evidence.
+//!
+//! # The residual gap
+//!
+//! Three bypasses are not caught by any check in this module:
+//!
+//! - **IAT hooks** — modifying the import table of a *calling* module so the
+//!   call never reaches `ntdll`. The bytes in `ntdll` are untouched.
+//! - **Hardware breakpoints** — setting `DR0`–`DR3` via a vectored exception
+//!   handler. No bytes change, so no byte comparison can see it.
+//! - **Detector self-patching** — patching the code of `check_ntdll_exports`
+//!   itself. This is the "who watches the watchmen" problem and cannot be
+//!   solved from inside the same process.
+//!
+//! Closing these requires either a separate process reading this one's
+//! memory, or kernel-level monitoring. That is the correct architecture for
+//! a high-assurance deployment and is documented in the README.
+
+use crate::error::EtwError;
+use std::path::PathBuf;
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+use windows::core::{PCSTR, PCWSTR};
+
+/// The ETW export functions a user-mode attacker patches.
+const ETW_EXPORTS: &[&str] = &[
+    "EtwEventWrite",
+    "EtwEventWriteFull",
+    "EtwEventWriteEx",
+    "NtTraceEvent",
+];
+
+/// Known patch patterns, as byte sequences.
+///
+/// **Order matters.** `starts_with` checks a prefix, so a longer pattern must
+/// come before any shorter pattern that it begins with. This list is a *hint*
+/// — the `.text` comparison catches everything a pattern list would, and
+/// more — but it names the technique, which a byte diff alone cannot.
+const PATCH_PATTERNS: &[(&str, &[u8])] = &[
+    ("xor eax, eax; ret", &[0x31, 0xC0, 0xC3]),
+    ("xor eax, eax; ret (alt)", &[0x33, 0xC0, 0xC3]),
+    ("mov eax, 0; ret", &[0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3]),
+    ("sub eax, eax; ret", &[0x2B, 0xC0, 0xC3]),
+    ("ret", &[0xC3]),
+    ("int3", &[0xCC]),
+    ("jmp short", &[0xEB]),
+    ("jmp rel32", &[0xE9]),
+];
+
+/// How many bytes of each export to read for the pattern match.
+///
+/// The matcher sees every 8-byte window that starts within these bytes, so a
+/// pattern whose first byte lands at offset `PROLOGUE_SCAN_BYTES - 8 + 1` or
+/// later is outside the scan window. The `.text` comparison in
+/// [`verify_text_section`] is the check that catches it. The scan is a
+/// *naming* convenience, not the load-bearing check.
+const PROLOGUE_SCAN_BYTES: usize = 16;
+
+/// A jump instruction found in a function's prologue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JumpScan {
+    /// Byte offset within the scanned range.
+    pub offset: usize,
+    /// The opcode byte.
+    pub opcode: u8,
+    /// A short description of the instruction.
+    pub description: &'static str,
+}
+
+/// The result of checking one export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportIntegrity {
+    pub name: &'static str,
+    /// The first [`PROLOGUE_SCAN_BYTES`] bytes of the function.
+    pub memory_bytes: [u8; PROLOGUE_SCAN_BYTES],
+    /// Whether any known patch pattern matches *anywhere* in the scanned
+    /// bytes, not just at offset 0.
+    pub known_patch: Option<&'static str>,
+    /// The offset at which the pattern matched, when it did.
+    pub patch_offset: Option<usize>,
+    /// Jumps found in the prologue. A real function's prologue does not
+    /// begin with a jump; a trampoline does.
+    pub jumps: Vec<JumpScan>,
+    /// Whether the memory page is private (not file-backed).
+    pub private_page: bool,
+}
+
+impl ExportIntegrity {
+    /// Whether this export appears to have been tampered with.
+    pub fn is_suspicious(&self) -> bool {
+        self.known_patch.is_some() || !self.jumps.is_empty() || self.private_page
+    }
+
+    /// A human-readable reason, when suspicious.
+    pub fn reason(&self) -> Option<String> {
+        if let Some(patch) = self.known_patch {
+            let at = self.patch_offset.unwrap_or(0);
+            return Some(format!("patched at offset {at}: {patch}"));
+        }
+        if let Some(jump) = self.jumps.first() {
+            return Some(format!(
+                "jump at offset {}: {}",
+                jump.offset, jump.description
+            ));
+        }
+        if self.private_page {
+            return Some("on a private page (possible tamper)".into());
+        }
+        None
+    }
+}
+
+/// Find a known patch pattern in a byte slice.
+///
+/// Returns the label of the first pattern found and the offset at which it
+/// starts. The pattern matches only at the *start* of an 8-byte window, so
+/// the search effectively covers offsets `0..=(len - 8)`.
+///
+/// This is the matcher the prologue check uses, exposed so tests can call
+/// it directly and so a caller diagnosing a false positive can see what the
+/// matcher found.
+pub fn find_patch_in(bytes: &[u8]) -> Option<(&'static str, usize)> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    for (offset, window) in bytes.windows(8).enumerate() {
+        for (label, pattern) in PATCH_PATTERNS {
+            if window.starts_with(pattern) {
+                return Some((label, offset));
+            }
+        }
+    }
+    None
+}
+
+/// The result of comparing `ntdll`'s `.text` section against the on-disk copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextIntegrity {
+    /// The path the on-disk copy was read from.
+    pub module_path: String,
+    /// How many bytes were compared.
+    pub text_size: usize,
+    /// How many bytes differed.
+    pub bytes_differing: usize,
+    /// The first offset where a difference was found.
+    pub first_difference: Option<usize>,
+    /// The first 16 bytes at the first difference, from memory.
+    pub first_difference_memory: [u8; 16],
+    /// The first 16 bytes at the first difference, from disk.
+    pub first_difference_disk: [u8; 16],
+}
+
+impl TextIntegrity {
+    pub fn is_clean(&self) -> bool {
+        self.bytes_differing == 0
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        if self.is_clean() {
+            return None;
+        }
+        let offset = self.first_difference.unwrap_or(0);
+        Some(format!(
+            "{} bytes differ from disk, first at offset {offset:#x}",
+            self.bytes_differing
+        ))
+    }
+}
+
+/// Check every ETW export in the current process.
+pub fn check_ntdll_exports() -> Vec<ExportIntegrity> {
+    let Some(ntdll) = load_ntdll() else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::with_capacity(ETW_EXPORTS.len());
+
+    for name in ETW_EXPORTS {
+        let Some(ptr) = resolve_export(ntdll, name) else {
+            continue;
+        };
+
+        // SAFETY: `ptr` is a valid function address returned by GetProcAddress.
+        // Every exported function is at least `PROLOGUE_SCAN_BYTES` long.
+        let mut memory_bytes = [0u8; PROLOGUE_SCAN_BYTES];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr as *const u8,
+                memory_bytes.as_mut_ptr(),
+                PROLOGUE_SCAN_BYTES,
+            );
+        }
+
+        let (known_patch, patch_offset) = match find_patch_in(&memory_bytes) {
+            Some((label, offset)) => (Some(label), Some(offset)),
+            None => (None, None),
+        };
+
+        // Scan for jumps in the prologue. A function whose first bytes are a
+        // jump is a trampoline.
+        let jumps = scan_for_jumps(&memory_bytes);
+
+        let private_page = page_is_private(ptr);
+
+        results.push(ExportIntegrity {
+            name,
+            memory_bytes,
+            known_patch,
+            patch_offset,
+            jumps,
+            private_page,
+        });
+    }
+
+    results
+}
+
+/// Scan a byte slice for jump instructions.
+///
+/// A normal function prologue does not begin with a jump. A trampoline does.
+/// The scanner is deliberately naive — it walks byte-by-byte and looks for
+/// jump opcodes rather than decoding x86 — because a false positive (a `jmp`
+/// that happens to be part of an instruction operand) is safer than a false
+/// negative.
+///
+/// Only a jump at offset 0 is reported. A jump later in the prologue is
+/// usually part of a legitimate instruction; the `.text` comparison catches
+/// those when they are not.
+pub fn scan_for_jumps(bytes: &[u8]) -> Vec<JumpScan> {
+    let mut jumps = Vec::new();
+    for (offset, byte) in bytes.iter().enumerate() {
+        let description = match *byte {
+            0xE9 => "jmp rel32",
+            0xEB => "jmp rel8",
+            0xE8 => "call rel32",
+            0xCC => "int3",
+            _ => continue,
+        };
+        jumps.push(JumpScan {
+            offset,
+            opcode: *byte,
+            description,
+        });
+    }
+    // A `ret` at offset 0 is a patch, not a trampoline; it is already covered
+    // by the pattern list. A jump at offset 0 is the trampoline signal.
+    jumps.retain(|j| j.offset == 0);
+    jumps
+}
+
+/// Compare `ntdll`'s `.text` section in memory against the on-disk copy.
+///
+/// This is the strongest user-mode check available. It catches any byte
+/// modification anywhere in the code section — a patch at offset 32, an
+/// unknown return pattern, a trampoline written over the entry point — and
+/// it does not depend on a pattern list knowing what the patch looks like.
+///
+/// It does **not** catch:
+/// - IAT hooks (another module's import table is modified, not `ntdll`).
+/// - Hardware breakpoints (no bytes change).
+/// - A patch that is applied and reverted between two calls to this function.
+pub fn verify_text_section() -> Option<TextIntegrity> {
+    let ntdll = load_ntdll()?;
+    let path = module_path(ntdll)?;
+    let (virtual_address, virtual_size, raw_offset) = find_text_section(ntdll)?;
+
+    let disk = std::fs::read(&path).ok()?;
+    let disk_start = raw_offset as usize;
+    let disk_end = disk_start.checked_add(virtual_size)?;
+    let disk_bytes = disk.get(disk_start..disk_end)?;
+
+    // SAFETY: `virtual_address` and `virtual_size` come from the PE header
+    // of a loaded module, so the resulting slice is within the module's
+    // mapped image.
+    let base = ntdll.0 as *const u8;
+    let memory_bytes =
+        unsafe { std::slice::from_raw_parts(base.add(virtual_address), virtual_size) };
+
+    let mut bytes_differing = 0usize;
+    let mut first_difference = None;
+    let mut first_difference_memory = [0u8; 16];
+    let mut first_difference_disk = [0u8; 16];
+
+    for (i, (m, d)) in memory_bytes.iter().zip(disk_bytes.iter()).enumerate() {
+        if m != d {
+            bytes_differing += 1;
+            if first_difference.is_none() {
+                first_difference = Some(i);
+                let take = (virtual_size - i).min(16);
+                first_difference_memory[..take].copy_from_slice(&memory_bytes[i..i + take]);
+                first_difference_disk[..take].copy_from_slice(&disk_bytes[i..i + take]);
+            }
+        }
+    }
+
+    Some(TextIntegrity {
+        module_path: path.to_string_lossy().into_owned(),
+        text_size: virtual_size,
+        bytes_differing,
+        first_difference,
+        first_difference_memory,
+        first_difference_disk,
+    })
+}
+
+/// Load `ntdll.dll` in the current process.
+fn load_ntdll() -> Option<HMODULE> {
+    let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+    unsafe { GetModuleHandleW(PCWSTR(name.as_ptr())) }.ok()
+}
+
+/// Resolve an export by name.
+fn resolve_export(module: HMODULE, name: &str) -> Option<*const core::ffi::c_void> {
+    let name: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+    unsafe { GetProcAddress(module, PCSTR(name.as_ptr())) }
+        .map(|f| f as usize as *const core::ffi::c_void)
+}
+
+/// The full path of a loaded module.
+fn module_path(module: HMODULE) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe { GetModuleFileNameW(Some(module), &mut buf) };
+    if len == 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    Some(PathBuf::from(String::from_utf16_lossy(&buf)))
+}
+
+/// Find the `.text` section of a PE module.
+///
+/// Returns `(virtual_address, virtual_size, raw_file_offset)`.
+fn find_text_section(module: HMODULE) -> Option<(usize, usize, u64)> {
+    // SAFETY: the offsets below are the documented PE layout. Each read is
+    // guarded by the check that the previous one produced a plausible value.
+    unsafe {
+        let base = module.0 as *const u8;
+
+        // DOS header: `e_lfanew` at offset 0x3C points to the PE header.
+        let e_lfanew = *(base.add(0x3C) as *const i32);
+        if e_lfanew < 0 || e_lfanew > 0x1000 {
+            return None;
+        }
+        let nt = base.add(e_lfanew as usize);
+
+        // PE signature "PE\0\0".
+        if *(nt as *const u32) != 0x0000_4550 {
+            return None;
+        }
+
+        // COFF file header follows the signature (20 bytes).
+        let coff = nt.add(4);
+        let num_sections = *(coff.add(2) as *const u16) as usize;
+        let optional_size = *(coff.add(16) as *const u16) as usize;
+
+        // Section headers follow the optional header.
+        let sections = coff.add(20 + optional_size);
+
+        for i in 0..num_sections {
+            let s = sections.add(i * 40);
+            let name = std::slice::from_raw_parts(s, 8);
+            if name.starts_with(b".text") {
+                let virtual_size = *(s.add(8) as *const u32) as usize;
+                let virtual_address = *(s.add(12) as *const u32) as usize;
+                let raw_offset = *(s.add(20) as *const u32) as u64;
+                if virtual_size == 0 {
+                    return None;
+                }
+                return Some((virtual_address, virtual_size, raw_offset));
+            }
+        }
+    }
+    None
+}
+
+/// Whether the page containing `addr` is private (not file-backed).
+fn page_is_private(addr: *const core::ffi::c_void) -> bool {
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    let result = unsafe {
+        VirtualQuery(
+            Some(addr),
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if result == 0 {
+        return false;
+    }
+    info.Type == MEM_PRIVATE
+}
+
+// ---------------------------------------------------------------------------
+// Session health
+// ---------------------------------------------------------------------------
+
+/// The health of the trace session, as reported by the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionHealth {
+    pub running: bool,
+    pub real_time: bool,
+    pub events_lost: u32,
+    pub buffers_lost: u32,
+    pub buffers_written: u32,
+    /// The session exists but `LogFileMode` no longer includes
+    /// `EVENT_TRACE_REAL_TIME_MODE`. Someone reconfigured it.
+    pub reconfigured: bool,
+}
+
+impl SessionHealth {
+    pub fn is_healthy(&self) -> bool {
+        self.running && self.real_time && !self.reconfigured
+    }
+
+    pub fn problem(&self) -> Option<String> {
+        if !self.running {
+            return Some("session is not running".into());
+        }
+        if self.reconfigured {
+            return Some("session is no longer real-time (LogFileMode was changed)".into());
+        }
+        if !self.real_time {
+            return Some("session is not real-time".into());
+        }
+        if self.events_lost > 0 || self.buffers_lost > 0 {
+            return Some(format!(
+                "{} events lost, {} buffers lost",
+                self.events_lost, self.buffers_lost
+            ));
+        }
+        None
+    }
+}
+
+/// Query the kernel for the session's state.
+pub fn session_health(name: &str) -> Result<SessionHealth, EtwError> {
+    match crate::session::session_state(name)? {
+        Some(state) => Ok(SessionHealth {
+            running: true,
+            real_time: state.real_time,
+            events_lost: state.events_lost,
+            buffers_lost: state.buffers_lost,
+            buffers_written: state.buffers_written,
+            reconfigured: !state.real_time,
+        }),
+        None => Ok(SessionHealth {
+            running: false,
+            real_time: false,
+            events_lost: 0,
+            buffers_lost: 0,
+            buffers_written: 0,
+            reconfigured: false,
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel integrity (VBS / HVCI)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelIntegrityStatus {
+    pub secure_kernel_running: bool,
+    pub hvci_enabled: bool,
+    pub hvci_strict: bool,
+    pub firmware_page_protection: bool,
+}
+
+// NtQuerySystemInformation is exported by ntdll.dll but is not in the
+// windows crate's safe bindings, so it is declared here. Rustdoc does not
+// generate documentation for extern blocks, which is why these are plain
+// `//` comments rather than `///`.
+//
+// SAFETY: the caller must pass a buffer of at least `len` bytes, and `class`
+// must be a valid information class. Only class 0xA5
+// (SystemIsolatedUserModeInformation) is used by this module.
+unsafe extern "system" {
+    fn NtQuerySystemInformation(class: u32, info: *mut u8, len: u32, returned: *mut u32) -> i32;
+}
+
+pub fn query_kernel_integrity() -> Option<KernelIntegrityStatus> {
+    const SYSTEM_ISOLATED_USER_MODE_INFORMATION: u32 = 0xA5;
+
+    let mut info = [0u8; 16];
+    let mut returned: u32 = 0;
+
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_ISOLATED_USER_MODE_INFORMATION,
+            info.as_mut_ptr(),
+            info.len() as u32,
+            &mut returned,
+        )
+    };
+
+    if status != 0 {
+        return None;
+    }
+
+    let byte0 = info[0];
+    Some(KernelIntegrityStatus {
+        secure_kernel_running: (byte0 & 0x01) != 0,
+        hvci_enabled: (byte0 & 0x02) != 0,
+        hvci_strict: (byte0 & 0x04) != 0,
+        firmware_page_protection: (byte0 & 0x20) != 0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Combined report
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct SecurityReport {
+    pub exports: Vec<ExportIntegrity>,
+    pub text: Option<TextIntegrity>,
+    pub session: SessionHealth,
+    pub kernel: Option<KernelIntegrityStatus>,
+}
+
+impl SecurityReport {
+    pub fn is_healthy(&self) -> bool {
+        self.exports.iter().all(|e| !e.is_suspicious())
+            && self.text.as_ref().map(|t| t.is_clean()).unwrap_or(false)
+            && self.session.is_healthy()
+            && self.kernel.map(|k| k.hvci_enabled).unwrap_or(false)
+    }
+
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        for export in &self.exports {
+            if let Some(reason) = export.reason() {
+                problems.push(format!("{}: {reason}", export.name));
+            }
+        }
+
+        if let Some(text) = &self.text {
+            if let Some(reason) = text.reason() {
+                problems.push(format!("ntdll .text: {reason}"));
+            }
+        }
+
+        if let Some(problem) = self.session.problem() {
+            problems.push(format!("session: {problem}"));
+        }
+
+        if let Some(kernel) = &self.kernel {
+            if !kernel.hvci_enabled {
+                problems.push("HVCI is not enabled; kernel tampering is unconstrained".into());
+            }
+            if !kernel.secure_kernel_running {
+                problems.push("VBS secure kernel is not running".into());
+            }
+        }
+
+        problems
+    }
+}
+
+pub fn full_report(session_name: &str) -> SecurityReport {
+    SecurityReport {
+        exports: check_ntdll_exports(),
+        text: verify_text_section(),
+        session: session_health(session_name).unwrap_or(SessionHealth {
+            running: false,
+            real_time: false,
+            events_lost: 0,
+            buffers_lost: 0,
+            buffers_written: 0,
+            reconfigured: false,
+        }),
+        kernel: query_kernel_integrity(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ntdll_exports_resolve_on_this_machine() {
+        let results = check_ntdll_exports();
+        assert!(!results.is_empty(), "ntdll.dll should have ETW exports");
+    }
+
+    #[test]
+    fn a_clean_ntdll_has_no_known_patch() {
+        for result in check_ntdll_exports() {
+            assert!(result.known_patch.is_none(), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn a_clean_text_section_matches_disk() {
+        let integrity = verify_text_section().expect("ntdll .text is readable");
+        assert!(
+            integrity.is_clean(),
+            "ntdll .text should match disk on a clean host: {:?}",
+            integrity.reason()
+        );
+        assert!(integrity.text_size > 0, "the section must have a size");
+    }
+
+    #[test]
+    fn the_pattern_matcher_only_sees_the_scan_window() {
+        // The matcher sees every 8-byte window that starts within
+        // `PROLOGUE_SCAN_BYTES`. A 3-byte pattern at position `j` is
+        // visible only if a window starts at `j`, i.e. `j` is at most
+        // `PROLOGUE_SCAN_BYTES - 8`. A patch that lands past that is
+        // invisible to this check — and that is what the `.text`
+        // comparison is for.
+
+        // Patch at offset 0: caught.
+        let mut at_zero = [0u8; PROLOGUE_SCAN_BYTES];
+        at_zero[0..3].copy_from_slice(&[0x31, 0xC0, 0xC3]);
+        assert_eq!(find_patch_in(&at_zero), Some(("xor eax, eax; ret", 0)));
+
+        // Patch at offset 8, the last window start: caught.
+        let mut at_eight = [0u8; PROLOGUE_SCAN_BYTES];
+        at_eight[8..11].copy_from_slice(&[0x31, 0xC0, 0xC3]);
+        assert_eq!(find_patch_in(&at_eight), Some(("xor eax, eax; ret", 8)));
+
+        // Patch at offset 9, past the last window start: not caught by
+        // this matcher. The `.text` comparison catches it, and that is
+        // why both checks exist.
+        let mut at_nine = [0u8; PROLOGUE_SCAN_BYTES];
+        at_nine[9..12].copy_from_slice(&[0x31, 0xC0, 0xC3]);
+        assert_eq!(find_patch_in(&at_nine), None);
+    }
+
+    #[test]
+    fn find_patch_in_refuses_short_slices() {
+        // A slice shorter than the window size cannot contain a match,
+        // and returning `None` rather than panicking is the contract.
+        assert_eq!(find_patch_in(&[]), None);
+        assert_eq!(find_patch_in(&[0x31, 0xC0, 0xC3]), None);
+        assert_eq!(find_patch_in(&[0u8; 7]), None);
+    }
+
+    #[test]
+    fn a_jump_at_offset_zero_is_reported() {
+        // A trampoline's first byte is a jump. A normal prologue's is not.
+        let mut trampoline = [0u8; PROLOGUE_SCAN_BYTES];
+        trampoline[0] = 0xE9;
+        let jumps = scan_for_jumps(&trampoline);
+        assert_eq!(jumps.len(), 1);
+        assert_eq!(jumps[0].offset, 0);
+        assert_eq!(jumps[0].description, "jmp rel32");
+    }
+
+    #[test]
+    fn a_jump_after_offset_zero_is_not_reported() {
+        // A jump later in the prologue is usually part of a legitimate
+        // instruction. The `.text` comparison is the check for those.
+        let mut normal = [0u8; PROLOGUE_SCAN_BYTES];
+        normal[0] = 0x40;
+        normal[1] = 0x55;
+        normal[8] = 0xE9;
+        assert!(scan_for_jumps(&normal).is_empty());
+    }
+
+    #[test]
+    fn a_normal_prologue_has_no_jumps_at_offset_zero() {
+        // The real prologue of `EtwEventWrite` is `40 55 57 41 ...`.
+        let mut normal = [0u8; PROLOGUE_SCAN_BYTES];
+        normal[0] = 0x40;
+        normal[1] = 0x55;
+        normal[2] = 0x57;
+        normal[3] = 0x41;
+        assert!(scan_for_jumps(&normal).is_empty());
+    }
+}
+//! Real-time ETW session lifecycle.
+//!
+//! The shape here is forced by the API, and most of the care is about
+//! lifetimes:
+//!
+//! * `EVENT_TRACE_PROPERTIES` and its logger name share one allocation that must
+//!   outlive the session, because `ControlTraceW` reads it back on stop. The
+//!   logger name is copied into the tail of that same buffer.
+//! * `ProcessTrace` blocks, so it owns a thread. `CloseTrace` from another
+//!   thread is what makes it return — there is no other way to wake it.
+//! * `EVENT_TRACE_LOGFILEW` must stay alive for the whole `ProcessTrace` call,
+//!   including the `LoggerName` pointer that reaches back into our name buffer.
+//!   It is owned by the session and never moved: the consumer thread only gets
+//!   the handle.
+//!
+//! Real-time mode means `FlushTimer` is a latency floor, not a tuning knob: a
+//! sparse provider's events are delivered on flush rather than on arrival, so
+//! one second is the compromise between seeing quiet providers at all and
+//! paying per-buffer overhead for nothing.
+//!
+//! # Why `INDEPENDENT_SESSION_MODE` is mandatory
+//!
+//! Without `EVENT_TRACE_INDEPENDENT_SESSION_MODE`, the kernel routes a portion
+//! of events through a shared buffer pool that silently drops under
+//! contention — **and the kernel's own loss counters stay at zero**. On a
+//! high-EPS provider such as `Microsoft-Windows-DNSServer`, the observed loss
+//! was roughly 50% with `EventsLost = 0` and `RealTimeBuffersLost = 0`[reference:3].
+//!
+//! A subtler requirement documented in the same report: the kernel silently
+//! strips `INDEPENDENT` unless it is paired with
+//! `EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN` (or its sibling). Setting
+//! `INDEPENDENT` alone produces `Requested LogFileMode = 0x08000100` but
+//! `Kernel-applied = 0x00000100` — the bit is gone, and the session looks
+//! healthy[reference:4]. Both bits together are honored.
+
+use crate::callback::{CallbackContext, EtwRaw, on_event};
+use crate::error::{EtwError, hint};
+use crate::stats::StatsSnapshot;
+use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
+use model::RawEvent;
+use ports::{EventSource, SourceError};
+use std::mem::size_of;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+use windows::Win32::Foundation::{ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND};
+use windows::Win32::System::Diagnostics::Etw::{
+    CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+    EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+    ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
+};
+use windows::core::{GUID, PCWSTR, PWSTR};
+
+/// `EVENT_TRACE_INDEPENDENT_SESSION_MODE` from `evntrace.h`.
+///
+/// Without this flag (and its required companion below), the kernel routes a
+/// portion of events through a shared pool that silently drops under
+/// contention. The kernel's loss counters do not increment; the only way to
+/// detect the loss is to compare against an independent consumer[reference:5].
+const EVENT_TRACE_INDEPENDENT_SESSION_MODE: u32 = 0x0800_0000;
+
+/// `EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN` from `evntrace.h`.
+///
+/// Required for `INDEPENDENT_SESSION_MODE` to be honored. Setting `INDEPENDENT`
+/// alone causes the kernel to silently strip it at `StartTrace` time, leaving
+/// the session in the shared-buffer mode without any indication that the
+/// requested isolation was not applied[reference:6].
+const EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN: u32 = 0x0080_0000;
+
+/// The `LogFileMode` this sensor always uses.
+///
+/// The composition is not arbitrary:
+///
+/// - `REAL_TIME_MODE` is what makes the session consumable live.
+/// - `INDEPENDENT_SESSION_MODE` isolates the session's buffer pool from other
+///   ETW consumers.
+/// - `PERSIST_ON_HYBRID_SHUTDOWN` is what makes the kernel *accept* the
+///   `INDEPENDENT` bit rather than silently stripping it.
+const LOG_FILE_MODE: u32 =
+    EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_INDEPENDENT_SESSION_MODE | EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN;
+
+/// One provider to enable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderSpec {
+    pub guid: GUID,
+    /// Human name, used both for the wire format and for error messages.
+    pub name: &'static str,
+    /// `TRACE_LEVEL_*`: 5 is verbose, 4 informational, 2 error-only.
+    pub level: u8,
+    /// Keyword mask. `0` means "every keyword", which against a manifest
+    /// provider is rarely what a production deployment wants.
+    pub keywords: u64,
+}
+
+/// Kernel buffer sizing and flush cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Buffers {
+    /// Size of one kernel buffer, in KB.
+    pub size_kb: u32,
+    /// Buffers allocated immediately. Held for the session's lifetime.
+    pub minimum: u32,
+    /// Ceiling the kernel may grow to under load.
+    pub maximum: u32,
+    /// Seconds between forced flushes.
+    pub flush_seconds: u32,
+}
+
+impl Default for Buffers {
+    fn default() -> Self {
+        Self {
+            size_kb: 128,
+            minimum: 16,
+            maximum: 64,
+            flush_seconds: 1,
+        }
+    }
+}
+
+/// Session parameters.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub name: String,
+    /// Bounded channel depth. When it fills, the callback drops rather than
+    /// blocks, so this is a real ceiling on burst absorption.
+    pub capacity: usize,
+    pub providers: Vec<ProviderSpec>,
+    /// Events above this level are counted and discarded before any allocation.
+    pub max_level: u8,
+    /// Kernel buffer sizing and flush cadence.
+    pub buffers: Buffers,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            capacity: 64 * 1024,
+            providers: Vec::new(),
+            max_level: 5,
+            buffers: Buffers::default(),
+        }
+    }
+}
+
+/// Outcome of enabling one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnableReport {
+    pub name: &'static str,
+    pub result: Result<(), u32>,
+}
+
+/// Keeps `EVENT_TRACE_LOGFILEW` alive without letting its raw pointers escape.
+#[allow(dead_code)]
+struct LogFile(Box<EVENT_TRACE_LOGFILEW>);
+
+unsafe impl Send for LogFile {}
+
+/// A live real-time session.
+pub struct EtwSession {
+    display_name: String,
+    /// Owned, NUL-terminated, and referenced by `LoggerName` for the whole run.
+    name: Vec<u16>,
+    /// `EVENT_TRACE_PROPERTIES` plus the logger name in its tail.
+    props: Box<[u8]>,
+    /// Held for its lifetime, never read after start.
+    #[allow(dead_code)]
+    logfile: LogFile,
+    consumer: PROCESSTRACE_HANDLE,
+    ctx: Arc<CallbackContext>,
+    rx: Receiver<EtwRaw>,
+    thread: Option<JoinHandle<()>>,
+    /// `(EventsLost, RealTimeBuffersLost)` as reported by the kernel.
+    lost: (u32, u32),
+    /// Whether this process started the session.
+    owns: bool,
+}
+
+fn props_ptr(buf: &mut [u8]) -> *mut EVENT_TRACE_PROPERTIES {
+    buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES
+}
+
+/// Build the properties struct and its embedded logger name.
+fn build_props(name: &[u16], buffers: Buffers) -> Box<[u8]> {
+    let terminated = name.last() == Some(&0);
+    let units = name.len() + usize::from(!terminated);
+    let total = size_of::<EVENT_TRACE_PROPERTIES>() + units * size_of::<u16>();
+    let mut buf = vec![0u8; total].into_boxed_slice();
+
+    unsafe {
+        let p = props_ptr(&mut buf);
+        (*p).Wnode.BufferSize = total as u32;
+        (*p).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        (*p).Wnode.ClientContext = 1;
+        // The three bits that matter: real-time, independent, persist.
+        // Setting only REAL_TIME is what causes the silent loss described in
+        // the module docs.
+        (*p).LogFileMode = LOG_FILE_MODE;
+        (*p).FlushTimer = buffers.flush_seconds.max(1);
+        (*p).BufferSize = buffers.size_kb;
+        (*p).MinimumBuffers = buffers.minimum;
+        (*p).MaximumBuffers = buffers.maximum.max(buffers.minimum);
+        (*p).LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+
+        let dst = buf.as_mut_ptr().add(size_of::<EVENT_TRACE_PROPERTIES>()) as *mut u16;
+        for (i, unit) in name.iter().enumerate() {
+            dst.add(i).write_unaligned(*unit);
+        }
+    }
+
+    buf
+}
+
+/// What the kernel knows about a session, without starting or stopping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionState {
+    pub real_time: bool,
+    pub log_file_mode: u32,
+    pub events_lost: u32,
+    pub buffers_lost: u32,
+    pub buffers_written: u32,
+    pub free_buffers: u32,
+}
+
+/// Ask the kernel what a session is doing.
+pub fn session_state(name: &str) -> Result<Option<SessionState>, EtwError> {
+    if name.is_empty() {
+        return Err(EtwError::EmptySessionName);
+    }
+
+    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut props = build_props(&name, Buffers::default());
+
+    let rc = unsafe {
+        ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            PCWSTR(name.as_ptr()),
+            props_ptr(&mut props),
+            EVENT_TRACE_CONTROL_QUERY,
+        )
+    };
+
+    if rc == ERROR_WMI_INSTANCE_NOT_FOUND {
+        return Ok(None);
+    }
+    if rc != ERROR_SUCCESS {
+        return Err(EtwError::ControlTrace(rc.0));
+    }
+
+    let p = props_ptr(&mut props);
+    Ok(Some(unsafe {
+        SessionState {
+            real_time: (*p).LogFileMode & EVENT_TRACE_REAL_TIME_MODE != 0,
+            log_file_mode: (*p).LogFileMode,
+            events_lost: (*p).EventsLost,
+            buffers_lost: (*p).RealTimeBuffersLost,
+            buffers_written: (*p).BuffersWritten,
+            free_buffers: (*p).FreeBuffers,
+        }
+    }))
+}
+
+/// Whether a session by this name exists.
+pub fn is_running(name: &str) -> Result<bool, EtwError> {
+    Ok(session_state(name)?.is_some())
+}
+
+impl EtwSession {
+    /// Start the session and its consumer thread.
+    pub fn start(cfg: SessionConfig) -> Result<(Self, Vec<EnableReport>), EtwError> {
+        if cfg.name.is_empty() {
+            return Err(EtwError::EmptySessionName);
+        }
+        if cfg.capacity == 0 {
+            return Err(EtwError::InvalidChannelCapacity);
+        }
+
+        let name: Vec<u16> = cfg.name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut props = build_props(&name, cfg.buffers);
+        let pname = PCWSTR(name.as_ptr());
+        let null_handle = CONTROLTRACE_HANDLE { Value: 0 };
+
+        let _ = unsafe {
+            ControlTraceW(
+                null_handle,
+                pname,
+                props_ptr(&mut props),
+                EVENT_TRACE_CONTROL_STOP,
+            )
+        };
+
+        let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
+        let rc = unsafe { StartTraceW(&mut handle, pname, props_ptr(&mut props)) };
+        if rc != ERROR_SUCCESS {
+            return Err(EtwError::StartTrace {
+                code: rc.0,
+                hint: hint(rc.0),
+            });
+        }
+
+        let mut reports = Vec::with_capacity(cfg.providers.len());
+        for spec in &cfg.providers {
+            let rc = unsafe {
+                EnableTraceEx2(
+                    handle,
+                    &spec.guid,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+                    spec.level,
+                    spec.keywords,
+                    0,
+                    0,
+                    None,
+                )
+            };
+            reports.push(EnableReport {
+                name: spec.name,
+                result: if rc == ERROR_SUCCESS {
+                    Ok(())
+                } else {
+                    Err(rc.0)
+                },
+            });
+        }
+
+        let session = Self::consume(cfg, name, props, true)?;
+        Ok((session, reports))
+    }
+
+    /// Attach to a session that is already running.
+    pub fn attach(cfg: SessionConfig) -> Result<Self, EtwError> {
+        if cfg.name.is_empty() {
+            return Err(EtwError::EmptySessionName);
+        }
+        if cfg.capacity == 0 {
+            return Err(EtwError::InvalidChannelCapacity);
+        }
+
+        let state = session_state(&cfg.name)?.ok_or_else(|| EtwError::NoSuchSession {
+            name: cfg.name.clone(),
+        })?;
+        if !state.real_time {
+            return Err(EtwError::NotRealTime {
+                name: cfg.name.clone(),
+                mode: state.log_file_mode,
+            });
+        }
+
+        let name: Vec<u16> = cfg.name.encode_utf16().chain(std::iter::once(0)).collect();
+        let props = build_props(&name, cfg.buffers);
+        Self::consume(cfg, name, props, false)
+    }
+
+    /// The consumer half, shared by `start` and `attach`.
+    fn consume(
+        cfg: SessionConfig,
+        name: Vec<u16>,
+        props: Box<[u8]>,
+        owns: bool,
+    ) -> Result<Self, EtwError> {
+        let providers = cfg
+            .providers
+            .iter()
+            .map(|s| (s.guid, model::ProviderId::new(s.name)))
+            .collect();
+
+        let (tx, rx) = bounded(cfg.capacity);
+        let ctx = Arc::new(CallbackContext {
+            tx,
+            stats: crate::stats::Stats::default(),
+            providers,
+            max_level: cfg.max_level,
+        });
+
+        let mut logfile = Box::new(EVENT_TRACE_LOGFILEW::default());
+        logfile.LoggerName = PWSTR(name.as_ptr() as *mut u16);
+        logfile.Anonymous1.ProcessTraceMode =
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Anonymous2.EventRecordCallback = Some(on_event);
+        logfile.Context = Arc::as_ptr(&ctx) as *mut core::ffi::c_void;
+
+        let consumer = unsafe { OpenTraceW(&mut *logfile) };
+        if consumer.Value == u64::MAX {
+            if owns {
+                let _ = unsafe {
+                    ControlTraceW(
+                        CONTROLTRACE_HANDLE { Value: 0 },
+                        PCWSTR(name.as_ptr()),
+                        props.as_ptr() as *mut EVENT_TRACE_PROPERTIES,
+                        EVENT_TRACE_CONTROL_STOP,
+                    )
+                };
+            }
+            return Err(EtwError::OpenTrace);
+        }
+
+        let thread = match thread::Builder::new()
+            .name("etw-consumer".into())
+            .spawn(move || {
+                let _ = unsafe { ProcessTrace(&[consumer], None, None) };
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = unsafe { CloseTrace(consumer) };
+                if owns {
+                    let _ = unsafe {
+                        ControlTraceW(
+                            CONTROLTRACE_HANDLE { Value: 0 },
+                            PCWSTR(name.as_ptr()),
+                            props.as_ptr() as *mut EVENT_TRACE_PROPERTIES,
+                            EVENT_TRACE_CONTROL_STOP,
+                        )
+                    };
+                }
+                return Err(EtwError::Spawn(e.to_string()));
+            }
+        };
+
+        Ok(Self {
+            display_name: cfg.name,
+            name,
+            props,
+            logfile: LogFile(logfile),
+            consumer,
+            ctx,
+            rx,
+            thread: Some(thread),
+            lost: (0, 0),
+            owns,
+        })
+    }
+
+    /// Pull up to `max` events, waiting no longer than `timeout` for the first.
+    pub fn drain(&mut self, out: &mut Vec<EtwRaw>, max: usize, timeout: Duration) -> usize {
+        let mut count = 0;
+
+        match self.rx.recv_timeout(timeout) {
+            Ok(item) => {
+                out.push(item);
+                count += 1;
+            }
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return 0,
+        }
+
+        while count < max {
+            match self.rx.try_recv() {
+                Ok(item) => {
+                    out.push(item);
+                    count += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        count
+    }
+
+    pub fn stats(&self) -> StatsSnapshot {
+        self.ctx.stats.snapshot()
+    }
+
+    /// Kernel-reported losses.
+    pub fn kernel_lost(&self) -> (u32, u32) {
+        self.lost
+    }
+
+    /// Stop consuming, release the session, and collect the final loss counts.
+    pub fn shutdown(&mut self) -> Result<(), EtwError> {
+        let _ = unsafe { CloseTrace(self.consumer) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+
+        let pname = PCWSTR(self.name.as_ptr());
+        let null_handle = CONTROLTRACE_HANDLE { Value: 0 };
+
+        let rc = unsafe {
+            ControlTraceW(
+                null_handle,
+                pname,
+                props_ptr(&mut self.props),
+                EVENT_TRACE_CONTROL_QUERY,
+            )
+        };
+        if rc == ERROR_SUCCESS {
+            let p = props_ptr(&mut self.props);
+            self.lost = unsafe { ((*p).EventsLost, (*p).RealTimeBuffersLost) };
+        }
+
+        let rc = unsafe {
+            ControlTraceW(
+                null_handle,
+                pname,
+                props_ptr(&mut self.props),
+                EVENT_TRACE_CONTROL_STOP,
+            )
+        };
+        if self.owns && rc != ERROR_SUCCESS {
+            return Err(EtwError::ControlTrace(rc.0));
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for EtwSession {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let _ = self.shutdown();
+        }
+    }
+}
+
+impl EventSource for EtwSession {
+    fn next_batch(
+        &mut self,
+        out: &mut Vec<RawEvent>,
+        max: usize,
+        timeout: Duration,
+    ) -> Result<usize, SourceError> {
+        let mut batch = Vec::new();
+        let n = self.drain(&mut batch, max, timeout);
+        out.extend(batch.into_iter().map(|e| e.wire));
+        Ok(n)
+    }
+
+    fn dropped_count(&self) -> u64 {
+        let snap = self.stats();
+        snap.lost() + u64::from(self.lost.0) + u64::from(self.lost.1)
+    }
+
+    fn name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn stop(&mut self) -> Result<(), SourceError> {
+        self.shutdown()
+            .map_err(|e| SourceError::Unavailable(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ABSENT: &str = "chaos-no-such-session-9f3c1a";
+
+    #[test]
+    fn an_absent_session_is_reported_as_absent_and_not_as_a_failure() {
+        match session_state(ABSENT) {
+            Ok(None) => {}
+            Ok(Some(state)) => panic!("a session that does not exist reported state: {state:?}"),
+            Err(e) => panic!("asking about an absent session was refused: {e}"),
+        }
+    }
+
+    #[test]
+    fn is_running_never_turns_a_refusal_into_a_quiet_no() {
+        assert_eq!(is_running(ABSENT).expect("query is permitted"), false);
+    }
+
+    #[test]
+    fn an_empty_session_name_is_rejected_before_any_syscall() {
+        assert!(matches!(session_state(""), Err(EtwError::EmptySessionName)));
+        assert!(matches!(is_running(""), Err(EtwError::EmptySessionName)));
+    }
+
+    #[test]
+    fn the_buffer_defaults_are_a_size_and_not_a_wish() {
+        let b = Buffers::default();
+        assert_eq!(b.size_kb, 128);
+        assert_eq!(b.minimum, 16);
+        assert_eq!(b.maximum, 64);
+        assert_eq!(b.flush_seconds, 1);
+    }
+
+    #[test]
+    fn the_log_file_mode_includes_independent_and_persist() {
+        // The critical pairing. `INDEPENDENT` alone is silently stripped by the
+        // kernel; `PERSIST_ON_HYBRID_SHUTDOWN` is what makes it stick.
+        // Verified against the reported observed behavior: without both, the
+        // kernel applies `0x00000100` and the session silently drops events
+        // on high-EPS providers with no counter increment.
+        assert_eq!(
+            LOG_FILE_MODE & EVENT_TRACE_REAL_TIME_MODE,
+            EVENT_TRACE_REAL_TIME_MODE,
+            "REAL_TIME is required for live consumption"
+        );
+        assert_eq!(
+            LOG_FILE_MODE & EVENT_TRACE_INDEPENDENT_SESSION_MODE,
+            EVENT_TRACE_INDEPENDENT_SESSION_MODE,
+            "INDEPENDENT is required to isolate the buffer pool"
+        );
+        assert_eq!(
+            LOG_FILE_MODE & EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN,
+            EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN,
+            "PERSIST is required for INDEPENDENT to be honored"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_below_the_floor_is_corrected_rather_than_written() {
+        let name = wide("chaos-test");
+        let buffers = Buffers {
+            size_kb: 64,
+            minimum: 32,
+            maximum: 8,
+            flush_seconds: 0,
+        };
+        let props = build_props(&name, buffers);
+        let p = props_ptr(&mut { props });
+        unsafe {
+            assert_eq!((*p).MaximumBuffers, 32, "raised to the floor");
+            assert_eq!((*p).MinimumBuffers, 32);
+            assert_eq!((*p).FlushTimer, 1, "zero would never flush");
+            assert_eq!((*p).BufferSize, 64);
+            assert_eq!((*p).LogFileMode, LOG_FILE_MODE);
+        }
+    }
+
+    #[test]
+    fn the_logger_name_is_written_into_the_properties_tail() {
+        let name = wide("chaos-test-session");
+        let props = build_props(&name, Buffers::default());
+        assert_eq!(
+            props.len(),
+            size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * size_of::<u16>()
+        );
+
+        let p = props_ptr(&mut { props });
+        let (recovered, terminator) = unsafe {
+            let tail = (p as *const u8).add((*p).LoggerNameOffset as usize) as *const u16;
+            let mut units = Vec::new();
+            for i in 0..name.len() {
+                units.push(tail.add(i).read_unaligned());
+            }
+            let terminator = units.last().copied();
+            let text: Vec<u16> = units.into_iter().take_while(|u| *u != 0).collect();
+            (String::from_utf16(&text).expect("valid UTF-16"), terminator)
+        };
+        assert_eq!(recovered, "chaos-test-session");
+        assert_eq!(terminator, Some(0), "the tail must end in a terminated name");
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+//! Counters for the sensor hot path.
+//!
+//! These live behind atomics rather than a mutex because the callback writes
+//! them and a stalled callback costs far more than the atomic traffic does.
+//!
+//! They are not diagnostics. `received - delivered` is the number of events the
+//! sensor saw and the pipeline did not, and that difference is what makes the
+//! A3 observation gap an empirical claim instead of an assumption.
+//!
+//! # The accounting
+//!
+//! Every event the callback sees falls into exactly one bucket:
+//!
+//! | Bucket | Where it is counted | Why |
+//! |---|---|---|
+//! | `classic` | callback | Pre-manifest header, cannot be decoded |
+//! | `string_only` | callback | Bare Unicode string, no properties |
+//! | `trace_message` | callback | WPP output, no properties |
+//! | `filtered` | callback | Level above the session's `max_level` |
+//! | `delivered` | callback | Reached the channel |
+//! | `dropped` | callback | Channel was full |
+//! | `unrecognised` | translator | Not a shape the sensor scores |
+//!
+//! `received == classic + string_only + trace_message + filtered + delivered`
+//! at the callback boundary. The translator then splits `delivered` into
+//! `mapped + undecodable + unrecognised`. Without `unrecognised`, the second
+//! sum does not close and the operator cannot tell how many events are being
+//! silently dropped at the shape match.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Default)]
+pub struct Stats {
+    received: AtomicU64,
+    delivered: AtomicU64,
+    filtered: AtomicU64,
+    classic: AtomicU64,
+    /// Events with `EVENT_HEADER_FLAG_STRING_ONLY`: bare Unicode strings,
+    /// no TDH-decodable properties.
+    string_only: AtomicU64,
+    /// Events with `EVENT_HEADER_FLAG_TRACE_MESSAGE`: WPP output, no
+    /// TDH-decodable properties.
+    trace_message: AtomicU64,
+    dropped: AtomicU64,
+    payload_bytes: AtomicU64,
+}
+
+impl Stats {
+    /// Callback produced a usable event and copied its payload.
+    pub(crate) fn received(&self, bytes: usize) {
+        self.received.fetch_add(1, Ordering::Relaxed);
+        self.payload_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Event made it into the channel.
+    pub(crate) fn delivered(&self) {
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Event was rejected before any allocation: too verbose for this run.
+    pub(crate) fn filtered(&self) {
+        self.filtered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A classic (pre-manifest) header, whose descriptor cannot be trusted the
+    /// same way.
+    pub(crate) fn classic(&self) {
+        self.classic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `EVENT_HEADER_FLAG_STRING_ONLY`: bare Unicode string, no properties.
+    pub(crate) fn string_only(&self) {
+        self.string_only.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `EVENT_HEADER_FLAG_TRACE_MESSAGE`: WPP output, no properties.
+    pub(crate) fn trace_message(&self) {
+        self.trace_message.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The channel was full, so the event was discarded instead of blocking the
+    /// callback.
+    pub(crate) fn dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            received: self.received.load(Ordering::Relaxed),
+            delivered: self.delivered.load(Ordering::Relaxed),
+            filtered: self.filtered.load(Ordering::Relaxed),
+            classic: self.classic.load(Ordering::Relaxed),
+            string_only: self.string_only.load(Ordering::Relaxed),
+            trace_message: self.trace_message.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            payload_bytes: self.payload_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub received: u64,
+    pub delivered: u64,
+    pub filtered: u64,
+    pub classic: u64,
+    pub string_only: u64,
+    pub trace_message: u64,
+    pub dropped: u64,
+    pub payload_bytes: u64,
+}
+
+impl StatsSnapshot {
+    /// Events the sensor saw but the pipeline never got.
+    pub fn lost(&self) -> u64 {
+        self.received.saturating_sub(self.delivered)
+    }
+
+    /// Fraction of received events that reached the consumer.
+    pub fn coverage(&self) -> f64 {
+        if self.received == 0 {
+            return 1.0;
+        }
+        self.delivered as f64 / self.received as f64
+    }
+
+    pub fn mean_payload_bytes(&self) -> f64 {
+        if self.delivered == 0 {
+            return 0.0;
+        }
+        self.payload_bytes as f64 / self.delivered as f64
+    }
+
+    /// The callback-boundary accounting.
+    ///
+    /// Returns `true` when `received == classic + string_only + trace_message
+    /// + filtered + delivered`. A `false` here means the callback is losing
+    /// events without counting them, which would be a bug in the callback
+    /// itself rather than in the host.
+    pub fn callback_accounting_closes(&self) -> bool {
+        let accounted = self.classic
+            + self.string_only
+            + self.trace_message
+            + self.filtered
+            + self.delivered
+            + self.dropped;
+        self.received == accounted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_add_up_and_coverage_is_honest() {
+        let s = Stats::default();
+        s.received(100);
+        s.received(200);
+        s.received(50);
+        s.delivered();
+        s.delivered();
+        s.filtered();
+        s.classic();
+        s.string_only();
+        s.trace_message();
+        s.dropped();
+
+        let snap = s.snapshot();
+        assert_eq!(snap.received, 3);
+        assert_eq!(snap.delivered, 2);
+        assert_eq!(snap.filtered, 1);
+        assert_eq!(snap.classic, 1);
+        assert_eq!(snap.string_only, 1);
+        assert_eq!(snap.trace_message, 1);
+        assert_eq!(snap.dropped, 1);
+        assert_eq!(snap.payload_bytes, 350);
+        assert_eq!(snap.lost(), 1);
+        assert!((snap.coverage() - 2.0 / 3.0).abs() < 1e-12);
+        assert!((snap.mean_payload_bytes() - 175.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_idle_sensor_reports_full_coverage_not_nan() {
+        let snap = Stats::default().snapshot();
+        assert_eq!(snap.coverage(), 1.0);
+        assert_eq!(snap.mean_payload_bytes(), 0.0);
+        assert_eq!(snap.lost(), 0);
+    }
+
+    #[test]
+    fn the_accounting_closes_on_a_healthy_run() {
+        let s = Stats::default();
+        // Three events: one delivered, one filtered, one classic.
+        s.received(64);
+        s.delivered();
+        s.received(64);
+        s.filtered();
+        s.received(64);
+        s.classic();
+
+        let snap = s.snapshot();
+        assert!(snap.callback_accounting_closes(), "{snap:?}");
+    }
+
+    #[test]
+    fn the_accounting_fails_when_an_event_vanishes() {
+        // A sanity check on the check itself: if `received` moves without a
+        // matching bucket, the accounting must report the discrepancy.
+        let s = Stats::default();
+        s.received(64);
+        // Deliberately do not increment any bucket.
+
+        let snap = s.snapshot();
+        assert!(!snap.callback_accounting_closes());
+    }
+}
+//! Turning raw ETW events into the pipeline's wire format.
+//!
+//! The sensor hands over an [`EtwRaw`] — a copied payload plus the descriptor
+//! TDH needs to name its fields. This module is where that becomes a
+//! [`TelemetryEvent`] the detection engine can score.
+//!
+//! # The field names come from this machine's manifests, not from memory
+//!
+//! TDH addresses properties by name, and the name has to match the provider's
+//! manifest exactly. Every name below was read off the shipped templates with
+//! `Get-WinEvent -ListProvider <provider>`, which needs no elevation. The
+//! chains exist because templates are not identical across Windows builds, and
+//! a miss has to degrade to `None` rather than to a guess.
+//!
+//! Two of those templates are worth stating outright, because both are
+//! surprises that cost detections silently:
+//!
+//! * `Microsoft-Windows-Kernel-Process` `ProcessStart` carries `ProcessID`,
+//!   `ParentProcessID`, `ImageName` and the token elevation — and **no command
+//!   line field at all**. Every rule that reads a command line is therefore
+//!   unreachable from this provider alone.
+//! * `Microsoft-Windows-Kernel-Registry` `RegistrySetValue` carries `KeyName`
+//!   and `ValueName`, but the value written is `CapturedData`, a `Binary`
+//!   field sized by `CapturedDataSize`. Its *shape* is decided by the companion
+//!   `Type` field, which is a `REG_*` constant.
+//!
+//! # NT device paths
+//!
+//! The kernel reports paths as `\Device\HarddiskVolumeN\...`, not `C:\...`.
+//! Drive letters are a user-mode concept, and the kernel does not consult the
+//! mount manager. Every path this module ships is translated to the DOS form
+//! with [`crate::paths::DevicePaths`], because the DOS form is what a rule
+//! author writes.
+//!
+//! # Why the failure counters matter
+//!
+//! A property name that does not resolve on a given machine is a silent hole.
+//! [`Translator::counts`] and [`Translator::failures`] exist so that cannot
+//! happen quietly — a non-zero `undecodable` means this table is wrong, not
+//! that the machine is idle.
+//!
+//! A shape whose event id is not in [`shape_of`] is also a silent hole, unless
+//! it is counted. [`ShapeCounts::unrecognised`] closes that hole: an event
+//! whose id is not a shape the sensor scores is counted as `unrecognised`, so
+//! that `delivered == mapped + undecodable + unrecognised` and every event the
+//! callback delivered is accounted for.
+//!
+//! # Gap correlation
+//!
+//! [`Translator::detect_gaps`] is the security layer. A process that patches
+//! `ntdll!EtwEventWrite` still generates **kernel** events but its **user-mode**
+//! events stop arriving. A shape that *was* firing and has stopped while other
+//! shapes are active is the signal. A shape that has never fired is
+//! **untested**, not silent.
+
+use crate::callback::EtwRaw;
+use crate::decode::{Decoder, FieldValue, utf16_to_string};
+use crate::paths::DevicePaths;
+use chrono::{DateTime, Utc};
+use model::{
+    DnsQueryPayload, EventId, EventKind, EventSource, HostId, Payload, ProcessId, ProcessStart,
+    RegistrySet, ScriptBlock, TelemetryEvent,
+};
+
+/// ETW's `TimeStamp` is a `FILETIME`: 100-nanosecond intervals since 1601-01-01.
+const FILETIME_EPOCH_DELTA: i64 = 116_444_736_000_000_000;
+const FILETIME_TICKS_PER_SEC: i64 = 10_000_000;
+
+/// Convert an ETW timestamp to UTC.
+fn from_filetime(filetime: i64) -> Option<DateTime<Utc>> {
+    let since_epoch = filetime.checked_sub(FILETIME_EPOCH_DELTA)?;
+    if since_epoch < 0 {
+        return None;
+    }
+    DateTime::from_timestamp(
+        since_epoch / FILETIME_TICKS_PER_SEC,
+        ((since_epoch % FILETIME_TICKS_PER_SEC) * 100) as u32,
+    )
+}
+
+/// A wire event this sensor knows how to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    ProcessStart = 0,
+    RegistrySet = 1,
+    DnsQuery = 2,
+    ScriptBlock = 3,
+}
+
+impl Shape {
+    pub const ALL: [Shape; 4] = [
+        Shape::ProcessStart,
+        Shape::RegistrySet,
+        Shape::DnsQuery,
+        Shape::ScriptBlock,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Shape::ProcessStart => "process_start",
+            Shape::RegistrySet => "registry_set",
+            Shape::DnsQuery => "dns_query",
+            Shape::ScriptBlock => "script_block",
+        }
+    }
+
+    pub const fn is_kernel_side(self) -> bool {
+        matches!(self, Shape::ProcessStart | Shape::RegistrySet)
+    }
+
+    pub const fn is_user_mode(self) -> bool {
+        !self.is_kernel_side()
+    }
+}
+
+/// What the sensor could and could not decode, per shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShapeCounts {
+    attempted: [u64; 4],
+    mapped: [u64; 4],
+    ever_fired: [bool; 4],
+    /// Events the callback delivered that `shape_of` did not recognise.
+    ///
+    /// Every provider the session enables emits event ids the translator does
+    /// not score. Before this counter, those events were silently dropped at
+    /// the shape match: the callback counted `delivered`, the translator
+    /// returned early without incrementing anything, and the accounting
+    /// broke. With this counter, `delivered == mapped + undecodable +
+    /// unrecognised` holds and every event is accounted for.
+    unrecognised: u64,
+}
+
+impl ShapeCounts {
+    pub(crate) fn note_attempt(&mut self, shape: Shape) {
+        self.attempted[shape as usize] += 1;
+        self.ever_fired[shape as usize] = true;
+    }
+
+    pub(crate) fn note_mapped(&mut self, shape: Shape) {
+        self.mapped[shape as usize] += 1;
+    }
+
+    /// An event the callback delivered that `shape_of` did not recognise.
+    pub(crate) fn note_unrecognised(&mut self) {
+        self.unrecognised += 1;
+    }
+
+    /// Events of this shape the sensor saw and could not decode.
+    pub fn undecodable(&self, shape: Shape) -> u64 {
+        self.attempted(shape).saturating_sub(self.mapped(shape))
+    }
+
+    pub fn attempted(&self, shape: Shape) -> u64 {
+        self.attempted[shape as usize]
+    }
+
+    pub fn mapped(&self, shape: Shape) -> u64 {
+        self.mapped[shape as usize]
+    }
+
+    pub fn ever_fired(&self, shape: Shape) -> bool {
+        self.ever_fired[shape as usize]
+    }
+
+    /// Events delivered but not recognised as any shape.
+    pub fn unrecognised(&self) -> u64 {
+        self.unrecognised
+    }
+
+    pub fn by_shape(&self) -> impl Iterator<Item = (Shape, u64, u64)> + '_ {
+        Shape::ALL
+            .iter()
+            .copied()
+            .map(|s| (s, self.attempted(s), self.mapped(s)))
+    }
+
+    pub fn total_attempted(&self) -> u64 {
+        self.attempted.iter().sum()
+    }
+
+    pub fn total_mapped(&self) -> u64 {
+        self.mapped.iter().sum()
+    }
+
+    /// Whether any kernel-side shape has seen events.
+    pub fn kernel_side_active(&self) -> bool {
+        Shape::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.is_kernel_side())
+            .any(|s| self.attempted(s) > 0)
+    }
+
+    /// Whether any user-mode shape has seen events.
+    pub fn user_mode_active(&self) -> bool {
+        Shape::ALL
+            .iter()
+            .copied()
+            .filter(|s| s.is_user_mode())
+            .any(|s| self.attempted(s) > 0)
+    }
+}
+
+/// A detected gap: a shape that should be producing events but is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryGap {
+    pub shape: Shape,
+    pub attempted: u64,
+    pub mapped: u64,
+    pub severity: GapSeverity,
+}
+
+impl TelemetryGap {
+    pub fn describe(&self) -> String {
+        match self.severity {
+            GapSeverity::Healthy => format!("{}: healthy", self.shape.as_str()),
+            GapSeverity::DecodeFailure => format!(
+                "{}: {} of {} events failed to decode (table problem, not an attack)",
+                self.shape.as_str(),
+                self.attempted - self.mapped,
+                self.attempted
+            ),
+            GapSeverity::Silent => format!(
+                "{}: silent while other shapes are active (possible ETW bypass)",
+                self.shape.as_str()
+            ),
+        }
+    }
+}
+
+/// How serious a gap is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GapSeverity {
+    Healthy,
+    DecodeFailure,
+    Silent,
+}
+
+/// Which ETW event becomes which wire event.
+fn shape_of(provider: &str, event_id: u16) -> Option<Shape> {
+    match (provider, event_id) {
+        ("Microsoft-Windows-Kernel-Process", 1) => Some(Shape::ProcessStart),
+        ("Microsoft-Windows-Kernel-Registry", 5) => Some(Shape::RegistrySet),
+        ("Microsoft-Windows-DNS-Client", 3006) => Some(Shape::DnsQuery),
+        ("Microsoft-Windows-PowerShell", 4104) => Some(Shape::ScriptBlock),
+        _ => None,
+    }
+}
+
+const PROCESS_ID: &[&str] = &["ProcessID", "ProcessId"];
+const PARENT_PROCESS_ID: &[&str] = &["ParentProcessID", "ParentProcessId"];
+const IMAGE_NAME: &[&str] = &["ImageName"];
+const KEY_NAME: &[&str] = &["KeyName"];
+const VALUE_NAME: &[&str] = &["ValueName"];
+const CAPTURED_DATA: &str = "CapturedData";
+const REGISTRY_TYPE: &[&str] = &["Type"];
+const QUERY_NAME: &[&str] = &["QueryName"];
+const QUERY_TYPE: &[&str] = &["QueryType"];
+const SCRIPT_BLOCK_TEXT: &[&str] = &["ScriptBlockText"];
+const SCRIPT_BLOCK_ID: &[&str] = &["ScriptBlockId"];
+const SCRIPT_BLOCK_PATH: &[&str] = &["Path"];
+const MESSAGE_NUMBER: &[&str] = &["MessageNumber"];
+const MESSAGE_TOTAL: &[&str] = &["MessageTotal"];
+
+/// How much script text we will ship, in bytes.
+const MAX_SCRIPT_TEXT: usize = 8 * 1024;
+
+fn cap_script_text(text: &str) -> &str {
+    if text.len() <= MAX_SCRIPT_TEXT {
+        return text;
+    }
+    let mut end = MAX_SCRIPT_TEXT;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+const KEPT_FAILURES: usize = 8;
+
+fn query_type_name(value: u32) -> String {
+    let known = match value {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        33 => "SRV",
+        43 => "DS",
+        65 => "HTTPS",
+        255 => "ANY",
+        other => return other.to_string(),
+    };
+    known.to_string()
+}
+
+mod reg_type {
+    pub const SZ: u32 = 1;
+    pub const EXPAND_SZ: u32 = 2;
+    pub const BINARY: u32 = 3;
+    pub const DWORD: u32 = 4;
+    pub const DWORD_BIG_ENDIAN: u32 = 5;
+    pub const MULTI_SZ: u32 = 7;
+    pub const QWORD: u32 = 11;
+}
+
+pub fn render_registry_value(reg_type: u32, bytes: &[u8]) -> String {
+    match reg_type {
+        reg_type::SZ | reg_type::EXPAND_SZ | reg_type::MULTI_SZ => {
+            utf16_to_string(bytes).unwrap_or_else(|| hex(bytes))
+        }
+        reg_type::DWORD | reg_type::DWORD_BIG_ENDIAN => bytes
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| hex(bytes)),
+        reg_type::QWORD => bytes
+            .get(..8)
+            .map(|b| u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8])))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| hex(bytes)),
+        reg_type::BINARY => hex(bytes),
+        _ => hex(bytes),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
+/// Translates raw ETW events, and reports what it could not translate.
+pub struct Translator {
+    host: HostId,
+    decoder: Decoder,
+    next_event_id: u64,
+    counts: ShapeCounts,
+    failures: Vec<String>,
+}
+
+impl Translator {
+    pub fn new(host: HostId) -> Self {
+        Self {
+            host,
+            decoder: Decoder::new(),
+            next_event_id: 0,
+            counts: ShapeCounts::default(),
+            failures: Vec::new(),
+        }
+    }
+
+    pub fn mapped(&self) -> u64 {
+        self.counts.total_mapped()
+    }
+
+    pub fn undecodable(&self) -> u64 {
+        self.counts
+            .total_attempted()
+            .saturating_sub(self.counts.total_mapped())
+    }
+
+    pub fn counts(&self) -> ShapeCounts {
+        self.counts
+    }
+
+    pub fn failures(&self) -> &[String] {
+        &self.failures
+    }
+
+    fn note_failure(&mut self, reason: String) {
+        if self.failures.len() < KEPT_FAILURES {
+            self.failures.push(reason);
+        }
+    }
+
+    /// Detect shapes that are silent while the sensor is otherwise active.
+    pub fn detect_gaps(&self) -> Vec<TelemetryGap> {
+        let total_attempted = self.counts.total_attempted();
+        if total_attempted == 0 {
+            return Vec::new();
+        }
+
+        let kernel_active = self.counts.kernel_side_active();
+        let user_active = self.counts.user_mode_active();
+
+        let mut gaps = Vec::new();
+
+        for shape in Shape::ALL {
+            let attempted = self.counts.attempted(shape);
+            let mapped = self.counts.mapped(shape);
+
+            let severity = if attempted == 0 {
+                if !self.counts.ever_fired(shape) {
+                    GapSeverity::Healthy
+                } else if shape.is_user_mode() && kernel_active {
+                    GapSeverity::Silent
+                } else if shape.is_kernel_side() && user_active {
+                    GapSeverity::Silent
+                } else {
+                    GapSeverity::Healthy
+                }
+            } else if attempted > mapped {
+                GapSeverity::DecodeFailure
+            } else {
+                GapSeverity::Healthy
+            };
+
+            if severity != GapSeverity::Healthy {
+                gaps.push(TelemetryGap {
+                    shape,
+                    attempted,
+                    mapped,
+                    severity,
+                });
+            }
+        }
+
+        gaps.sort_by(|a, b| {
+            b.severity
+                .cmp(&a.severity)
+                .then_with(|| a.shape.as_str().cmp(b.shape.as_str()))
+        });
+
+        gaps
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        for (shape, attempted, mapped) in self.counts.by_shape() {
+            parts.push(format!("{}: {}/{}", shape.as_str(), mapped, attempted));
+        }
+        if self.counts.unrecognised() > 0 {
+            parts.push(format!("unrecognised: {}", self.counts.unrecognised()));
+        }
+        parts.join(", ")
+    }
+
+    /// Translate one event, or return `None` if it is not something this sensor
+    /// scores or not something it could decode.
+    pub fn translate(&mut self, raw: &EtwRaw) -> Option<TelemetryEvent> {
+        let Some(shape) = shape_of(raw.wire.provider.as_str(), raw.wire.event_id) else {
+            // Not a shape we score. Counted so the totals add up: without
+            // this, the event was silently dropped at the shape match and
+            // the accounting broke between `delivered` and `mapped`.
+            self.counts.note_unrecognised();
+            return None;
+        };
+        self.counts.note_attempt(shape);
+
+        let Some(timestamp) = from_filetime(raw.wire.timestamp_raw) else {
+            self.note_failure(format!(
+                "{} id={}: timestamp {} is not a valid FILETIME",
+                raw.wire.provider.as_str(),
+                raw.wire.event_id,
+                raw.wire.timestamp_raw
+            ));
+            return None;
+        };
+
+        let kind = match shape {
+            Shape::ProcessStart => self.process_start(raw, timestamp),
+            Shape::RegistrySet => self.registry_set(raw, timestamp),
+            Shape::DnsQuery => self.dns_query(raw, timestamp),
+            Shape::ScriptBlock => self.script_block(raw, timestamp),
+        };
+
+        let kind = match kind {
+            Ok(kind) => kind,
+            Err(reason) => {
+                self.note_failure(format!(
+                    "{} id={}: {reason}",
+                    raw.wire.provider.as_str(),
+                    raw.wire.event_id
+                ));
+                return None;
+            }
+        };
+
+        self.counts.note_mapped(shape);
+        self.next_event_id += 1;
+
+        Some(TelemetryEvent::new(
+            EventId::new(self.next_event_id),
+            self.host.clone(),
+            timestamp,
+            EventSource::WindowsEtw,
+            raw.wire.provider.clone(),
+            raw.wire.event_id,
+            raw.wire.pid,
+            raw.wire.tid,
+            raw.wire.level,
+            kind,
+            Payload::empty(),
+        ))
+    }
+
+    fn process_start(&mut self, raw: &EtwRaw, at: DateTime<Utc>) -> Result<EventKind, String> {
+        let image = self
+            .decoder
+            .text_any(raw, IMAGE_NAME)
+            .ok_or("no ImageName; cannot attribute the process")?;
+
+        // The kernel reports paths as `\Device\HarddiskVolumeN\...`. Translate
+        // to the DOS form (`C:\...`) that a rule author writes.
+        let image = DevicePaths::global().translate(&image).into_owned();
+
+        let pid = self
+            .decoder
+            .u32_any(raw, PROCESS_ID)
+            .unwrap_or(raw.wire.pid);
+
+        Ok(EventKind::ProcessStart(ProcessStart {
+            pid: ProcessId::new(pid),
+            parent_pid: self
+                .decoder
+                .u32_any(raw, PARENT_PROCESS_ID)
+                .map(ProcessId::new),
+            executable: image.into(),
+            command_line: None,
+            user: None,
+            working_directory: None,
+            started_at: at,
+            image_hash: None,
+            integrity_level: None,
+        }))
+    }
+
+    fn registry_set(&mut self, raw: &EtwRaw, at: DateTime<Utc>) -> Result<EventKind, String> {
+        let key = self
+            .decoder
+            .text_any(raw, KEY_NAME)
+            .ok_or("no KeyName; cannot tell which key was written")?;
+
+        let value_data = match self.decoder.typed_field(raw, CAPTURED_DATA) {
+            Some((FieldValue::Binary(bytes), _)) => {
+                let declared = self.decoder.u32_any(raw, REGISTRY_TYPE).unwrap_or(0);
+                Some(render_registry_value(declared, &bytes).into())
+            }
+            Some((other, _)) => Some(render_field(&other).into()),
+            None => None,
+        };
+
+        Ok(EventKind::RegistrySet(RegistrySet {
+            pid: ProcessId::new(raw.wire.pid),
+            key_path: key.into(),
+            value_name: self.decoder.text_any(raw, VALUE_NAME).map(Into::into),
+            value_data,
+            set_at: at,
+        }))
+    }
+
+    fn dns_query(&mut self, raw: &EtwRaw, at: DateTime<Utc>) -> Result<EventKind, String> {
+        let name = self
+            .decoder
+            .text_any(raw, QUERY_NAME)
+            .ok_or("no QueryName; cannot tell what was looked up")?;
+
+        Ok(EventKind::DnsQuery(DnsQueryPayload {
+            pid: ProcessId::new(raw.wire.pid),
+            query_name: name.into(),
+            query_type: self
+                .decoder
+                .u32_any(raw, QUERY_TYPE)
+                .map(query_type_name)
+                .unwrap_or_else(|| "A".to_string())
+                .into(),
+            answers: Vec::new(),
+            response_code: None,
+            queried_at: at,
+        }))
+    }
+
+    fn script_block(&mut self, raw: &EtwRaw, at: DateTime<Utc>) -> Result<EventKind, String> {
+        let text = self
+            .decoder
+            .text_any(raw, SCRIPT_BLOCK_TEXT)
+            .ok_or("no ScriptBlockText; cannot tell what was run")?;
+
+        let path = self
+            .decoder
+            .text_any(raw, SCRIPT_BLOCK_PATH)
+            .map(|p| DevicePaths::global().translate(&p).into_owned());
+
+        Ok(EventKind::ScriptBlock(ScriptBlock {
+            pid: ProcessId::new(raw.wire.pid),
+            text: cap_script_text(&text).into(),
+            script_block_id: self.decoder.text_any(raw, SCRIPT_BLOCK_ID).map(Into::into),
+            path: path.map(Into::into),
+            message_number: self.decoder.u32_any(raw, MESSAGE_NUMBER),
+            message_total: self.decoder.u32_any(raw, MESSAGE_TOTAL),
+            recorded_at: at,
+        }))
+    }
+}
+
+fn render_field(value: &FieldValue) -> String {
+    match value {
+        FieldValue::Str(s) => s.clone(),
+        FieldValue::I8(v) => v.to_string(),
+        FieldValue::U8(v) => v.to_string(),
+        FieldValue::I16(v) => v.to_string(),
+        FieldValue::U16(v) => v.to_string(),
+        FieldValue::I32(v) => v.to_string(),
+        FieldValue::U32(v) => v.to_string(),
+        FieldValue::I64(v) => v.to_string(),
+        FieldValue::U64(v) => v.to_string(),
+        FieldValue::F32(v) => v.to_string(),
+        FieldValue::F64(v) => v.to_string(),
+        FieldValue::Guid(b) => hex(b),
+        FieldValue::Binary(b) => hex(b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::{ProviderId, RawEvent};
+    use windows::core::GUID;
+
+    const KNOWN_FILETIME: i64 = 133_444_736_000_000_000;
+
+    fn raw(provider: &'static str, event_id: u16, data: Vec<u8>) -> EtwRaw {
+        EtwRaw {
+            wire: RawEvent {
+                source: EventSource::WindowsEtw,
+                provider: ProviderId::new(provider),
+                event_id,
+                timestamp_raw: KNOWN_FILETIME,
+                pid: 4242,
+                tid: 4243,
+                level: 4,
+                data,
+            },
+            guid: GUID::from_u128(0),
+            version: 0,
+            opcode: 0,
+            keyword: 0,
+            activity_id: [0; 16],
+            related_activity_id: None,
+            process_start_key: Some(1),
+            is_wow64: false,
+        }
+    }
+
+    fn translator() -> Translator {
+        Translator::new(HostId::new("host-a").unwrap())
+    }
+
+    #[test]
+    fn filetime_converts_to_the_right_instant() {
+        let at = from_filetime(KNOWN_FILETIME).expect("valid filetime");
+        assert_eq!(at.to_rfc3339(), "2023-11-14T22:13:20+00:00");
+    }
+
+    #[test]
+    fn sub_second_filetime_precision_survives() {
+        let at = from_filetime(KNOWN_FILETIME + 1_234_567).expect("valid filetime");
+        assert_eq!(at.timestamp_subsec_nanos(), 123_456_700);
+    }
+
+    #[test]
+    fn a_filetime_before_the_unix_epoch_is_refused() {
+        assert_eq!(from_filetime(0), None);
+        assert_eq!(from_filetime(FILETIME_EPOCH_DELTA - 1), None);
+    }
+
+    #[test]
+    fn only_the_scored_shapes_are_claimed() {
+        assert_eq!(
+            shape_of("Microsoft-Windows-Kernel-Process", 1),
+            Some(Shape::ProcessStart)
+        );
+        assert_eq!(
+            shape_of("Microsoft-Windows-Kernel-Registry", 5),
+            Some(Shape::RegistrySet)
+        );
+        assert_eq!(
+            shape_of("Microsoft-Windows-DNS-Client", 3006),
+            Some(Shape::DnsQuery)
+        );
+        assert_eq!(
+            shape_of("Microsoft-Windows-PowerShell", 4104),
+            Some(Shape::ScriptBlock)
+        );
+        assert_eq!(shape_of("Microsoft-Windows-Kernel-Process", 3), None);
+        assert_eq!(shape_of("Microsoft-Windows-Kernel-Process", 5), None);
+        assert_eq!(shape_of("Some-Third-Party-Provider", 1), None);
+        assert_eq!(shape_of("Microsoft-Windows-PowerShell", 4103), None);
+        assert_eq!(shape_of("Microsoft-Windows-PowerShell", 4097), None);
+    }
+
+    #[test]
+    fn kernel_side_classification_is_correct() {
+        assert!(Shape::ProcessStart.is_kernel_side());
+        assert!(Shape::RegistrySet.is_kernel_side());
+        assert!(!Shape::DnsQuery.is_kernel_side());
+        assert!(!Shape::ScriptBlock.is_kernel_side());
+
+        assert!(Shape::DnsQuery.is_user_mode());
+        assert!(Shape::ScriptBlock.is_user_mode());
+        assert!(!Shape::ProcessStart.is_user_mode());
+    }
+
+    #[test]
+    fn a_script_block_without_the_machine_schema_is_not_invented() {
+        let raw = raw("Microsoft-Windows-PowerShell", 4104, vec![1, 2, 3, 4]);
+        let mut t = translator();
+        assert!(t.translate(&raw).is_none());
+        assert_eq!(t.mapped(), 0);
+        assert_eq!(t.undecodable(), 1);
+        assert_eq!(t.counts().attempted(Shape::ScriptBlock), 1);
+        assert_eq!(t.counts().mapped(Shape::ScriptBlock), 0);
+    }
+
+    #[test]
+    fn a_long_script_is_capped_at_a_character_boundary() {
+        let long = "e".repeat(MAX_SCRIPT_TEXT * 2);
+        assert_eq!(cap_script_text(&long).len(), MAX_SCRIPT_TEXT);
+
+        let mut text = "a".repeat(MAX_SCRIPT_TEXT - 1);
+        text.push('\u{20ac}');
+        text.push_str(&"b".repeat(100));
+        let capped = cap_script_text(&text);
+        assert_eq!(
+            capped.len(),
+            MAX_SCRIPT_TEXT - 1,
+            "the euro sign is dropped"
+        );
+        assert!(text.starts_with(capped));
+
+        assert_eq!(cap_script_text("short"), "short");
+    }
+
+    #[test]
+    fn query_types_map_to_mnemonics_and_fall_back_to_numbers() {
+        assert_eq!(query_type_name(1), "A");
+        assert_eq!(query_type_name(28), "AAAA");
+        assert_eq!(query_type_name(65), "HTTPS");
+        assert_eq!(
+            query_type_name(99),
+            "99",
+            "an unknown type is reported as itself, not as a wrong mnemonic"
+        );
+    }
+
+    #[test]
+    fn registry_values_render_by_their_declared_reg_type() {
+        let sz: Vec<u8> = "C:\\x"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert_eq!(render_registry_value(reg_type::SZ, &sz), "C:\\x");
+        assert_eq!(render_registry_value(reg_type::EXPAND_SZ, &sz), "C:\\x");
+        assert_eq!(
+            render_registry_value(reg_type::DWORD, &[0x01, 0, 0, 0]),
+            "1"
+        );
+        assert_eq!(
+            render_registry_value(reg_type::QWORD, &[1, 0, 0, 0, 0, 0, 0, 0]),
+            "1"
+        );
+        assert_eq!(
+            render_registry_value(reg_type::BINARY, &[1, 2, 3]),
+            "010203"
+        );
+        assert_eq!(render_registry_value(0xdead, &[1, 2, 3]), "010203");
+    }
+
+    #[test]
+    fn unscored_traffic_is_counted_as_unrecognised_not_as_undecodable() {
+        // The distinction the counters rest on: a busy machine is not a
+        // broken sensor. Thread events must move `unrecognised`, not
+        // `undecodable`, and the totals must add up.
+        let mut t = translator();
+        for id in [2u16, 3, 4, 5, 6] {
+            assert!(
+                t.translate(&raw("Microsoft-Windows-Kernel-Process", id, vec![1, 2, 3]))
+                    .is_none()
+            );
+        }
+        assert!(
+            t.translate(&raw("Some-Other-Provider", 1, vec![1]))
+                .is_none()
+        );
+        assert_eq!(t.undecodable(), 0);
+        assert_eq!(t.mapped(), 0);
+        assert_eq!(t.counts().unrecognised(), 6);
+        assert_eq!(t.counts().total_attempted(), 0);
+    }
+
+    #[test]
+    fn the_translator_accounting_closes() {
+        // Every event the translator received is either mapped, undecodable,
+        // or unrecognised. Before the `unrecognised` counter, the shape
+        // match silently dropped events and the accounting broke.
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, Vec::new())); // undecodable
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 3, Vec::new())); // unrecognised
+        t.translate(&raw("Some-Other-Provider", 1, Vec::new())); // unrecognised
+
+        let total = t.mapped() + t.undecodable() + t.counts().unrecognised();
+        assert_eq!(total, 3, "three events were delivered, three are accounted for");
+    }
+
+    #[test]
+    fn a_header_only_process_start_is_undecodable_rather_than_invented() {
+        let mut t = translator();
+        assert!(
+            t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, Vec::new()))
+                .is_none()
+        );
+        assert_eq!(t.mapped(), 0);
+        assert_eq!(t.undecodable(), 1);
+        assert!(
+            t.failures()[0].contains("ImageName"),
+            "the reason must name the field that failed: {:?}",
+            t.failures()
+        );
+    }
+
+    #[test]
+    fn each_shape_names_its_own_missing_field() {
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, Vec::new()));
+        t.translate(&raw("Microsoft-Windows-Kernel-Registry", 5, Vec::new()));
+        t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+        t.translate(&raw("Microsoft-Windows-PowerShell", 4104, Vec::new()));
+        assert_eq!(t.undecodable(), 4);
+        assert!(t.failures()[0].contains("ImageName"), "{:?}", t.failures());
+        assert!(t.failures()[1].contains("KeyName"), "{:?}", t.failures());
+        assert!(t.failures()[2].contains("QueryName"), "{:?}", t.failures());
+        assert!(
+            t.failures()[3].contains("ScriptBlockText"),
+            "{:?}",
+            t.failures()
+        );
+    }
+
+    #[test]
+    fn an_unusable_timestamp_is_reported_and_not_scored() {
+        let mut t = translator();
+        let mut bad = raw("Microsoft-Windows-Kernel-Process", 1, vec![0; 8]);
+        bad.wire.timestamp_raw = 0;
+        assert!(t.translate(&bad).is_none());
+        assert_eq!(t.undecodable(), 1);
+        assert!(t.failures()[0].contains("FILETIME"), "{:?}", t.failures());
+    }
+
+    #[test]
+    fn the_failure_log_is_bounded() {
+        let mut t = translator();
+        for _ in 0..500 {
+            t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, Vec::new()));
+        }
+        assert_eq!(t.undecodable(), 500);
+        assert_eq!(t.failures().len(), KEPT_FAILURES);
+    }
+
+    #[test]
+    fn per_shape_counts_separate_a_quiet_shape_from_a_broken_one() {
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, Vec::new()));
+        t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+        t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+
+        assert_eq!(t.counts().attempted(Shape::ProcessStart), 1);
+        assert_eq!(t.counts().mapped(Shape::ProcessStart), 0);
+        assert_eq!(t.counts().attempted(Shape::DnsQuery), 2);
+        assert_eq!(t.counts().mapped(Shape::DnsQuery), 0);
+        assert_eq!(t.counts().attempted(Shape::RegistrySet), 0);
+        assert_eq!(t.counts().attempted(Shape::ScriptBlock), 0);
+        assert_eq!(t.undecodable(), 3);
+        assert_eq!(t.counts().total_attempted(), 3);
+    }
+
+    #[test]
+    fn by_shape_iterates_in_a_stable_order() {
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+        let seen: Vec<Shape> = t.counts().by_shape().map(|(s, _, _)| s).collect();
+        assert_eq!(
+            seen,
+            vec![
+                Shape::ProcessStart,
+                Shape::RegistrySet,
+                Shape::DnsQuery,
+                Shape::ScriptBlock
+            ]
+        );
+    }
+
+    #[test]
+    fn an_idle_sensor_reports_no_gaps() {
+        let t = translator();
+        assert!(t.detect_gaps().is_empty());
+    }
+
+    #[test]
+    fn a_shape_that_never_fired_is_untested_not_silent() {
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+
+        let gaps = t.detect_gaps();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].shape, Shape::DnsQuery);
+        assert_eq!(gaps[0].severity, GapSeverity::DecodeFailure);
+
+        assert!(!t.counts().ever_fired(Shape::ProcessStart));
+        assert!(!t.counts().ever_fired(Shape::ScriptBlock));
+    }
+
+    #[test]
+    fn a_shape_that_stopped_firing_is_silent() {
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+        assert!(t.counts().ever_fired(Shape::DnsQuery));
+
+        for _ in 0..3 {
+            t.translate(&raw("Microsoft-Windows-Kernel-Registry", 5, Vec::new()));
+        }
+
+        let gaps = t.detect_gaps();
+        let dns_gap = gaps
+            .iter()
+            .find(|g| g.shape == Shape::DnsQuery)
+            .expect("DNS gap should be present");
+        assert_eq!(dns_gap.severity, GapSeverity::Silent);
+
+        assert!(gaps.iter().all(|g| g.shape != Shape::ScriptBlock));
+    }
+
+    #[test]
+    fn a_decode_failure_is_not_a_silent_gap() {
+        let mut t = translator();
+        for _ in 0..3 {
+            t.translate(&raw("Microsoft-Windows-Kernel-Registry", 5, Vec::new()));
+        }
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, Vec::new()));
+
+        let gaps = t.detect_gaps();
+        let registry_gap = gaps
+            .iter()
+            .find(|g| g.shape == Shape::RegistrySet)
+            .expect("registry gap");
+        assert_eq!(registry_gap.severity, GapSeverity::DecodeFailure);
+        assert_eq!(registry_gap.attempted, 3);
+        assert_eq!(registry_gap.mapped, 0);
+    }
+
+    #[test]
+    fn silent_gaps_sort_before_decode_failures() {
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+        for _ in 0..2 {
+            t.translate(&raw("Microsoft-Windows-Kernel-Registry", 5, Vec::new()));
+        }
+
+        let gaps = t.detect_gaps();
+        assert!(gaps.len() >= 2, "{gaps:?}");
+        assert_eq!(gaps[0].severity, GapSeverity::Silent);
+    }
+
+    #[test]
+    fn a_gap_describes_itself_usefully() {
+        let gap = TelemetryGap {
+            shape: Shape::ScriptBlock,
+            attempted: 0,
+            mapped: 0,
+            severity: GapSeverity::Silent,
+        };
+        let text = gap.describe();
+        assert!(text.contains("script_block"));
+        assert!(text.contains("silent"));
+
+        let decode_gap = TelemetryGap {
+            shape: Shape::RegistrySet,
+            attempted: 10,
+            mapped: 3,
+            severity: GapSeverity::DecodeFailure,
+        };
+        let text = decode_gap.describe();
+        assert!(text.contains("registry_set"));
+        assert!(text.contains("7 of 10"));
+    }
+
+    #[test]
+    fn summary_reports_every_shape_and_unrecognised() {
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, Vec::new()));
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 3, Vec::new())); // unrecognised
+        let s = t.summary();
+        assert!(s.contains("process_start: 0/1"), "{s}");
+        assert!(s.contains("registry_set: 0/0"), "{s}");
+        assert!(s.contains("dns_query: 0/0"), "{s}");
+        assert!(s.contains("script_block: 0/0"), "{s}");
+        assert!(s.contains("unrecognised: 1"), "{s}");
+    }
+}

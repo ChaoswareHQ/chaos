@@ -148,14 +148,25 @@ The rules are in `crates/pipeline/src/rules.rs`, each naming its technique:
 | `high_abuse_tld` | T1071.004 | name resolution in a high-abuse namespace |
 | `novel_binary_in_writable_location` | T1036 | first sighting (A22) of a binary in a writable place |
 | `process_fanout_burst` | T1055 | a parent producing children at an unusual rate |
+| `script_block_encoded_command` | T1059.001 | a PowerShell script that passes an encoded command |
+| `script_block_obfuscated` | T1140 | a PowerShell script that decodes or assembles itself |
+| `script_block_remote_fetch` | T1105 | a PowerShell script that fetches over the network |
+| `script_block_defence_evasion` | T1562.001 | a PowerShell script that touches AMSI or Defender |
 
-`T1059.001` and `T1218` read a command line, and the process provider on Windows
-does not carry one — so neither can fire from `Kernel-Process` alone. Two other
-providers on a stock machine do, once the matching audit policy is on: PowerShell
-`4104` (script text) and Security-Auditing `4688` v2 (`CommandLine`,
-`ParentProcessName`). See
-[`crates/adapters/etw/README.md`](crates/adapters/etw/README.md) for the verified
-field lists.
+The last four read a PowerShell `4104` script block rather than a command line,
+which is the only way `T1059.001` fires on a live host: the process provider on
+Windows carries no command line, so `encoded_powershell` needs a source that does.
+A 4104 also carries the *whole script* rather than the first 260 characters of a
+command line, which is where a staged loader keeps its payload. They report which
+pattern matched and never quote the script — an alert body is minimised before it
+leaves the host (A19), and the script is the most sensitive thing on the machine.
+
+Each tell is its own finding with its own likelihood, so a loader that fetches,
+decodes and disables AMSI adds three pieces of evidence rather than asserting one
+verdict. That follows A5, and it carries A5's caveat as well: the tells are
+correlated in reality and treated as independent here, so a loader's posterior is
+higher than a strict reading would give. It matters at the top of the range, where
+the decision has already been made.
 
 ## The console
 
@@ -222,11 +233,21 @@ Stated plainly, because the alternative is a reader assuming these are done:
   carries the detail.
 - **`crates/config` is not wired to the server** — the server's flags are
   parsed in its own `main`.
-- **No ETW event has been scored with a command-line rule on live hardware**,
-  because the process provider does not carry the field. The two providers that
-  do are named in
-  [`crates/adapters/etw/README.md`](crates/adapters/etw/README.md) and no rule
+- **`T1218` cannot fire on a live host yet.** It reads a command line, and the
+  process provider does not carry one. The route is Security-Auditing `4688` v2
+  (`CommandLine`, `ParentProcessName`) once `Audit Process Creation` and
+  `ProcessCreationIncludeCmdLine_Enabled` are on; the field names are verified in
+  [`crates/adapters/etw/README.md`](crates/adapters/etw/README.md) and no shape
   reads them yet.
+- **The PowerShell script-block rules have never seen a live 4104.** The decode
+  path, the rules and the end-to-end result are covered by tests; the field names
+  are verified against this machine's manifest. What is untested is a real script
+  block in a real batch, because the host needs Script Block Logging on for one to
+  exist at all.
+- **Evidence from different tells is summed as if independent**, which A5 says to
+  do and which is not strictly true: a loader that fetches, decodes and disables
+  AMSI is one behaviour, not three. The effect is a higher posterior at the top of
+  the range, where the decision is already made.
 - **The event schema is version 2** as of the `Payload` change. A client and a
   server built from different commits will not understand each other's events,
   so rebuild both together.

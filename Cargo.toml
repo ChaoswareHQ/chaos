@@ -1,16 +1,20 @@
 [workspace]
 resolver = "3"
-default-members = ["apps/client"]
+default-members = ["apps/*"]
 members = [
     "apps/*",
-    "crates/adapters/*",
+    "crates/adapters/mac/*",
+    "crates/adapters/linux/*",
+    "crates/adapters/windows/*",
+    "crates/adapters/respond",
     "crates/asmr",
     "crates/config",
     "crates/model",
     "crates/pipeline",
     "crates/ports",
     "crates/protocol",
-    "crates/transport",
+    "crates/supervision",
+    "crates/transport", "crates/observer",
 ]
 
 [workspace.package]
@@ -22,12 +26,11 @@ rust-version = "1.98.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-# --- infrastructure -------------------------------------------------------
 asmr = { path = "crates/asmr" }
 config = { path = "crates/config" }
-ebpf = { path = "crates/adapters/ebpf" }
-es = { path = "crates/adapters/es" }
-etw = { path = "crates/adapters/etw" }
+ebpf = { path = "crates/adapters/linux/ebpf" }
+es = { path = "crates/adapters/mac/es" }
+etw = { path = "crates/adapters/windows/etw" }
 model = { path = "crates/model" }
 pipeline = { path = "crates/pipeline" }
 ports = { path = "crates/ports" }
@@ -35,10 +38,20 @@ protocol = { path = "crates/protocol" }
 respond = { path = "crates/adapters/respond" }
 transport = { path = "crates/transport" }
 
-# --- third party ----------------------------------------------------------
 crossbeam-channel = "0.5.17"
+goblin = { version = "0.10.7", default-features = false, features = [
+    "std",
+    "alloc",
+    "elf32",
+    "elf64",
+    "pe32",
+    "pe64",
+] }
 mimalloc = "0.1.52"
 windows = "0.62.2"
+
+axum = "0.8.9"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 
 indexmap = { version = "2.14.2", features = ["serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }

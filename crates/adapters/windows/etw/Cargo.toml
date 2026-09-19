@@ -13,8 +13,6 @@ crossbeam-channel.workspace = true
 model.workspace = true
 ports.workspace = true
 thiserror.workspace = true
-
-# The translator timestamps wire events from ETW's FILETIME header.
 chrono.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -22,6 +20,9 @@ windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Performance",
-    # EVENT_TRACE_LOGFILEW and OpenTraceW are gated behind this in windows-rs.
+    "Win32_System_Registry",
     "Win32_System_Time",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_Storage_FileSystem"
 ] }

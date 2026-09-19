@@ -15,6 +15,24 @@
 //! makes deferred decoding possible at all — TDH can rebuild a synthetic
 //! `EVENT_RECORD` over our own buffer later, but it can never survive the
 //! kernel recycling the original.
+//!
+//! # Legacy formats the callback filters before the decoder sees them
+//!
+//! Three event-header flags mark formats that TDH cannot decode:
+//!
+//! * `EVENT_HEADER_FLAG_CLASSIC_HEADER` (`0x0001`) — a pre-manifest event whose
+//!   descriptor is a legacy `EVENT_CLASSIC_HEADER` rather than an
+//!   `EVENT_DESCRIPTOR`. Counted as `classic`.
+//! * `EVENT_HEADER_FLAG_STRING_ONLY` (`0x0004`) — the event data is a bare
+//!   null-terminated Unicode string with no properties. TDH has no field names
+//!   to resolve, so an event like this counted as `undecodable` would be a
+//!   false positive in the failure counter. Counted as `string_only`.
+//! * `EVENT_HEADER_FLAG_TRACE_MESSAGE` (`0x0008`) — the provider used the WPP
+//!   trace-message function rather than a manifest. Also no named properties.
+//!   Counted as `trace_message`.
+//!
+//! Before this filter, the two legacy formats silently inflated `undecodable`
+//! on any host that still runs WPP providers — which is most of them.
 
 use crate::stats::Stats;
 use crossbeam_channel::Sender;
@@ -22,18 +40,31 @@ use model::{EventSource, ProviderId, RawEvent};
 use std::slice;
 use windows::Win32::System::Diagnostics::Etw::{
     EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
-    EVENT_HEADER_FLAG_CLASSIC_HEADER, EVENT_RECORD,
+    EVENT_HEADER_FLAG_CLASSIC_HEADER, EVENT_HEADER_FLAG_STRING_ONLY,
+    EVENT_HEADER_FLAG_TRACE_MESSAGE, EVENT_RECORD,
 };
 use windows::core::GUID;
 
+/// `EVENT_HEADER_FLAG_STRING_ONLY` from `evntcons.h`.
+///
+/// The windows-rs binding declares these flags as `u32` while the header
+/// field is `u16`. The alias is `u32` and the header field is widened at
+/// the read site, so the two sides of the comparison are the same width
+/// without a second cast.
+const FLAG_STRING_ONLY: u32 = EVENT_HEADER_FLAG_STRING_ONLY;
+
+/// `EVENT_HEADER_FLAG_TRACE_MESSAGE` from `evntcons.h`.
+const FLAG_TRACE_MESSAGE: u32 = EVENT_HEADER_FLAG_TRACE_MESSAGE;
+
+/// `EVENT_HEADER_FLAG_32_BIT_HEADER` from `evntcons.h`.
+///
+/// Not exposed as a named constant in this version of windows-rs. The value
+/// is stable: the event was logged by a 32-bit process (including a WOW64
+/// process on a 64-bit host).
+const FLAG_32_BIT_HEADER: u32 = 0x0020;
+
 /// An ETW event, paired with the routing detail the wire format deliberately
 /// does not carry.
-///
-/// `wire` is what ships to a server: provider *name*, opaque payload, no GUID.
-/// The rest exists because local decoding needs it — TDH resolves a schema from
-/// the provider GUID plus the descriptor, and a name is not enough to rebuild
-/// that. Keeping both means the shipping path and the detection path read the
-/// same bytes without either one dictating the other's shape.
 #[derive(Debug, Clone)]
 pub struct EtwRaw {
     pub wire: RawEvent,
@@ -47,22 +78,20 @@ pub struct EtwRaw {
     pub related_activity_id: Option<[u8; 16]>,
     /// A kernel-generated process identity that survives PID reuse.
     pub process_start_key: Option<u64>,
+    /// Whether the provider was 32-bit or a WOW64 process.
+    ///
+    /// From `EVENT_HEADER_FLAG_32_BIT_HEADER`. The header's ProcessId is
+    /// always a 32-bit PID; this flag is what distinguishes a native 64-bit
+    /// process from a WOW64 one that happens to share the PID space.
+    pub is_wow64: bool,
 }
 
 impl EtwRaw {
-    /// Stable identity for the process that emitted this event, when the
-    /// provider supplies a start key. Without one, a PID is only valid for as
-    /// long as nothing recycles it.
+    /// Stable identity for the process that emitted this event.
     pub fn process_identity(&self) -> ProcessIdentity {
-        match self.process_start_key {
-            Some(key) => ProcessIdentity {
-                pid: self.wire.pid,
-                start_key: Some(key),
-            },
-            None => ProcessIdentity {
-                pid: self.wire.pid,
-                start_key: None,
-            },
+        ProcessIdentity {
+            pid: self.wire.pid,
+            start_key: self.process_start_key,
         }
     }
 }
@@ -78,12 +107,6 @@ pub struct ProcessIdentity {
 pub(crate) struct CallbackContext {
     pub(crate) tx: Sender<EtwRaw>,
     pub(crate) stats: Stats,
-    /// The enabled providers, as `(guid, name)`.
-    ///
-    /// A `Vec` scanned linearly rather than a `HashMap`: the list is the four
-    /// providers the session was configured with, so four `GUID` comparisons beat
-    /// hashing a sixteen-byte key on every event, and there is one less
-    /// collection to reason about on the hottest path in the product.
     pub(crate) providers: Vec<(GUID, ProviderId)>,
     pub(crate) max_level: u8,
 }
@@ -104,10 +127,27 @@ pub(crate) unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     let (rec, ctx) = (unsafe { &*record }, unsafe { &*ctx });
     let header = &rec.EventHeader;
 
-    // The SDK declares this flag as `u32` while the header field is `u16`; the
-    // cast keeps that width mismatch in one place.
-    if u32::from(header.Flags) & EVENT_HEADER_FLAG_CLASSIC_HEADER != 0 {
+    // The SDK declares the flag constants as `u32` while the header field is
+    // `u16`. Widening once here means every subsequent comparison is against
+    // `u32` and the width mismatch lives in exactly one place.
+    let flags = u32::from(header.Flags);
+
+    // Classic header: pre-manifest, cannot be decoded.
+    if flags & EVENT_HEADER_FLAG_CLASSIC_HEADER != 0 {
         ctx.stats.classic();
+        return;
+    }
+
+    // String-only: bare Unicode string, no properties. Previously fell
+    // through to the decoder and inflated `undecodable`.
+    if flags & FLAG_STRING_ONLY != 0 {
+        ctx.stats.string_only();
+        return;
+    }
+
+    // Trace message: WPP output, no properties. Same as above.
+    if flags & FLAG_TRACE_MESSAGE != 0 {
+        ctx.stats.trace_message();
         return;
     }
 
@@ -122,23 +162,20 @@ pub(crate) unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         .iter()
         .find(|(guid, _)| *guid == header.ProviderId)
     {
-        // Cloning the name is an `Arc` increment, not an allocation.
         Some((_, name)) => name.clone(),
-        // A provider we did not ask for still arrives when another session
-        // enables it. Paying one format per unknown provider beats dropping
-        // evidence we cannot attribute.
-        None => ProviderId::new(format!("{:?}", header.ProviderId)),
+        None => ProviderId::new(crate::autologger::format_guid(&header.ProviderId)),
     };
 
     let len = (rec.UserDataLength as usize).min(model::MAX_PAYLOAD_SIZE);
     let data = if len == 0 || rec.UserData.is_null() {
         Vec::new()
     } else {
-        // The one irreplaceable operation: UserData dies with this call.
         unsafe { slice::from_raw_parts(rec.UserData as *const u8, len) }.to_vec()
     };
 
     let (related_activity_id, process_start_key) = unsafe { extended_data(rec) };
+
+    let is_wow64 = flags & FLAG_32_BIT_HEADER != 0;
 
     let raw = EtwRaw {
         wire: RawEvent {
@@ -158,6 +195,7 @@ pub(crate) unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         activity_id: guid_bytes(&header.ActivityId),
         related_activity_id,
         process_start_key,
+        is_wow64,
     };
 
     ctx.stats.received(raw.wire.data.len());
@@ -222,7 +260,6 @@ mod tests {
 
     #[test]
     fn guid_bytes_use_the_canonical_windows_layout() {
-        // 00112233-4455-6677-8899-aabbccddeeff
         let g = GUID::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
         let b = guid_bytes(&g);
 
@@ -231,10 +268,6 @@ mod tests {
         assert_eq!(b[6..8], 0x6677u16.to_le_bytes());
         assert_eq!(b[8..16], [0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
 
-        // The first three fields are little-endian and the trailing eight bytes
-        // are not, so this is NOT a little-endian encoding of the 128-bit value.
-        // Getting it wrong silently byte-swaps every activity id we keep, which
-        // turns A4 correlation into noise.
         assert_eq!(
             b,
             [
@@ -268,6 +301,7 @@ mod tests {
             activity_id: [0; 16],
             related_activity_id: None,
             process_start_key: Some(100),
+            is_wow64: false,
         };
 
         let first = base.process_identity();

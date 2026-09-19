@@ -8,6 +8,10 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "cclient"
+path = "src/main.rs"
+
 [dependencies]
 mimalloc.workspace = true
 model.workspace = true

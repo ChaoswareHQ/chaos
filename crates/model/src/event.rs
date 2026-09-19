@@ -301,6 +301,58 @@ mod tests {
     }
 
     #[test]
+    fn a_script_block_announces_itself_by_name_on_the_wire() {
+        // The tag is the whole contract. Misspell it and the far end does not
+        // complain: `#[serde(other)]` turns an unknown tag into `Unclassified`,
+        // so the event arrives, counts, and means nothing. Silently.
+        let event = TelemetryEvent::new(
+            EventId::new(11),
+            HostId::new("host-a").expect("valid"),
+            DateTime::from_timestamp(1_700_000_000, 0).expect("valid instant"),
+            EventSource::WindowsEtw,
+            ProviderId::new("Microsoft-Windows-PowerShell"),
+            4104,
+            42,
+            42,
+            4,
+            crate::EventKind::ScriptBlock(crate::ScriptBlock {
+                pid: crate::ProcessId::new(42),
+                text: "Invoke-Expression $x".into(),
+                script_block_id: Some("{abc}".into()),
+                path: None,
+                message_number: Some(1),
+                message_total: Some(1),
+                recorded_at: DateTime::from_timestamp(1_700_000_000, 0).expect("valid instant"),
+            }),
+            Payload::empty(),
+        );
+
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert!(json.contains(r#""kind":"script_block""#), "{json}");
+
+        let reparsed = serde_json::from_str::<TelemetryEvent>(&json).expect("parses");
+        match &reparsed.kind {
+            crate::EventKind::ScriptBlock(block) => {
+                assert_eq!(block.text.as_ref(), "Invoke-Expression $x");
+                assert_eq!(block.pid.as_u32(), 42);
+                // Absent optionals must stay absent rather than becoming empty.
+                assert!(block.path.is_none());
+            }
+            other => panic!("the tag did not survive: {other:?}"),
+        }
+        assert_eq!(serde_json::to_string(&reparsed).expect("serializes"), json);
+    }
+
+    #[test]
+    fn an_event_from_a_newer_agent_is_unclassified_rather_than_a_parse_failure() {
+        // The forward-compatibility promise `#[serde(other)]` makes, and the
+        // reason adding a variant is additive.
+        let json = r#"{"kind":"something_from_the_future","pid":1}"#;
+        let parsed = serde_json::from_str::<crate::EventKind>(json).expect("parses");
+        assert_eq!(parsed, crate::EventKind::Unclassified);
+    }
+
+    #[test]
     fn a_payload_round_trips_through_a_whole_event() {
         // The transparent attribute is on the type, but the field it lives in is
         // what actually has to keep working.

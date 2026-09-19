@@ -10,13 +10,14 @@ what a rule is, or what an alert is.
 ## Shape
 
 ```
-session.rs    owns the kernel session and the thread blocked in ProcessTrace
-callback.rs   runs per event on that thread: copies the payload, hands off
-decode.rs     runs on the consumer side: rebuilds an EVENT_RECORD, asks TDH
-translate.rs  decoded fields -> the wire format the pipeline scores
-provider.rs   GUIDs, keyword masks, and the default provider list
-stats.rs      counters, including what was lost
-error.rs      error codes, hints, and the two remedies worth writing down
+session.rs     owns the kernel session and the thread blocked in ProcessTrace
+callback.rs    runs per event on that thread: copies the payload, hands off
+decode.rs      runs on the consumer side: rebuilds an EVENT_RECORD, asks TDH
+translate.rs   decoded fields -> the wire format the pipeline scores
+provider.rs    GUIDs, keyword masks, and the default provider list
+autologger.rs  boot-time sessions: read the configuration, render the commands
+stats.rs       counters, including what was lost
+error.rs       error codes, hints, and the two remedies worth writing down
 ```
 
 The split between `callback` and `decode` is the central design decision, and it
@@ -37,6 +38,27 @@ Two rules hold in the callback, and both are load-bearing:
   `try_send` is far cheaper than losing a buffer.
 - **Never panic.** Unwinding out of an `extern "system"` frame aborts the
   process. Every operation there is total.
+
+## Typed decode, not width guessing
+
+`TdhGetProperty` returns a byte buffer and does not say whether those bytes are
+a `UInt32`, four bytes of a `Binary` field, or the first half of a UTF-16 string.
+Guessing from the width works until it does not — the registry provider's
+`CapturedData` is declared `Binary`, so a four-byte `REG_DWORD` Run value would
+be read as an integer where the manifest says bytes.
+
+`Decoder` fetches the declared type once per `(provider, event id, version)` via
+`TdhGetEventInformation` and caches it, so a field's type is a fact. Two
+accessors:
+
+- `Decoder::typed_field` asks the schema and classifies by declared `InType`.
+  This is what `translate::registry_set` uses, because the shape of a registry
+  value is not obvious from its name.
+- `Decoder::field` keeps the width-based classification for fields the caller
+  already knows are fixed-width scalars (a `ProcessID`, a `QueryType`).
+
+`FieldType` is the subset of `TDH_INTYPE_*` this crate acts on; anything else
+becomes `FieldType::Unknown` and is kept as bytes.
 
 ## What is collected
 
@@ -67,31 +89,39 @@ enabled by default.
 
 ## What becomes a wire event
 
-`translate.rs` maps exactly three shapes today:
+`translate.rs` maps four shapes today:
 
 | Provider | Event id | Name | Becomes |
 |---|---|---|---|
 | `Kernel-Process` | 1 | `ProcessStart` | `EventKind::ProcessStart` |
 | `Kernel-Registry` | 5 | `RegistrySetValue` | `EventKind::RegistrySet` |
 | `DNS-Client` | 3006 | `DnsQuery` | `EventKind::DnsQuery` |
+| `PowerShell` | 4104 | `ScriptBlock` | `EventKind::ScriptBlock` |
 
 Everything else the session delivers is counted and dropped. That is a
 deliberate choice about which events are worth shipping, not a limit of the
-sensor.
+sensor — the PowerShell provider, for instance, emits two dozen event ids of its
+own logging, and claiming them would ship a great deal and detect nothing.
+
+`ScriptBlock` is the shape that makes `T1059.001` reachable on a live host. The
+script text is capped at 8 KiB on the way in, at a character boundary, so one
+enormous script cannot fail a whole batch; and a script long enough to be split
+arrives as several events sharing a `ScriptBlockId`, which nothing reassembles.
+Both facts are visible in the wire event rather than hidden.
 
 ## The field names come from the machine, not from memory
 
 TDH addresses properties by *name* (`TdhGetProperty` takes a `PCWSTR`, not an
 index), and the name has to match the provider's manifest exactly. Every name in
-`translate.rs` was read off the shipped templates:
+`translate.rs` was read off a real host with `tools/dump-fields.ps1`:
 
 ```powershell
-Get-WinEvent -ListProvider Microsoft-Windows-Kernel-Process
-wevtutil gp Microsoft-Windows-Kernel-Registry /ge:true
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/dump-fields.ps1 `
+    -Provider Microsoft-Windows-Kernel-Registry
 ```
 
-**Both work without elevation.** The manifests are shipped files; reading them is
-not a privileged operation, which makes this table checkable on any machine
+**Reading a manifest needs no elevation.** The manifests are shipped files; this
+is not a privileged operation, which makes the table checkable on any machine
 rather than a matter of trust.
 
 Two of these templates are genuinely surprising, and both cost detections
@@ -108,17 +138,16 @@ Its fields are `ProcessID`, `ProcessSequenceNumber`, `CreateTime`,
 There is no command-line field. **Every rule that reads a command line is
 unreachable from this provider**, which is why `T1059.001` (encoded command) and
 `T1218` (signed binary against a remote location) cannot fire from it, however
-well they test against a fixture. Two other providers on a stock machine do carry
-a command line — see [Where a command line actually
-comes from](#where-a-command-line-actually-comes-from).
+well they test against a fixture.
 
 ### `RegistrySetValue` has no string value
 
 It carries `KeyObject`, `Status`, `Type`, `DataSize`, `KeyName`, `ValueName`,
 `CapturedDataSize`, `CapturedData`, `PreviousDataType` and friends. The value
-written is `CapturedData`, a **`Binary`** field sized by `CapturedDataSize`.
-There is no `Data` or `ValueData` string, so a rule cannot grep the written value
-without decoding the binary form.
+written is `CapturedData`, a **`Binary`** field. Its shape is decided by the
+companion `Type` field, which is a `REG_*` constant — `render_registry_value`
+reads it and decodes the bytes accordingly, so a `REG_SZ` Run value arrives as
+the path it names rather than as the hex of its UTF-16.
 
 Property names are looked up through a chain rather than a single name
 (`PROCESS_ID = &["ProcessID", "ProcessId"]`) because templates are not identical
@@ -126,22 +155,31 @@ across Windows builds and a miss has to degrade to `None` rather than to a guess
 
 ## Where a command line actually comes from
 
-Verified from this machine's shipped manifests, not from documentation. Both of
-these need a policy turned on before the events are emitted at all, so on a
-stock host neither one fires and the sensor is correct to be quiet.
+Verified from this machine's shipped manifests with `tools/dump-fields.ps1`, not
+from documentation. Both of these need a policy turned on before the events are
+emitted at all, so on a stock host neither one fires and the sensor is correct to
+be quiet.
 
-### PowerShell 4104 — script text, no policy work beyond logging
+### PowerShell 4104 — script text. **Decoded today.**
 
 ```
 id=4104  v=1  MessageNumber, MessageTotal, ScriptBlockText, ScriptBlockId, Path
 ```
 
-`ScriptBlockText` is the script body. Requires **Script Block Logging**
-(`EnableScriptBlockLogging`), and covers PowerShell only. This is the direct
-route to `T1059.001`: the encoded-command rule reads a command line, and a
-script block is the same evidence at a different level.
+`ScriptBlockText` is the script body, and it is what the four `script_block_*`
+rules in the pipeline read. Requires **Script Block Logging**
+(`EnableScriptBlockLogging`), and covers PowerShell only. When the policy is off
+the provider emits nothing, which is why a quiet host proves nothing about
+whether this path works.
 
-### Security-Auditing 4688 — every process, with the command line
+The event carries no pid field: the header's process is the interpreter that
+logged it, so that is the process the evidence accumulates against. A script long
+enough to be split arrives as several events sharing a `ScriptBlockId` and
+counting themselves with `MessageNumber`/`MessageTotal` — nothing reassembles
+them, and `message_total > 1` is how a reader can tell the text in hand is one
+piece of something larger.
+
+### Security-Auditing 4688 — every process, with the command line. Not decoded.
 
 ```
 id=4688  v=0  ... NewProcessName, TokenElevationType, ProcessId
@@ -154,7 +192,8 @@ id=4688  v=2  ... (v1) ..., TargetUserSid, TargetUserName, TargetDomainName,
 label as well, which is what the masquerading and fan-out rules read. It needs
 `Audit Process Creation` **and** `ProcessCreationIncludeCmdLine_Enabled` — the
 latter is off by default, which is why the template on a stock machine is `v0` and
-has no `CommandLine` at all.
+has no `CommandLine` at all. This is the route to `T1218`, which PowerShell 4104
+cannot cover.
 
 ### Not a route: Kernel-Audit-API-Calls
 
@@ -181,6 +220,76 @@ PowerShell. `CodeIntegrity` is the trap in the table — its field names contain
 `Microsoft-Windows-Sysmon` is not installed on the reference machine and the
 sensor does not need it: it is only another provider, and every field above comes
 from something already present.
+
+## Boot-time capture, and the limit of it
+
+A session created by `EtwSession::start` begins when the agent does. Everything
+before that — the services that started, the logon, the Run key that fired during
+it — happened with nothing listening, and no care in the consumer recovers it.
+
+Windows has a mechanism for this. A subkey under
+`HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger` describes a session and the
+kernel starts it during boot. Read off this machine's own `EventLog-System`
+session, the layout is:
+
+```
+[EventLog-System]
+  Start          REG_DWORD  0x1       1 = started at boot
+  Guid           REG_SZ     {d2112be4-cd15-5a9c-e38f-080a207e08d5}
+  BufferSize     REG_DWORD  0x40      in KB, as here
+  MinimumBuffers REG_DWORD  0x0
+  MaximumBuffers REG_DWORD  0x10
+  FlushTimer     REG_DWORD  0x1       seconds
+  LogFileMode    REG_DWORD  0x98000180
+  <provider guid>                      one subkey per provider
+      Enabled        REG_DWORD 1
+      EnableLevel    REG_DWORD 4
+      MatchAnyKeyword REG_QWORD
+```
+
+`autologger.rs` gives three things and deliberately withholds a fourth:
+
+- **`AutologgerState::read(session)`** — reads that configuration back. Reading a
+  *named* session needs no elevation; enumerating which sessions exist does, and
+  the container key refuses a normal user outright. That is why this takes a name.
+- **`AutologgerSpec::problems(&state)`** — the self-check. Each string names one
+  value that is missing or wrong, because "the autologger is broken" is not
+  something an operator can act on. Empty means the host is configured as this
+  deployment expects. **It notices a *changed* `MatchAnyKeyword`, not only an
+  absent one**: a mask narrowed from `0x50` to `0x10` silently drops image-load
+  telemetry, and the check that used to fire only on absence could not see it.
+- **`AutologgerSpec::reg_commands()`** — the exact `reg add` lines that create the
+  session, rendered from the same data the check compares against, so the
+  instructions cannot drift from the code.
+- **No writing.** Creating the key needs an elevated token, and a library that
+  quietly rewrites `HKLM` at startup is a library nobody should trust.
+
+`EtwSession::attach(cfg)` consumes such a session: it does not start anything and
+**enables no provider** — that was decided by whoever created the session — so the
+provider list passed to it is used only to *name* providers in outgoing events. It
+refuses a session whose `LogFileMode` lacks `EVENT_TRACE_REAL_TIME_MODE (0x100)`,
+because a session that only writes to a file has nothing to join. And it will not
+stop what it did not start: [`EtwSession::shutdown`] leaves an attached session
+running, since killing it would blind every other consumer and end a session that
+is supposed to outlive the process.
+
+### What is unverified
+
+Attaching to a real-time session created by another process is the one part of
+this module that cannot be tested without elevation and a boot-time session. The
+FFI is the documented shape — `LoggerName` plus `PROCESS_TRACE_MODE_REAL_TIME` —
+and the failure paths are explicit rather than silent, but "another consumer can
+attach to a boot session while it runs" is a claim from documentation, not from
+this machine. It is reported as `EtwError::NoSuchSession` or `NotRealTime` if it
+does not hold, and neither of those is a hang.
+
+### It is a speed bump, not a wall
+
+An autologger is started by the kernel but *configured* by a registry key. An
+administrator can stop the session (`logman stop -ets`) or edit the key and
+reboot. What it buys is that doing so has to be deliberate, privileged and
+recorded — which is why `problems()` exists: a host can be asked whether its own
+telemetry is still configured the way it was, and the answer is worth alerting on.
 
 ## Reading a manifest
 
@@ -248,11 +357,17 @@ one line per provider and only fails if *no* provider could be enabled.
   real ceiling on burst absorption (`capacity` in `SessionConfig` — a depth of
   65,536 events by default).
 
-`Translator` keeps its own pair: `mapped` and `undecodable`. A non-zero
-`undecodable` means a property name in `translate.rs` is wrong for this build of
-Windows — **not** that the machine was quiet — and the first eight failures are
-retained with their reason so the report can say which field went missing. A
-silent hole is the failure mode this exists to prevent.
+`Translator` keeps a per-shape pair: `ShapeCounts` holds `attempted` and `mapped`
+arrays indexed by `Shape`, so the report can say *which* shape went quiet rather
+than only that something did. One number cannot tell "the host is idle" from
+"PowerShell logging is off and only PowerShell events are missing". A shape with
+`attempted == 0` is absent, not healthy, and the array makes the difference
+visible.
+
+A non-zero `undecodable` means a property name in `translate.rs` is wrong for
+this build of Windows — **not** that the machine was quiet — and the first eight
+failures are retained with their reason so the report can say which field went
+missing. A silent hole is the failure mode this exists to prevent.
 
 ## Running it
 
@@ -278,10 +393,12 @@ cargo test -p etw
 ```
 
 Note what the unit tests can and cannot cover. They pin GUIDs, keyword masks,
-event names, `FILETIME` conversion, property lookup chains and the error hints —
-all against literals. They **cannot** tell you that a field name matches your
-machine's manifest, because that is a property of the machine.
+event names, `FILETIME` conversion, property lookup chains, the declared-type
+classification and the error hints — all against literals. They **cannot** tell
+you that a field name matches your machine's manifest, because that is a
+property of the machine.
 
 That gap is why the report prints `undecodable` and the retained reasons instead
-of a bare count. If you are adding a shape to `translate.rs`, read the template
-off a real host first.
+of a bare count, and why `ShapeCounts` carries the shape an event belonged to.
+If you are adding a shape to `translate.rs`, read the template off a real host
+first.
