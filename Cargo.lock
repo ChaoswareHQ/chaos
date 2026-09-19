@@ -531,6 +531,10 @@ dependencies = [
 [[package]]
 name = "observer"
 version = "0.1.0"
+dependencies = [
+ "model",
+ "ports",
+]
 
 [[package]]
 name = "once_cell"

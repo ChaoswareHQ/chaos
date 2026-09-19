@@ -1,5 +1,6 @@
 [package]
 name = "observer"
+description = "The observation runtime: drives a source, a scorer and a sink as one loop."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,3 +9,5 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+model.workspace = true
+ports.workspace = true

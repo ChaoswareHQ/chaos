@@ -50,9 +50,9 @@ pub use error::{EtwError, hint, remedy};
 pub use paths::DevicePaths;
 pub use provider::{DNS_CLIENT, KERNEL_FILE, KERNEL_NETWORK, KERNEL_PROCESS, KERNEL_REGISTRY};
 pub use security::{
-    ExportIntegrity, JumpScan, KernelIntegrityStatus, SecurityReport, SessionHealth,
-    TextIntegrity, check_ntdll_exports, find_patch_in, full_report, query_kernel_integrity,
-    scan_for_jumps, session_health, verify_text_section,
+    ExportIntegrity, JumpScan, KernelIntegrityStatus, SecurityReport, SessionHealth, TextIntegrity,
+    check_ntdll_exports, find_patch_in, full_report, query_kernel_integrity, scan_for_jumps,
+    session_health, verify_text_section,
 };
 pub use session::{
     Buffers, EnableReport, EtwSession, ProviderSpec, SessionConfig, SessionState, is_running,
@@ -60,5 +60,6 @@ pub use session::{
 };
 pub use stats::{Stats, StatsSnapshot};
 pub use translate::{
-    GapSeverity, Shape, ShapeCounts, TelemetryGap, Translator, render_registry_value,
+    GapSeverity, KcbStats, KeyCache, Shape, ShapeCounts, TelemetryGap, Translator,
+    UnrecognisedHistogram, render_registry_value,
 };

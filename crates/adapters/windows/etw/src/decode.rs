@@ -183,7 +183,7 @@ struct SchemaKey {
 }
 
 /// A template's property names and their declared types, as TDH reported them.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Schema {
     /// Property name to `InType` as TDH spelled it. Kept as a `BTreeMap` for
     /// determinism across runs, which matters when a failure message is the
@@ -204,7 +204,7 @@ struct Schema {
 ///
 /// `Decoder` is not `Sync`: it is meant to live on the single thread that
 /// consumes a session.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Decoder {
     scratch: Vec<u8>,
     name: Vec<u16>,
@@ -406,12 +406,39 @@ impl Decoder {
     /// `ProcessId` versus `NewProcessId` are all real), and a lookup chain costs
     /// a few failed `TdhGetPropertySize` calls only on the first event of a
     /// schema.
+    ///
+    /// Note that this returns the first *resolving* name, even if it resolves
+    /// to an empty string. A field declared by the manifest but not populated
+    /// on this event is `Some("")`, not `None`, and a chain that stops there
+    /// would hide the next name. Use [`Self::text_first_nonempty`] when an
+    /// empty value should fall through to the next candidate.
     pub fn text_any(&mut self, raw: &EtwRaw, names: &[&str]) -> Option<String> {
         names.iter().find_map(|n| self.text(raw, n))
     }
 
+    /// Like [`Self::text_any`], but skips a name that resolves to an empty
+    /// string.
+    ///
+    /// A field that is *declared* by the manifest but *not populated* in this
+    /// event returns an empty string, not `None`. That is a real outcome — the
+    /// registry provider's `KeyName` behaves this way on `SetValueKey` events,
+    /// where the kernel only has a pointer and not a path — and treating it as
+    /// "resolved" hides the next name in the chain.
+    /// `text_first_nonempty` continues to the next name when one resolves to
+    /// nothing.
+    pub fn text_first_nonempty(&mut self, raw: &EtwRaw, names: &[&str]) -> Option<String> {
+        names
+            .iter()
+            .filter_map(|n| self.text(raw, n))
+            .find(|s| !s.is_empty())
+    }
+
     pub fn u32_any(&mut self, raw: &EtwRaw, names: &[&str]) -> Option<u32> {
         names.iter().find_map(|n| self.u32(raw, n))
+    }
+
+    pub fn u64_any(&mut self, raw: &EtwRaw, names: &[&str]) -> Option<u64> {
+        names.iter().find_map(|n| self.u64(raw, n))
     }
 }
 
@@ -739,6 +766,7 @@ mod tests {
             activity_id: [0; 16],
             related_activity_id: None,
             process_start_key: Some(1),
+            is_wow64: false,
         }
     }
 
@@ -852,8 +880,11 @@ mod tests {
         // so the chain must degrade to None instead of looping or panicking.
         let empty = raw("p", 1, Vec::new());
         assert_eq!(d.text_any(&empty, &["A", "B", "C"]), None);
+        assert_eq!(d.text_first_nonempty(&empty, &["A", "B", "C"]), None);
         assert_eq!(d.u32_any(&empty, &["A", "B"]), None);
+        assert_eq!(d.u64_any(&empty, &["A", "B"]), None);
         assert_eq!(d.text_any(&empty, &[]), None);
+        assert_eq!(d.text_first_nonempty(&empty, &[]), None);
     }
 
     #[test]
