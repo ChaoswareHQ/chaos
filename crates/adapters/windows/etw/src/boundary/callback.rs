@@ -1,70 +1,45 @@
 //! The ETW callback: the hottest code in the product.
 //!
-//! Everything here runs on the consumer thread, once per event, with the whole
-//! session waiting on it. Two rules follow, and both are load-bearing:
+//! # The two rules
 //!
-//! * **Never block.** A callback that waits on a full channel stalls
-//!   `ProcessTrace`, and the kernel responds by dropping events in bulk. Losing
-//!   one event to `try_send` is strictly cheaper than losing the buffer.
-//! * **Never panic.** Unwinding out of an `extern "system"` frame aborts the
-//!   process. Every operation below is total: checked lengths, saturating
-//!   arithmetic, no indexing that can go out of range.
+//! 1. **Never block.** A callback that waits on a full channel stalls
+//!    `ProcessTrace`, and the kernel responds by dropping events in bulk.
+//!    Losing one event to `try_send` is strictly cheaper than losing a
+//!    buffer.
+//! 2. **Never panic.** Unwinding out of an `extern "system"` frame aborts
+//!    the process. Every operation below is total: checked lengths,
+//!    saturating arithmetic, no indexing that can go out of range.
 //!
-//! The callback does exactly one piece of real work: copy `UserData`. That
-//! pointer is only valid for the duration of the call, and the *copy* is what
-//! makes deferred decoding possible at all — TDH can rebuild a synthetic
-//! `EVENT_RECORD` over our own buffer later, but it can never survive the
-//! kernel recycling the original.
+//! # The recipe
 //!
-//! # Legacy formats the callback filters before the decoder sees them
+//! 1. Validate the record and its context (one `unsafe` helper).
+//! 2. Reject the three formats TDH cannot decode.
+//! 3. Reject events above the level ceiling.
+//! 4. Copy `UserData` — the only allocation this function makes.
+//! 5. Read the two extended items worth the walk.
+//! 6. `try_send`, counting a drop if the channel is full.
 //!
-//! Three event-header flags mark formats that TDH cannot decode:
-//!
-//! * `EVENT_HEADER_FLAG_CLASSIC_HEADER` (`0x0001`) — a pre-manifest event whose
-//!   descriptor is a legacy `EVENT_CLASSIC_HEADER` rather than an
-//!   `EVENT_DESCRIPTOR`. Counted as `classic`.
-//! * `EVENT_HEADER_FLAG_STRING_ONLY` (`0x0004`) — the event data is a bare
-//!   null-terminated Unicode string with no properties. TDH has no field names
-//!   to resolve, so an event like this counted as `undecodable` would be a
-//!   false positive in the failure counter. Counted as `string_only`.
-//! * `EVENT_HEADER_FLAG_TRACE_MESSAGE` (`0x0008`) — the provider used the WPP
-//!   trace-message function rather than a manifest. Also no named properties.
-//!   Counted as `trace_message`.
-//!
-//! Before this filter, the two legacy formats silently inflated `undecodable`
-//! on any host that still runs WPP providers — which is most of them.
+//! Everything unsafe is in [`prepare`] and [`extended_data`]. The body of
+//! the callback itself is safe code operating on references those two
+//! helpers produced.
 
-use crate::stats::Stats;
+use crate::boundary::constants::*;
+use crate::boundary::stats::Stats;
 use crossbeam_channel::Sender;
 use model::{EventSource, ProviderId, RawEvent};
 use std::slice;
 use windows::Win32::System::Diagnostics::Etw::{
     EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
-    EVENT_HEADER_FLAG_CLASSIC_HEADER, EVENT_HEADER_FLAG_STRING_ONLY,
-    EVENT_HEADER_FLAG_TRACE_MESSAGE, EVENT_RECORD,
+    EVENT_RECORD,
 };
 use windows::core::GUID;
 
-/// `EVENT_HEADER_FLAG_STRING_ONLY` from `evntcons.h`.
+/// An ETW event, paired with the routing detail the wire format does not
+/// carry.
 ///
-/// The windows-rs binding declares these flags as `u32` while the header
-/// field is `u16`. The alias is `u32` and the header field is widened at
-/// the read site, so the two sides of the comparison are the same width
-/// without a second cast.
-const FLAG_STRING_ONLY: u32 = EVENT_HEADER_FLAG_STRING_ONLY;
-
-/// `EVENT_HEADER_FLAG_TRACE_MESSAGE` from `evntcons.h`.
-const FLAG_TRACE_MESSAGE: u32 = EVENT_HEADER_FLAG_TRACE_MESSAGE;
-
-/// `EVENT_HEADER_FLAG_32_BIT_HEADER` from `evntcons.h`.
-///
-/// Not exposed as a named constant in this version of windows-rs. The value
-/// is stable: the event was logged by a 32-bit process (including a WOW64
-/// process on a 64-bit host).
-const FLAG_32_BIT_HEADER: u32 = 0x0020;
-
-/// An ETW event, paired with the routing detail the wire format deliberately
-/// does not carry.
+/// `wire` is the part that ships. Everything else is decode-time context:
+/// the GUID that TDH keys schemas on, the descriptor fields that select
+/// one, the two extended items, and the WOW64 flag.
 #[derive(Debug, Clone)]
 pub struct EtwRaw {
     pub wire: RawEvent,
@@ -72,17 +47,19 @@ pub struct EtwRaw {
     pub version: u8,
     pub opcode: u8,
     pub keyword: u64,
-    /// ETW's own correlation identifier. The kernel already computed a causal
-    /// graph here; A4 gets to start from it rather than reconstructing one.
+    /// ETW's own correlation identifier. The kernel already computed a
+    /// causal graph here; downstream analysis starts from it rather than
+    /// reconstructing one.
     pub activity_id: [u8; 16],
     pub related_activity_id: Option<[u8; 16]>,
     /// A kernel-generated process identity that survives PID reuse.
     pub process_start_key: Option<u64>,
-    /// Whether the provider was 32-bit or a WOW64 process.
+    /// Whether the provider was a 32-bit image (including WOW64).
     ///
-    /// From `EVENT_HEADER_FLAG_32_BIT_HEADER`. The header's ProcessId is
-    /// always a 32-bit PID; this flag is what distinguishes a native 64-bit
-    /// process from a WOW64 one that happens to share the PID space.
+    /// From `EVENT_HEADER_FLAG_32_BIT_HEADER`. The header's `ProcessId` is
+    /// always a 32-bit PID; this flag is what distinguishes a native
+    /// 64-bit process from a WOW64 one that happens to share the PID
+    /// space.
     pub is_wow64: bool,
 }
 
@@ -104,78 +81,79 @@ pub struct ProcessIdentity {
 }
 
 /// Shared state the callback reaches through `EVENT_RECORD::UserContext`.
+///
+/// Installed by [`crate::boundary::session::EtwSession::consume`], which
+/// holds the `Arc` for the session's lifetime. The callback borrows it,
+/// never owns it.
 pub(crate) struct CallbackContext {
     pub(crate) tx: Sender<EtwRaw>,
     pub(crate) stats: Stats,
+    /// `(GUID, name)` for every enabled provider. A linear scan is fine:
+    /// the list is under a dozen entries and this is the hot path.
     pub(crate) providers: Vec<(GUID, ProviderId)>,
+    /// Events above this level are counted and discarded.
     pub(crate) max_level: u8,
 }
 
-/// The callback itself.
+/// The callback.
 ///
 /// # Safety
-/// Called by ETW with a valid `EVENT_RECORD` whose `UserContext` is the
-/// `Arc<CallbackContext>` kept alive by `EtwSession`.
+///
+/// ETW calls this with a valid `EVENT_RECORD` whose `UserContext` is the
+/// `Arc<CallbackContext>` kept alive by
+/// [`crate::boundary::session::EtwSession`].
 pub(crate) unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
-    if record.is_null() {
-        return;
-    }
-    let ctx = unsafe { (*record).UserContext as *const CallbackContext };
-    if ctx.is_null() {
-        return;
-    }
-    let (rec, ctx) = (unsafe { &*record }, unsafe { &*ctx });
-    let header = &rec.EventHeader;
+    // All unsafe is in `prepare`; from here on this is safe code.
+    let (rec, ctx) = match unsafe { prepare(record) } {
+        Some(pair) => pair,
+        None => return,
+    };
 
-    // The SDK declares the flag constants as `u32` while the header field is
-    // `u16`. Widening once here means every subsequent comparison is against
-    // `u32` and the width mismatch lives in exactly one place.
+    let header = &rec.EventHeader;
+    let descriptor = &header.EventDescriptor;
     let flags = u32::from(header.Flags);
 
-    // Classic header: pre-manifest, cannot be decoded.
-    if flags & EVENT_HEADER_FLAG_CLASSIC_HEADER != 0 {
+    // Reject formats TDH cannot decode. Counted, not dropped silently.
+    if flags & FLAG_CLASSIC != 0 {
         ctx.stats.classic();
         return;
     }
-
-    // String-only: bare Unicode string, no properties. Previously fell
-    // through to the decoder and inflated `undecodable`.
     if flags & FLAG_STRING_ONLY != 0 {
         ctx.stats.string_only();
         return;
     }
-
-    // Trace message: WPP output, no properties. Same as above.
     if flags & FLAG_TRACE_MESSAGE != 0 {
         ctx.stats.trace_message();
         return;
     }
 
-    let descriptor = &header.EventDescriptor;
+    // Level filter, before any allocation.
     if descriptor.Level > ctx.max_level {
         ctx.stats.filtered();
         return;
     }
 
-    let provider = match ctx
+    // Provider name: from the enabled list, or the GUID's canonical
+    // spelling if the event came from a provider we did not enable.
+    let provider = ctx
         .providers
         .iter()
         .find(|(guid, _)| *guid == header.ProviderId)
-    {
-        Some((_, name)) => name.clone(),
-        None => ProviderId::new(crate::autologger::format_guid(&header.ProviderId)),
-    };
+        .map(|(_, name)| name.clone())
+        .unwrap_or_else(|| ProviderId::new(crate::util::format_guid(&header.ProviderId)));
 
+    // The one allocation in the callback. `UserData` is valid only for the
+    // duration of this call, so it must be copied before we return.
     let len = (rec.UserDataLength as usize).min(model::MAX_PAYLOAD_SIZE);
     let data = if len == 0 || rec.UserData.is_null() {
         Vec::new()
     } else {
+        // SAFETY: `UserData` points at `UserDataLength` bytes valid for
+        // the duration of this call. The `min` above bounds it.
         unsafe { slice::from_raw_parts(rec.UserData as *const u8, len) }.to_vec()
     };
 
     let (related_activity_id, process_start_key) = unsafe { extended_data(rec) };
-
-    let is_wow64 = flags & FLAG_32_BIT_HEADER != 0;
 
     let raw = EtwRaw {
         wire: RawEvent {
@@ -195,7 +173,7 @@ pub(crate) unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         activity_id: guid_bytes(&header.ActivityId),
         related_activity_id,
         process_start_key,
-        is_wow64,
+        is_wow64: flags & FLAG_32_BIT_HEADER != 0,
     };
 
     ctx.stats.received(raw.wire.data.len());
@@ -205,18 +183,50 @@ pub(crate) unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     }
 }
 
+/// Validate the record and its context, then hand back references with a
+/// `'static` lifetime bounded by this scope.
+///
+/// # Safety
+///
+/// `record` must either be null or point at a valid `EVENT_RECORD` whose
+/// `UserContext` is a `*const CallbackContext` kept alive for the duration
+/// of the call.
+unsafe fn prepare(
+    record: *mut EVENT_RECORD,
+) -> Option<(&'static EVENT_RECORD, &'static CallbackContext)> {
+    if record.is_null() {
+        return None;
+    }
+    let rec = unsafe { &*record };
+    let ctx_ptr = rec.UserContext as *const CallbackContext;
+    if ctx_ptr.is_null() {
+        return None;
+    }
+    let ctx = unsafe { &*ctx_ptr };
+    // SAFETY: both references outlive this call. `rec` is stack-local to
+    // the caller; `ctx` is installed by `EtwSession` and outlives the
+    // session. The `transmute` is how we tell the borrow checker that,
+    // without lying about either pointer's real lifetime.
+    Some((
+        unsafe { std::mem::transmute(rec) },
+        unsafe { std::mem::transmute(ctx) },
+    ))
+}
+
 /// Pull the two extended items worth the walk: the causal parent, and the
 /// process start key.
+///
+/// # Safety
+///
+/// `rec.ExtendedData` must be either null or point at `ExtendedDataCount`
+/// valid `EVENT_HEADER_EXTENDED_DATA_ITEM`s.
 unsafe fn extended_data(rec: &EVENT_RECORD) -> (Option<[u8; 16]>, Option<u64>) {
+    if rec.ExtendedData.is_null() || rec.ExtendedDataCount == 0 {
+        return (None, None);
+    }
+    let items = unsafe { slice::from_raw_parts(rec.ExtendedData, rec.ExtendedDataCount as usize) };
     let mut related = None;
     let mut start_key = None;
-
-    if rec.ExtendedData.is_null() || rec.ExtendedDataCount == 0 {
-        return (related, start_key);
-    }
-
-    let items = unsafe { slice::from_raw_parts(rec.ExtendedData, rec.ExtendedDataCount as usize) };
-
     for item in items {
         if item.DataPtr == 0 {
             continue;
@@ -224,6 +234,8 @@ unsafe fn extended_data(rec: &EVENT_RECORD) -> (Option<[u8; 16]>, Option<u64>) {
         match u32::from(item.ExtType) {
             EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID if item.DataSize >= 16 => {
                 let mut buf = [0u8; 16];
+                // SAFETY: `DataPtr` is non-null and `DataSize` is at least
+                // 16, so the range is valid.
                 unsafe {
                     std::ptr::copy_nonoverlapping(item.DataPtr as *const u8, buf.as_mut_ptr(), 16)
                 };
@@ -231,6 +243,7 @@ unsafe fn extended_data(rec: &EVENT_RECORD) -> (Option<[u8; 16]>, Option<u64>) {
             }
             EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY if item.DataSize >= 8 => {
                 let mut buf = [0u8; 8];
+                // SAFETY: same as above.
                 unsafe {
                     std::ptr::copy_nonoverlapping(item.DataPtr as *const u8, buf.as_mut_ptr(), 8)
                 };
@@ -239,11 +252,14 @@ unsafe fn extended_data(rec: &EVENT_RECORD) -> (Option<[u8; 16]>, Option<u64>) {
             _ => {}
         }
     }
-
     (related, start_key)
 }
 
-/// GUID as raw bytes, for the causal identifiers we keep opaquely.
+/// GUID as raw bytes, in the canonical Windows layout.
+///
+/// `data1`, `data2`, and `data3` are little-endian integers; `data4` is
+/// big-endian bytes as stored. This is what the causal identifiers use to
+/// stay opaque but stable.
 fn guid_bytes(guid: &GUID) -> [u8; 16] {
     let mut out = [0u8; 16];
     out[0..4].copy_from_slice(&guid.data1.to_le_bytes());
@@ -256,7 +272,6 @@ fn guid_bytes(guid: &GUID) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::core::GUID;
 
     #[test]
     fn guid_bytes_use_the_canonical_windows_layout() {
@@ -275,6 +290,7 @@ mod tests {
                 0xee, 0xff
             ]
         );
+        // The byte order is not the same as a big-endian u128.
         assert_ne!(
             u128::from_le_bytes(b),
             0x0011_2233_4455_6677_8899_aabb_ccdd_eeff
@@ -322,5 +338,11 @@ mod tests {
         };
         assert_eq!(id.pid, 7);
         assert!(id.start_key.is_none());
+    }
+
+    #[test]
+    fn prepare_rejects_null_records() {
+        let result = unsafe { prepare(std::ptr::null_mut()) };
+        assert!(result.is_none());
     }
 }

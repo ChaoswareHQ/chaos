@@ -3,27 +3,58 @@
 //! `attempted` counts events whose shape the translator recognised;
 //! `mapped` counts those that produced a wire event. The difference is
 //! `undecodable`, and `unrecognised` covers events whose `(provider, id)`
-//! was not in `shape_of` at all. The three together close the accounting:
-//! `delivered == mapped + undecodable + unrecognised`.
+//! was not in [`super::shape_of`] at all. The three together close the
+//! accounting: `delivered == mapped + undecodable + unrecognised`.
+//!
+//! The per-shape arrays are sized by `Shape::ALL.len()` rather than a
+//! literal, so adding a shape in `shape.rs` cannot leave these arrays the
+//! wrong size. That was the point of the macro.
 
 use super::shape::Shape;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShapeCounts {
-    attempted: [u64; 6],
-    mapped: [u64; 6],
-    ever_fired: [bool; 6],
+    attempted: [u64; Shape::ALL.len()],
+    mapped: [u64; Shape::ALL.len()],
+    ever_fired: [bool; Shape::ALL.len()],
     unrecognised: u64,
 }
 
+impl Default for ShapeCounts {
+    fn default() -> Self {
+        Self {
+            attempted: [0; Shape::ALL.len()],
+            mapped: [0; Shape::ALL.len()],
+            ever_fired: [false; Shape::ALL.len()],
+            unrecognised: 0,
+        }
+    }
+}
+
 impl ShapeCounts {
+    /// The index of `shape` in the per-shape arrays.
+    ///
+    /// This is its position in [`Shape::ALL`], which the macro guarantees
+    /// equals the enum discriminant. Computed rather than cast so that
+    /// reordering `ALL` without reordering the enum fails loudly here.
+    #[inline]
+    fn index(shape: Shape) -> usize {
+        // `position` on a six-element slice is a linear scan of at most
+        // six comparisons, cheaper than the atomic increments around it.
+        Shape::ALL
+            .iter()
+            .position(|s| *s == shape)
+            .expect("every Shape variant is in Shape::ALL")
+    }
+
     pub(crate) fn note_attempt(&mut self, shape: Shape) {
-        self.attempted[shape as usize] += 1;
-        self.ever_fired[shape as usize] = true;
+        let i = Self::index(shape);
+        self.attempted[i] += 1;
+        self.ever_fired[i] = true;
     }
 
     pub(crate) fn note_mapped(&mut self, shape: Shape) {
-        self.mapped[shape as usize] += 1;
+        self.mapped[Self::index(shape)] += 1;
     }
 
     pub(crate) fn note_unrecognised(&mut self) {
@@ -31,11 +62,11 @@ impl ShapeCounts {
     }
 
     pub fn attempted(&self, shape: Shape) -> u64 {
-        self.attempted[shape as usize]
+        self.attempted[Self::index(shape)]
     }
 
     pub fn mapped(&self, shape: Shape) -> u64 {
-        self.mapped[shape as usize]
+        self.mapped[Self::index(shape)]
     }
 
     pub fn undecodable(&self, shape: Shape) -> u64 {
@@ -43,7 +74,7 @@ impl ShapeCounts {
     }
 
     pub fn ever_fired(&self, shape: Shape) -> bool {
-        self.ever_fired[shape as usize]
+        self.ever_fired[Self::index(shape)]
     }
 
     pub fn unrecognised(&self) -> u64 {
@@ -82,6 +113,11 @@ impl ShapeCounts {
     }
 }
 
+/// How serious a gap is.
+///
+/// Order matters: [`GapSeverity::Silent`] sorts above
+/// [`GapSeverity::DecodeFailure`] so the gap list puts the suspicious
+/// findings first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GapSeverity {
     Healthy,
@@ -89,6 +125,7 @@ pub enum GapSeverity {
     Silent,
 }
 
+/// A shape that should be producing events and is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryGap {
     pub shape: Shape,
@@ -148,5 +185,63 @@ mod tests {
         c.note_attempt(Shape::DnsQuery);
         assert!(!c.kernel_side_active());
         assert!(c.user_mode_active());
+    }
+
+    #[test]
+    fn ever_fired_tracks_attempts_not_mappings() {
+        let mut c = ShapeCounts::default();
+        assert!(!c.ever_fired(Shape::RegistrySet));
+        c.note_attempt(Shape::RegistrySet);
+        assert!(c.ever_fired(Shape::RegistrySet));
+        // Still true even though nothing mapped.
+        assert_eq!(c.mapped(Shape::RegistrySet), 0);
+    }
+
+    #[test]
+    fn the_arrays_are_sized_for_every_shape() {
+        let c = ShapeCounts::default();
+        assert_eq!(Shape::ALL.len(), 6);
+        // Every shape must be indexable without panicking.
+        for shape in Shape::ALL {
+            assert_eq!(c.attempted(*shape), 0);
+            assert_eq!(c.mapped(*shape), 0);
+            assert!(!c.ever_fired(*shape));
+        }
+    }
+
+    #[test]
+    fn by_shape_iterates_in_declaration_order() {
+        let c = ShapeCounts::default();
+        let seen: Vec<Shape> = c.by_shape().map(|(s, _, _)| s).collect();
+        assert_eq!(seen, Shape::ALL.to_vec());
+    }
+
+    #[test]
+    fn gap_severity_orders_silent_above_decode_failure() {
+        assert!(GapSeverity::Silent > GapSeverity::DecodeFailure);
+        assert!(GapSeverity::DecodeFailure > GapSeverity::Healthy);
+    }
+
+    #[test]
+    fn a_gap_describes_itself() {
+        let silent = TelemetryGap {
+            shape: Shape::ScriptBlock,
+            attempted: 0,
+            mapped: 0,
+            severity: GapSeverity::Silent,
+        };
+        let text = silent.describe();
+        assert!(text.contains("script_block"));
+        assert!(text.contains("silent"));
+
+        let decode = TelemetryGap {
+            shape: Shape::RegistrySet,
+            attempted: 10,
+            mapped: 3,
+            severity: GapSeverity::DecodeFailure,
+        };
+        let text = decode.describe();
+        assert!(text.contains("registry_set"));
+        assert!(text.contains("7 of 10"));
     }
 }

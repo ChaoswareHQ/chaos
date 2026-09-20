@@ -6,7 +6,7 @@
 //! same amount of *useful* signal. The process and image keywords are what a
 //! security pipeline actually consumes; the thread keywords are mostly volume.
 
-use crate::session::ProviderSpec;
+use crate::boundary::session::ProviderSpec;
 use windows::core::GUID;
 
 pub const KERNEL_PROCESS: GUID = GUID::from_u128(0x22FB2CD6_0E7B_422B_A0C7_2FAD1FD0E716);

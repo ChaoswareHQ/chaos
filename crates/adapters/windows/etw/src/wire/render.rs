@@ -1,16 +1,27 @@
-//! Value rendering: FILETIME, registry types, DNS mnemonics, script capping.
+//! Value rendering: FILETIME, registry types, DNS mnemonics, script
+//! capping.
 //!
 //! Everything here is pure — no TDH, no decoder state — so the code that
-//! formats a value is separable from the code that fetches it. That matters
-//! when a value renders wrong and the bug is either in TDH or in the
-//! formatter; this file is the second one.
+//! formats a value is separable from the code that fetches it. That
+//! matters when a value renders wrong and the bug is either in TDH or in
+//! the formatter; this file is the second one.
 
 use chrono::{DateTime, Utc};
 
-/// ETW's `TimeStamp` is a FILETIME: 100-nanosecond intervals since 1601-01-01.
+/// ETW's `TimeStamp` is a FILETIME: 100-nanosecond intervals since
+/// 1601-01-01.
+///
+/// The delta is the number of such intervals between 1601-01-01 and
+/// 1970-01-01, which is what makes the subtraction land in Unix time.
 const FILETIME_EPOCH_DELTA: i64 = 116_444_736_000_000_000;
 const FILETIME_TICKS_PER_SEC: i64 = 10_000_000;
 
+/// Convert an ETW timestamp to UTC.
+///
+/// Returns `None` for a value at or before the FILETIME epoch — a
+/// malformed event, or a zero that means "unset" in some providers. The
+/// caller treats `None` as a reason to skip the event rather than invent
+/// a timestamp.
 pub fn from_filetime(filetime: i64) -> Option<DateTime<Utc>> {
     let since_epoch = filetime.checked_sub(FILETIME_EPOCH_DELTA)?;
     if since_epoch < 0 {
@@ -23,8 +34,17 @@ pub fn from_filetime(filetime: i64) -> Option<DateTime<Utc>> {
 }
 
 /// How much script text we will ship, in bytes.
+///
+/// A very long block is truncated. The cap is a property of what we ship,
+/// not of what the host ran.
 pub const MAX_SCRIPT_TEXT: usize = 8 * 1024;
 
+/// Truncate script text to [`MAX_SCRIPT_TEXT`], respecting character
+/// boundaries.
+///
+/// A naive `&text[..MAX_SCRIPT_TEXT]` panics on a multi-byte UTF-8
+/// character that straddles the boundary. Walking back to the nearest
+/// boundary costs at most three bytes of scanning.
 pub fn cap_script_text(text: &str) -> &str {
     if text.len() <= MAX_SCRIPT_TEXT {
         return text;
@@ -36,6 +56,12 @@ pub fn cap_script_text(text: &str) -> &str {
     &text[..end]
 }
 
+/// Render a DNS query type as its mnemonic, or its number when unknown.
+///
+/// The manifest declares this as a `UInt32`. The mapping is from the IANA
+/// DNS parameter registry; anything not in the table becomes its decimal
+/// string, which is more useful than "UNKNOWN" because the number is at
+/// least a fact.
 pub fn query_type_name(value: u32) -> String {
     let known = match value {
         1 => "A",
@@ -55,6 +81,11 @@ pub fn query_type_name(value: u32) -> String {
     known.to_string()
 }
 
+/// Windows registry value types.
+///
+/// A subset: only the ones a registry value can carry that matter for
+/// decoding. Anything outside this set renders as hex, which is the
+/// honest answer for a type we do not understand.
 pub mod reg_type {
     pub const SZ: u32 = 1;
     pub const EXPAND_SZ: u32 = 2;
@@ -66,6 +97,12 @@ pub mod reg_type {
 }
 
 /// Render a registry value according to its declared `REG_*` type.
+///
+/// The `CapturedData` field is declared `Binary`, and what it *contains*
+/// depends on the registry value's `Type` field. A `REG_SZ` is UTF-16, a
+/// `REG_DWORD` is four little-endian bytes, and a `REG_BINARY` is what it
+/// is. This is the function that turns the raw bytes into what the rule
+/// author expects to read.
 pub fn render_registry_value(reg_type: u32, bytes: &[u8]) -> String {
     use crate::decode::utf16_to_string;
     match reg_type {
@@ -87,6 +124,9 @@ pub fn render_registry_value(reg_type: u32, bytes: &[u8]) -> String {
     }
 }
 
+/// Lowercase hex. Shared with the decode module's value renderer via the
+/// `pub(crate)` visibility, but kept here as well so this module does not
+/// depend on `decode`'s internals.
 pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -122,14 +162,30 @@ mod tests {
     }
 
     #[test]
+    fn an_extreme_filetime_does_not_overflow() {
+        assert_eq!(from_filetime(i64::MAX), None);
+        assert_eq!(from_filetime(i64::MIN), None);
+    }
+
+    #[test]
     fn script_cap_respects_char_boundaries() {
         let long = "e".repeat(MAX_SCRIPT_TEXT * 2);
         assert_eq!(cap_script_text(&long).len(), MAX_SCRIPT_TEXT);
 
+        // A multi-byte character straddling the boundary: the cap must
+        // walk back to the nearest valid boundary.
         let mut text = "a".repeat(MAX_SCRIPT_TEXT - 1);
-        text.push('\u{20ac}');
+        text.push('\u{20ac}'); // 3 bytes
         text.push_str(&"b".repeat(100));
-        assert_eq!(cap_script_text(&text).len(), MAX_SCRIPT_TEXT - 1);
+        let capped = cap_script_text(&text);
+        assert_eq!(capped.len(), MAX_SCRIPT_TEXT - 1);
+        assert!(text.starts_with(capped));
+    }
+
+    #[test]
+    fn a_short_script_is_returned_unchanged() {
+        assert_eq!(cap_script_text("short"), "short");
+        assert_eq!(cap_script_text(""), "");
     }
 
     #[test]
@@ -140,7 +196,12 @@ mod tests {
             .flat_map(|u| u.to_le_bytes())
             .collect();
         assert_eq!(render_registry_value(reg_type::SZ, &sz), "C:\\x");
+        assert_eq!(render_registry_value(reg_type::EXPAND_SZ, &sz), "C:\\x");
         assert_eq!(render_registry_value(reg_type::DWORD, &[1, 0, 0, 0]), "1");
+        assert_eq!(
+            render_registry_value(reg_type::QWORD, &[1, 0, 0, 0, 0, 0, 0, 0]),
+            "1"
+        );
         assert_eq!(
             render_registry_value(reg_type::BINARY, &[1, 2, 3]),
             "010203"
@@ -149,9 +210,29 @@ mod tests {
     }
 
     #[test]
+    fn a_truncated_dword_renders_as_hex_rather_than_a_wrong_number() {
+        // Two bytes for a `REG_DWORD`: not enough to form the value, so
+        // the honest answer is the bytes, not a number made up from a
+        // partial read.
+        assert_eq!(
+            render_registry_value(reg_type::DWORD, &[0x01, 0x02]),
+            "0102"
+        );
+    }
+
+    #[test]
     fn unknown_dns_types_fall_back_to_numbers() {
         assert_eq!(query_type_name(1), "A");
         assert_eq!(query_type_name(28), "AAAA");
+        assert_eq!(query_type_name(65), "HTTPS");
         assert_eq!(query_type_name(99), "99");
+    }
+
+    #[test]
+    fn hex_is_lowercase_and_pairs_bytes() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00]), "00");
+        assert_eq!(hex(&[0xab]), "ab");
+        assert_eq!(hex(&[0xab, 0xcd, 0xef]), "abcdef");
     }
 }

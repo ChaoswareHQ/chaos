@@ -86,6 +86,8 @@ pub struct ProcessStart {
     pub image_hash: Option<Box<str>>,
     #[serde(default)]
     pub integrity_level: Option<IntegrityLevel>,
+    #[serde(default)]
+    pub is_wow64: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,6 +197,8 @@ pub struct ImageLoad {
     #[serde(default)]
     pub signer: Option<Box<str>>,
     pub loaded_at: DateTime<Utc>,
+    #[serde(default)]
+    pub is_wow64: bool,
 }
 
 /// A script block an interpreter was asked to run (`Microsoft-Windows-PowerShell`

@@ -1,21 +1,23 @@
 //! NT device path translation.
 //!
-//! The kernel reports paths as `\Device\HarddiskVolumeN\...` because that is
-//! what the kernel sees. Drive letters are a user-mode concept — the mount
-//! manager maintains the mapping, and the kernel's ETW providers do not
-//! consult it.
+//! The kernel reports paths as `\Device\HarddiskVolumeN\...` because that
+//! is what the kernel sees. Drive letters are a user-mode concept — the
+//! mount manager maintains the mapping, and the kernel's ETW providers do
+//! not consult it.
 //!
-//! Every tool that reads those events — Process Explorer, Sysmon, Defender —
-//! translates them to the DOS form (`C:\...`) before presenting them, because
-//! the DOS form is what a rule author writes. This module does that.
+//! Every tool that reads those events — Process Explorer, Sysmon,
+//! Defender — translates them to the DOS form (`C:\...`) before
+//! presenting them, because the DOS form is what a rule author writes.
+//! This module does that.
 //!
 //! # What it does not do
 //!
-//! The translation covers mounted volumes only. A path on a volume with no
-//! drive letter — a hidden recovery partition, a Windows Store app's package
-//! volume, a mounted VHD — is returned unchanged. That is the honest answer
-//! for a path the user's view of the filesystem does not include, and it
-//! keeps the caller from inventing a translation that would not resolve.
+//! The translation covers mounted volumes only. A path on a volume with
+//! no drive letter — a hidden recovery partition, a Windows Store app's
+//! package volume, a mounted VHD — is returned unchanged. That is the
+//! honest answer for a path the user's view of the filesystem does not
+//! include, and it keeps the caller from inventing a translation that
+//! would not resolve.
 //!
 //! # Two details that are load-bearing
 //!
@@ -23,13 +25,13 @@
 //! number of TCHARs written, and on this build that count includes the
 //! terminating NUL. Reading the whole reported length produces a device
 //! string ending in an invisible `\0`, which `strip_prefix` then fails to
-//! match against a path that has no NUL after the volume name. The string is
-//! therefore truncated at the first NUL, not at the reported length.
+//! match against a path that has no NUL after the volume name. The string
+//! is therefore truncated at the first NUL, not at the reported length.
 //!
 //! **The root has no trailing backslash.** The suffix that `strip_prefix`
-//! returns already begins with a `\`, so the replacement root must not end
-//! with one. If both have it, the result is `C:\\Windows\...` — a path no
-//! user-mode API will resolve.
+//! returns already begins with a `\`, so the replacement root must not
+//! end with one. If both have it, the result is `C:\\Windows\...` — a
+//! path no user-mode API will resolve.
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -39,9 +41,9 @@ use windows::core::PCWSTR;
 /// A mapping from NT device paths to DOS drive roots.
 #[derive(Debug)]
 pub struct DevicePaths {
-    /// Device path to DOS drive root, sorted longest-first so a longer prefix
-    /// wins over a shorter one. `\Device\HarddiskVolume10` must be checked
-    /// before `\Device\HarddiskVolume1`.
+    /// Device path to DOS drive root, sorted longest-first so a longer
+    /// prefix wins over a shorter one. `\Device\HarddiskVolume10` must be
+    /// checked before `\Device\HarddiskVolume1`.
     ///
     /// The root is stored **without** a trailing backslash.
     mappings: Vec<(String, String)>,
@@ -49,6 +51,11 @@ pub struct DevicePaths {
 
 impl DevicePaths {
     /// The process-wide mapping.
+    ///
+    /// Built once, on first call. The mount table does not change during
+    /// a process's lifetime often enough to warrant rebuilding it; a
+    /// volume mounted after this crate starts is a rare case, and
+    /// returning the unmapped path is the honest fallback.
     pub fn global() -> &'static DevicePaths {
         static INSTANCE: OnceLock<DevicePaths> = OnceLock::new();
         INSTANCE.get_or_init(DevicePaths::build)
@@ -81,9 +88,9 @@ impl DevicePaths {
             let drive = String::from_utf16_lossy(&buffer[start..end]);
             start = end + 1;
 
-            // `QueryDosDeviceW("C:")` returns `\Device\HarddiskVolume3` for
-            // the system volume, or the appropriate device for removable
-            // media, network shares, and so on.
+            // `QueryDosDeviceW("C:")` returns `\Device\HarddiskVolume3`
+            // for the system volume, or the appropriate device for
+            // removable media, network shares, and so on.
             let drive_query: Vec<u16> = drive
                 .trim_end_matches('\\')
                 .encode_utf16()
@@ -99,11 +106,11 @@ impl DevicePaths {
             }
 
             // The reported length can include the terminating NUL. The
-            // device string is what comes before it, so the units are read
-            // up to the first NUL rather than to `device_len`. A device
-            // string with a trailing `\0` would never match a path in
-            // `translate`, and the symptom is a silent failure to translate
-            // every image path.
+            // device string is what comes before it, so the units are
+            // read up to the first NUL rather than to `device_len`. A
+            // device string with a trailing `\0` would never match a path
+            // in `translate`, and the symptom is a silent failure to
+            // translate every image path.
             let units: Vec<u16> = device_buffer
                 .iter()
                 .take(device_len as usize)
@@ -122,7 +129,8 @@ impl DevicePaths {
         }
 
         // Longest device path first: `\Device\HarddiskVolume10` must win
-        // over `\Device\HarddiskVolume1` when both are prefixes of the path.
+        // over `\Device\HarddiskVolume1` when both are prefixes of the
+        // path.
         mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         Self { mappings }
@@ -140,11 +148,11 @@ impl DevicePaths {
 
     /// Print the current mappings.
     ///
-    /// Each line ends with `\` so a reader can see the exact boundary of the
-    /// stored root. A NUL in the device string does not render — this is why
-    /// the diagnostic prints the byte length alongside the text, so a
-    /// trailing NUL that survived the trim would be visible as a length one
-    /// greater than the number of characters shown.
+    /// Each line ends with `\` so a reader can see the exact boundary of
+    /// the stored root. A NUL in the device string does not render — this
+    /// is why the diagnostic prints the byte length alongside the text, so
+    /// a trailing NUL that survived the trim would be visible as a length
+    /// one greater than the number of characters shown.
     pub fn debug_print(&self) {
         if self.mappings.is_empty() {
             println!("  (no mappings — GetLogicalDriveStringsW or QueryDosDeviceW failed)");
@@ -226,10 +234,11 @@ mod tests {
 
     #[test]
     fn a_synthetic_mapping_translates_as_expected() {
-        // The property every caller depends on: a device string and a path
-        // that begins with it produce a DOS path with exactly one backslash
-        // between the root and the suffix. This test builds the mapping by
-        // hand so it does not depend on the host's drive configuration.
+        // The property every caller depends on: a device string and a
+        // path that begins with it produce a DOS path with exactly one
+        // backslash between the root and the suffix. This test builds the
+        // mapping by hand so it does not depend on the host's drive
+        // configuration.
         let paths = DevicePaths {
             mappings: vec![(
                 r"\Device\HarddiskVolume3".to_string(),
@@ -241,9 +250,12 @@ mod tests {
             paths.translate(r"\Device\HarddiskVolume3\Windows\System32\notepad.exe"),
             r"C:\Windows\System32\notepad.exe"
         );
-        assert_eq!(
-            paths.translate(r"\Device\HarddiskVolume3"),
-            r"C:"
-        );
+        assert_eq!(paths.translate(r"\Device\HarddiskVolume3"), r"C:");
+    }
+
+    #[test]
+    fn an_empty_path_is_returned_unchanged() {
+        let paths = DevicePaths::global();
+        assert_eq!(paths.translate(""), "");
     }
 }

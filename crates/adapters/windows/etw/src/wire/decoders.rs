@@ -1,34 +1,34 @@
 //! Per-shape decoders.
 //!
-//! Each returns `Result<EventKind, String>` where the `Err` string names the
-//! field that was missing or empty. Callers log it via
-//! `Translator::note_failure` and increment `undecodable`; the reason must be
-//! specific enough that an operator can act on it, which is why "no
-//! ImageName" is not "decode failed".
+//! Each returns `Result<EventKind, String>` where the `Err` string names
+//! the field that was missing or empty. Callers log it via
+//! [`super::Translator`]'s failure log and increment `undecodable`; the
+//! reason must be specific enough that an operator can act on it, which
+//! is why "no ImageName" is not "decode failed".
 //!
 //! # Two rules this module holds to
 //!
 //! * **Empty string is missing.** A field that resolves to `""` is treated
 //!   the same as a field that did not resolve. The registry-key bug that
-//!   produced `key=` in production was exactly this: TDH returned an empty
-//!   string and the old decoder accepted it as a value.
+//!   produced `key=` in production was exactly this: TDH returned an
+//!   empty string and the old decoder accepted it as a value.
 //! * **A shape is not `mapped` until its mandatory fields are present.**
-//!   `note_mapped` fires only after the decoder returns `Ok`. This is what
-//!   keeps `mapped` meaning "the event carries what a rule needs" rather
-//!   than "the shape function returned a value".
+//!   `note_mapped` fires only after the decoder returns `Ok`.
 //!
-//! # The registry special case
+//! # Two enrichments over the raw event
 //!
-//! `registry_set` is the one decoder that reads cross-event state: the
-//! [`super::kcb::KeyCache`] on the translator. The kernel hands the event a
-//! pointer, not a path, and the cache learns the mapping from the registry
-//! events that name it. See [`super::kcb`] for the full story.
+//! * `registry_set` reads the path from the KCB cache when the manifest's
+//!   `KeyName` is empty, then translates it to the documentation spelling
+//!   (`\REGISTRY\MACHINE\...` → `HKLM\...`).
+//! * `image_load` fills `image_hash`, `signed`, and `signer` from the
+//!   image-metadata cache, so a rule can match "loaded from an unusual
+//!   path AND not signed".
 
-use super::Translator;
 use super::shape::*;
-use crate::callback::EtwRaw;
+use super::Translator;
+use crate::boundary::callback::EtwRaw;
 use crate::decode::FieldValue;
-use crate::paths::DevicePaths;
+use crate::enrich::{image::ImageMeta, paths::DevicePaths, registry};
 use chrono::{DateTime, Utc};
 use model::{
     DnsQueryPayload, EventKind, ImageLoad, ProcessExit, ProcessId, ProcessStart, RegistrySet,
@@ -65,6 +65,7 @@ impl Translator {
             started_at: at,
             image_hash: None,
             integrity_level: None,
+            is_wow64: raw.is_wow64,
         }))
     }
 
@@ -74,9 +75,8 @@ impl Translator {
         at: DateTime<Utc>,
     ) -> Result<EventKind, String> {
         // The exit event's `ProcessID` is the process that exited; the
-        // header's `ProcessId` is the same value on this provider, but the
-        // field is what the manifest declares and reading it directly keeps
-        // the two paths honest.
+        // header's `ProcessId` is the same value on this provider, but
+        // reading the field directly keeps the two paths honest.
         let pid = self
             .decoder
             .u32_any(raw, PROCESS_ID)
@@ -106,13 +106,19 @@ impl Translator {
             .u32_any(raw, PROCESS_ID)
             .unwrap_or(raw.wire.pid);
 
+        // Metadata (hash + signature) is looked up per path, cached on
+        // (path, mtime, size). The cache is shared across workers so a
+        // module loaded twice in the same process is hashed once.
+        let meta: ImageMeta = self.image_meta.get(&image);
+
         Ok(EventKind::ImageLoad(ImageLoad {
             pid: ProcessId::new(pid),
             image_path: image.into(),
-            image_hash: None,
-            signed: None,
-            signer: None,
+            image_hash: meta.hash,
+            signed: meta.signed,
+            signer: meta.signer,
             loaded_at: at,
+            is_wow64: raw.is_wow64,
         }))
     }
 
@@ -123,20 +129,21 @@ impl Translator {
     ) -> Result<EventKind, String> {
         // Read the path, in one of two ways, in order of preference:
         //
-        // 1. `KeyName` (or an alternative spelling) is present and non-empty —
-        //    use it directly. This is what happens on a build where the kernel
-        //    does resolve the path before the event is emitted.
+        // 1. `KeyName` (or an alternative spelling) is present and
+        //    non-empty — use it directly. This is what happens on a build
+        //    where the kernel does resolve the path before the event is
+        //    emitted.
         //
-        // 2. `KeyName` is empty but the KCB cache knows the pointer. This is
-        //    what happens on every current build: `learn_kcb` has been filling
-        //    the cache from `OpenKey`, `CreateKey`, and the `KCBCreate` family,
-        //    and the `SetValueKey` event's `KeyObject` is looked up.
+        // 2. `KeyName` is empty but the KCB cache knows the pointer. This
+        //    is what happens on every current build: `learn_kcb` has been
+        //    filling the cache from `OpenKey`, `CreateKey`, and the
+        //    `KCBCreate` family, and the `SetValueKey` event's
+        //    `KeyObject` is looked up.
         //
-        // A miss from both is a real `SetValueKey` we cannot attribute. It
-        // goes to `undecodable` with a reason that names the pointer we could
-        // not resolve — the operator sees a specific fact, not a generic
+        // A miss from both goes to `undecodable` with a reason that names
+        // the pointer — the operator sees a specific fact, not a generic
         // failure.
-        let key_path = match self.decoder.text_first_nonempty(raw, KEY_NAME) {
+        let kernel_path = match self.decoder.text_first_nonempty(raw, KEY_NAME) {
             Some(path) => path,
             None => {
                 let key_object = self.decoder.u64_any(raw, KCB_KEY_OBJECT).unwrap_or(0);
@@ -158,6 +165,10 @@ impl Translator {
                 }
             }
         };
+
+        // Translate `\REGISTRY\MACHINE\...` to `HKLM\...` so a rule author
+        // never has to know the kernel's spelling.
+        let key_path = registry::translate(&kernel_path).into_owned();
 
         let value_data = match self.decoder.typed_field(raw, CAPTURED_DATA) {
             Some((FieldValue::Binary(bytes), _)) => {
@@ -235,6 +246,12 @@ impl Translator {
     }
 }
 
+/// Render a non-binary `FieldValue` as text.
+///
+/// Kept separate from `decode::value::render_text` because that one is
+/// `pub(crate)` inside `decode` and this is used by decoders that receive
+/// a value from `typed_field` and want its string form. The two render
+/// identically; the split is about where each is called from.
 pub(crate) fn render_field(value: &FieldValue) -> String {
     match value {
         FieldValue::Str(s) => s.clone(),
@@ -250,5 +267,20 @@ pub(crate) fn render_field(value: &FieldValue) -> String {
         FieldValue::F64(v) => v.to_string(),
         FieldValue::Guid(b) => super::render::hex(b),
         FieldValue::Binary(b) => super::render::hex(b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_field_renders_every_variant() {
+        assert_eq!(render_field(&FieldValue::Str("x".into())), "x");
+        assert_eq!(render_field(&FieldValue::I32(-1)), "-1");
+        assert_eq!(render_field(&FieldValue::U32(42)), "42");
+        assert_eq!(render_field(&FieldValue::U64(u64::MAX)), u64::MAX.to_string());
+        assert_eq!(render_field(&FieldValue::Binary(vec![0xab])), "ab");
+        assert_eq!(render_field(&FieldValue::Guid([0u8; 16])), "0".repeat(32));
     }
 }

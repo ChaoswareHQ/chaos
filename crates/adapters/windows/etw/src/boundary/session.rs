@@ -3,39 +3,31 @@
 //! The shape here is forced by the API, and most of the care is about
 //! lifetimes:
 //!
-//! * `EVENT_TRACE_PROPERTIES` and its logger name share one allocation that must
-//!   outlive the session, because `ControlTraceW` reads it back on stop. The
-//!   logger name is copied into the tail of that same buffer.
+//! * `EVENT_TRACE_PROPERTIES` and its logger name share one allocation
+//!   that must outlive the session, because `ControlTraceW` reads it back
+//!   on stop. The logger name is copied into the tail of that same buffer.
 //! * `ProcessTrace` blocks, so it owns a thread. `CloseTrace` from another
 //!   thread is what makes it return — there is no other way to wake it.
-//! * `EVENT_TRACE_LOGFILEW` must stay alive for the whole `ProcessTrace` call,
-//!   including the `LoggerName` pointer that reaches back into our name buffer.
-//!   It is owned by the session and never moved: the consumer thread only gets
-//!   the handle.
+//! * `EVENT_TRACE_LOGFILEW` must stay alive for the whole `ProcessTrace`
+//!   call, including the `LoggerName` pointer that reaches back into our
+//!   name buffer. It is owned by the session and never moved.
 //!
-//! Real-time mode means `FlushTimer` is a latency floor, not a tuning knob: a
-//! sparse provider's events are delivered on flush rather than on arrival, so
-//! one second is the compromise between seeing quiet providers at all and
-//! paying per-buffer overhead for nothing.
+//! Real-time mode means `FlushTimer` is a latency floor, not a tuning
+//! knob: a sparse provider's events are delivered on flush rather than on
+//! arrival, so one second is the compromise between seeing quiet
+//! providers at all and paying per-buffer overhead for nothing.
 //!
 //! # Why `INDEPENDENT_SESSION_MODE` is mandatory
 //!
-//! Without `EVENT_TRACE_INDEPENDENT_SESSION_MODE`, the kernel routes a portion
-//! of events through a shared buffer pool that silently drops under
-//! contention — **and the kernel's own loss counters stay at zero**. On a
-//! high-EPS provider such as `Microsoft-Windows-DNSServer`, the observed loss
-//! was roughly 50% with `EventsLost = 0` and `RealTimeBuffersLost = 0`[reference:3].
-//!
-//! A subtler requirement documented in the same report: the kernel silently
-//! strips `INDEPENDENT` unless it is paired with
-//! `EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN` (or its sibling). Setting
-//! `INDEPENDENT` alone produces `Requested LogFileMode = 0x08000100` but
-//! `Kernel-applied = 0x00000100` — the bit is gone, and the session looks
-//! healthy[reference:4]. Both bits together are honored.
+//! See [`crate::boundary::constants`]. The composition of `LOG_FILE_MODE`
+//! is not a tuning choice; without both the `INDEPENDENT` and `PERSIST`
+//! bits, the kernel silently drops events with its own loss counters at
+//! zero.
 
-use crate::callback::{CallbackContext, EtwRaw, on_event};
+use crate::boundary::callback::{CallbackContext, EtwRaw, on_event};
+use crate::boundary::constants::LOG_FILE_MODE;
+use crate::boundary::stats::StatsSnapshot;
 use crate::error::{EtwError, hint};
-use crate::stats::StatsSnapshot;
 use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use model::RawEvent;
 use ports::{EventSource, SourceError};
@@ -52,34 +44,6 @@ use windows::Win32::System::Diagnostics::Etw::{
     ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
-
-/// `EVENT_TRACE_INDEPENDENT_SESSION_MODE` from `evntrace.h`.
-///
-/// Without this flag (and its required companion below), the kernel routes a
-/// portion of events through a shared pool that silently drops under
-/// contention. The kernel's loss counters do not increment; the only way to
-/// detect the loss is to compare against an independent consumer[reference:5].
-const EVENT_TRACE_INDEPENDENT_SESSION_MODE: u32 = 0x0800_0000;
-
-/// `EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN` from `evntrace.h`.
-///
-/// Required for `INDEPENDENT_SESSION_MODE` to be honored. Setting `INDEPENDENT`
-/// alone causes the kernel to silently strip it at `StartTrace` time, leaving
-/// the session in the shared-buffer mode without any indication that the
-/// requested isolation was not applied[reference:6].
-const EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN: u32 = 0x0080_0000;
-
-/// The `LogFileMode` this sensor always uses.
-///
-/// The composition is not arbitrary:
-///
-/// - `REAL_TIME_MODE` is what makes the session consumable live.
-/// - `INDEPENDENT_SESSION_MODE` isolates the session's buffer pool from other
-///   ETW consumers.
-/// - `PERSIST_ON_HYBRID_SHUTDOWN` is what makes the kernel *accept* the
-///   `INDEPENDENT` bit rather than silently stripping it.
-const LOG_FILE_MODE: u32 =
-    EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_INDEPENDENT_SESSION_MODE | EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN;
 
 /// One provider to enable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,11 +86,12 @@ impl Default for Buffers {
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub name: String,
-    /// Bounded channel depth. When it fills, the callback drops rather than
-    /// blocks, so this is a real ceiling on burst absorption.
+    /// Bounded channel depth. When it fills, the callback drops rather
+    /// than blocks, so this is a real ceiling on burst absorption.
     pub capacity: usize,
     pub providers: Vec<ProviderSpec>,
-    /// Events above this level are counted and discarded before any allocation.
+    /// Events above this level are counted and discarded before any
+    /// allocation.
     pub max_level: u8,
     /// Kernel buffer sizing and flush cadence.
     pub buffers: Buffers,
@@ -151,16 +116,22 @@ pub struct EnableReport {
     pub result: Result<(), u32>,
 }
 
-/// Keeps `EVENT_TRACE_LOGFILEW` alive without letting its raw pointers escape.
+/// Keeps `EVENT_TRACE_LOGFILEW` alive without letting its raw pointers
+/// escape.
 #[allow(dead_code)]
 struct LogFile(Box<EVENT_TRACE_LOGFILEW>);
 
+// SAFETY: the pointers inside `EVENT_TRACE_LOGFILEW` point into buffers
+// owned by the session (`name`), and the session owns this struct. Moving
+// it to the consumer thread moves only the box, not the buffers the
+// pointers refer to.
 unsafe impl Send for LogFile {}
 
 /// A live real-time session.
 pub struct EtwSession {
     display_name: String,
-    /// Owned, NUL-terminated, and referenced by `LoggerName` for the whole run.
+    /// Owned, NUL-terminated, and referenced by `LoggerName` for the whole
+    /// run.
     name: Vec<u16>,
     /// `EVENT_TRACE_PROPERTIES` plus the logger name in its tail.
     props: Box<[u8]>,
@@ -188,14 +159,16 @@ fn build_props(name: &[u16], buffers: Buffers) -> Box<[u8]> {
     let total = size_of::<EVENT_TRACE_PROPERTIES>() + units * size_of::<u16>();
     let mut buf = vec![0u8; total].into_boxed_slice();
 
+    // SAFETY: `buf` is a fresh allocation large enough for
+    // `EVENT_TRACE_PROPERTIES` plus `units` UTF-16 code units; the
+    // arithmetic above computed `total` from exactly those.
     unsafe {
         let p = props_ptr(&mut buf);
         (*p).Wnode.BufferSize = total as u32;
         (*p).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         (*p).Wnode.ClientContext = 1;
-        // The three bits that matter: real-time, independent, persist.
-        // Setting only REAL_TIME is what causes the silent loss described in
-        // the module docs.
+        // The three bits that matter. See `boundary::constants` for why
+        // INDEPENDENT alone is not enough.
         (*p).LogFileMode = LOG_FILE_MODE;
         (*p).FlushTimer = buffers.flush_seconds.max(1);
         (*p).BufferSize = buffers.size_kb;
@@ -249,6 +222,8 @@ pub fn session_state(name: &str) -> Result<Option<SessionState>, EtwError> {
     }
 
     let p = props_ptr(&mut props);
+    // SAFETY: `ControlTraceW` with `QUERY` filled `props` in place and
+    // returned `ERROR_SUCCESS`, so the fields it reads are valid.
     Ok(Some(unsafe {
         SessionState {
             real_time: (*p).LogFileMode & EVENT_TRACE_REAL_TIME_MODE != 0,
@@ -281,6 +256,11 @@ impl EtwSession {
         let pname = PCWSTR(name.as_ptr());
         let null_handle = CONTROLTRACE_HANDLE { Value: 0 };
 
+        // Stop any session that already exists under this name. We do this
+        // before `StartTraceW` because `StartTraceW` returns
+        // `ERROR_ALREADY_EXISTS` if the name is taken — even if the
+        // previous owner is a dead process whose session was never
+        // cleanly stopped.
         let _ = unsafe {
             ControlTraceW(
                 null_handle,
@@ -367,7 +347,7 @@ impl EtwSession {
         let (tx, rx) = bounded(cfg.capacity);
         let ctx = Arc::new(CallbackContext {
             tx,
-            stats: crate::stats::Stats::default(),
+            stats: crate::boundary::stats::Stats::default(),
             providers,
             max_level: cfg.max_level,
         });
@@ -430,7 +410,8 @@ impl EtwSession {
         })
     }
 
-    /// Pull up to `max` events, waiting no longer than `timeout` for the first.
+    /// Pull up to `max` events, waiting no longer than `timeout` for the
+    /// first.
     pub fn drain(&mut self, out: &mut Vec<EtwRaw>, max: usize, timeout: Duration) -> usize {
         let mut count = 0;
 
@@ -463,8 +444,11 @@ impl EtwSession {
         self.lost
     }
 
-    /// Stop consuming, release the session, and collect the final loss counts.
+    /// Stop consuming, release the session, and collect the final loss
+    /// counts.
     pub fn shutdown(&mut self) -> Result<(), EtwError> {
+        // `CloseTrace` from this thread is what makes the blocked
+        // `ProcessTrace` return. There is no other way to wake it.
         let _ = unsafe { CloseTrace(self.consumer) };
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -473,6 +457,8 @@ impl EtwSession {
         let pname = PCWSTR(self.name.as_ptr());
         let null_handle = CONTROLTRACE_HANDLE { Value: 0 };
 
+        // Query first, while the session still exists, so the final loss
+        // counts are read before the session is destroyed.
         let rc = unsafe {
             ControlTraceW(
                 null_handle,
@@ -483,6 +469,7 @@ impl EtwSession {
         };
         if rc == ERROR_SUCCESS {
             let p = props_ptr(&mut self.props);
+            // SAFETY: `QUERY` filled `props`, so these reads are valid.
             self.lost = unsafe { ((*p).EventsLost, (*p).RealTimeBuffersLost) };
         }
 
@@ -504,6 +491,9 @@ impl EtwSession {
 
 impl Drop for EtwSession {
     fn drop(&mut self) {
+        // If shutdown was not called explicitly, do it now. A session left
+        // running under this process's name is a session that a future
+        // `start` will refuse to create.
         if self.thread.is_some() {
             let _ = self.shutdown();
         }
@@ -574,30 +564,6 @@ mod tests {
     }
 
     #[test]
-    fn the_log_file_mode_includes_independent_and_persist() {
-        // The critical pairing. `INDEPENDENT` alone is silently stripped by the
-        // kernel; `PERSIST_ON_HYBRID_SHUTDOWN` is what makes it stick.
-        // Verified against the reported observed behavior: without both, the
-        // kernel applies `0x00000100` and the session silently drops events
-        // on high-EPS providers with no counter increment.
-        assert_eq!(
-            LOG_FILE_MODE & EVENT_TRACE_REAL_TIME_MODE,
-            EVENT_TRACE_REAL_TIME_MODE,
-            "REAL_TIME is required for live consumption"
-        );
-        assert_eq!(
-            LOG_FILE_MODE & EVENT_TRACE_INDEPENDENT_SESSION_MODE,
-            EVENT_TRACE_INDEPENDENT_SESSION_MODE,
-            "INDEPENDENT is required to isolate the buffer pool"
-        );
-        assert_eq!(
-            LOG_FILE_MODE & EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN,
-            EVENT_TRACE_PERSIST_ON_HYBRID_SHUTDOWN,
-            "PERSIST is required for INDEPENDENT to be honored"
-        );
-    }
-
-    #[test]
     fn a_ceiling_below_the_floor_is_corrected_rather_than_written() {
         let name = wide("chaos-test");
         let buffers = Buffers {
@@ -607,7 +573,10 @@ mod tests {
             flush_seconds: 0,
         };
         let props = build_props(&name, buffers);
-        let p = props_ptr(&mut { props });
+        let mut boxed = props;
+        let p = props_ptr(&mut boxed);
+        // SAFETY: `boxed` is a fresh allocation that `build_props` sized
+        // for exactly this struct.
         unsafe {
             assert_eq!((*p).MaximumBuffers, 32, "raised to the floor");
             assert_eq!((*p).MinimumBuffers, 32);
@@ -626,7 +595,10 @@ mod tests {
             size_of::<EVENT_TRACE_PROPERTIES>() + name.len() * size_of::<u16>()
         );
 
-        let p = props_ptr(&mut { props });
+        let mut boxed = props;
+        let p = props_ptr(&mut boxed);
+        // SAFETY: `boxed` was sized by `build_props` for exactly this
+        // layout.
         let (recovered, terminator) = unsafe {
             let tail = (p as *const u8).add((*p).LoggerNameOffset as usize) as *const u16;
             let mut units = Vec::new();
@@ -635,7 +607,10 @@ mod tests {
             }
             let terminator = units.last().copied();
             let text: Vec<u16> = units.into_iter().take_while(|u| *u != 0).collect();
-            (String::from_utf16(&text).expect("valid UTF-16"), terminator)
+            (
+                String::from_utf16(&text).expect("valid UTF-16"),
+                terminator,
+            )
         };
         assert_eq!(recovered, "chaos-test-session");
         assert_eq!(terminator, Some(0), "the tail must end in a terminated name");

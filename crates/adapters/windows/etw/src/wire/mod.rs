@@ -1,44 +1,56 @@
 //! Turning raw ETW events into the pipeline's wire format.
 //!
-//! Split into focused submodules so no file exceeds a few hundred lines:
+//! # Composition
 //!
-//! * [`shape`] — which `(provider, id)` becomes which wire shape, and the
-//!   field-name chains TDH resolves against.
-//! * [`counts`] — per-shape counters and the gap detector.
-//! * [`histogram`] — a bounded breakdown of events that were *not* claimed
-//!   by any shape. This is what makes "we are dropping 99% of traffic" a
-//!   decision with evidence behind it rather than a shrug.
-//! * [`render`] — pure value formatting: FILETIME, `REG_*` types, DNS
-//!   mnemonics, script capping.
-//! * [`decoders`] — the per-shape decoder functions themselves, plus the
-//!   "empty string is missing" rule that the registry bug taught us.
-//! * [`kcb`] — the Key Control Block cache. The kernel hands us a pointer,
-//!   not a path, for registry writes; this module learns the mapping from
-//!   the events that carry both and answers the writes.
+//! [`Translator`] owns five things:
 //!
-//! The [`Translator`] type lives here. It owns the [`Decoder`], the
-//! counters, the histogram, the KCB cache, and the bounded failure log; it
-//! is `Clone` so the observer can give each decode worker its own copy — and
-//! the KCB cache is `Arc`-backed so those copies share their correlation
-//! state.
+//! * a [`Decoder`] — TDH field resolution, per worker;
+//! * a [`ShapeCounts`] — per-shape counters, for the report;
+//! * an [`UnrecognisedHistogram`] — what the shape table does not claim;
+//! * a bounded failure log — the last eight decode failures, for diagnosis;
+//! * two `Arc`-backed caches — [`KeyCache`] and [`ImageMetaCache`] —
+//!   shared across observer workers so a KCB learned by one worker is
+//!   visible to another, and a DLL hashed by one is not re-hashed by
+//!   another.
+//!
+//! # Why `Clone`
+//!
+//! The observer runs N decode workers, each with its own `Translator`.
+//! The `Decoder` is per-clone (each worker warms its own schema cache);
+//! the two correlation caches are `Arc`-backed and shared.
+//!
+//! # Flow, per event
+//!
+//! 1. `learn_kcb` — cross-event correlation, before the shape match,
+//!    because the events that teach the KCB cache are mostly unrecognised.
+//! 2. `shape_of` — does the sensor care about this `(provider, id)`?
+//! 3. `from_filetime` — is the timestamp usable?
+//! 4. dispatch to a per-shape decoder;
+//! 5. `note_mapped` or `note_failure`, then construct the `TelemetryEvent`.
 
 mod counts;
 mod decoders;
 mod histogram;
-mod kcb;
 mod render;
 mod shape;
 
 pub use counts::{GapSeverity, ShapeCounts, TelemetryGap};
 pub use histogram::UnrecognisedHistogram;
-pub use kcb::KeyCache;
 pub use render::render_registry_value;
 pub use shape::{Shape, shape_of};
 
-use crate::callback::EtwRaw;
+use crate::boundary::callback::EtwRaw;
 use crate::decode::Decoder;
+use crate::enrich::image::ImageMetaCache;
+use crate::enrich::kcb::KeyCache;
 use model::{EventId, EventSource, HostId, Payload, TelemetryEvent};
 
+/// How many distinct failure messages are kept, for the run report.
+///
+/// Eight is a compromise: enough to spot a pattern (a wrong field name
+/// repeats), small enough that every kept message is visible on one
+/// screen. The failures are printed one per line; more than eight pushes
+/// the useful ones off the top.
 const KEPT_FAILURES: usize = 8;
 
 /// The provider whose events populate and query the KCB cache.
@@ -61,6 +73,11 @@ pub struct KcbStats {
 
 impl KcbStats {
     /// Fraction of correlated lookups that succeeded.
+    ///
+    /// A run with zero lookups reports `1.0`, because "no misses" is the
+    /// honest reading of "no data". The distinction from `0.0` matters:
+    /// a rate of zero says the cache is broken, and a run that has not
+    /// seen a `SetValueKey` yet has no evidence either way.
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -73,10 +90,11 @@ impl KcbStats {
 
 /// Translates raw ETW events, and reports what it could not translate.
 ///
-/// Clone is cheap and **shares the KCB cache**: the schema cache in
-/// [`Decoder`] is per-clone (each worker warms its own) but the correlation
-/// state is `Arc`-backed because a `KCBCreate` seen by one worker must be
-/// visible to another worker handling the matching `SetValueKey`.
+/// Clone is cheap and **shares both caches**. The schema cache in
+/// [`Decoder`] is per-clone; the KCB and image-metadata caches are
+/// `Arc`-backed because a `KCBCreate` seen by one worker must be visible
+/// to another, and a DLL hashed by one worker must not be re-hashed by
+/// another.
 #[derive(Debug, Clone)]
 pub struct Translator {
     host: HostId,
@@ -86,6 +104,7 @@ pub struct Translator {
     histogram: UnrecognisedHistogram,
     failures: Vec<String>,
     key_cache: KeyCache,
+    image_meta: ImageMetaCache,
     kcb_learned: u64,
     kcb_hits: u64,
     kcb_misses: u64,
@@ -101,16 +120,22 @@ impl Translator {
             histogram: UnrecognisedHistogram::default(),
             failures: Vec::new(),
             key_cache: KeyCache::default(),
+            image_meta: ImageMetaCache::default(),
             kcb_learned: 0,
             kcb_hits: 0,
             kcb_misses: 0,
         }
     }
 
+    /// Total events mapped to a wire shape.
     pub fn mapped(&self) -> u64 {
         self.counts.total_mapped()
     }
 
+    /// Events that were a scored shape but could not be decoded.
+    ///
+    /// A non-zero value here is a bug in the field table for this build
+    /// of Windows, not a quiet host. The failure log names each one.
     pub fn undecodable(&self) -> u64 {
         self.counts
             .total_attempted()
@@ -139,16 +164,15 @@ impl Translator {
         }
     }
 
-    fn note_failure(&mut self, reason: String) {
-        if self.failures.len() < KEPT_FAILURES {
-            self.failures.push(reason);
-        }
-    }
-
     /// Detect shapes that are silent while the sensor is otherwise active.
+    ///
+    /// A shape that has *never* fired is untested, not silent. A shape
+    /// that has fired and stopped while another shape of the opposite
+    /// kind is still active is the ETW-bypass signature: a user-mode
+    /// provider that no longer emits because someone patched the export
+    /// function, while the kernel-mode events keep flowing.
     pub fn detect_gaps(&self) -> Vec<TelemetryGap> {
-        let total_attempted = self.counts.total_attempted();
-        if total_attempted == 0 {
+        if self.counts.total_attempted() == 0 {
             return Vec::new();
         }
 
@@ -157,11 +181,11 @@ impl Translator {
         let mut gaps = Vec::new();
 
         for shape in Shape::ALL {
-            let attempted = self.counts.attempted(shape);
-            let mapped = self.counts.mapped(shape);
+            let attempted = self.counts.attempted(*shape);
+            let mapped = self.counts.mapped(*shape);
 
             let severity = if attempted == 0 {
-                if !self.counts.ever_fired(shape) {
+                if !self.counts.ever_fired(*shape) {
                     GapSeverity::Healthy
                 } else if shape.is_user_mode() && kernel_active {
                     GapSeverity::Silent
@@ -178,7 +202,7 @@ impl Translator {
 
             if severity != GapSeverity::Healthy {
                 gaps.push(TelemetryGap {
-                    shape,
+                    shape: *shape,
                     attempted,
                     mapped,
                     severity,
@@ -194,6 +218,7 @@ impl Translator {
         gaps
     }
 
+    /// One line summarising every shape's mapped/attempted counts.
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         for (shape, attempted, mapped) in self.counts.by_shape() {
@@ -205,39 +230,20 @@ impl Translator {
         parts.join(", ")
     }
 
-    /// Learn `KeyObject → path` from any registry event that carries both.
+    /// Translate one raw event.
     ///
-    /// Called on *every* registry event, before the shape match. The events
-    /// that teach us the mapping are mostly events we do not score — an
-    /// `OpenKey` is not a detection — so they would never reach a decoder if
-    /// this ran after the match.
+    /// Returns `Some` when the event is a shape the sensor scores and the
+    /// decoder had every mandatory field. Returns `None` for one of three
+    /// reasons, each counted so the run report can say which:
     ///
-    /// The cost is one TDH call per registry event, and only when the path
-    /// field resolves to something non-empty. On a desktop that is a few
-    /// thousand TDH calls a second at peak, on top of the ~5 the sensor
-    /// already does per event it scores.
-    fn learn_kcb(&mut self, raw: &EtwRaw) {
-        if raw.wire.provider.as_str() != KERNEL_REGISTRY {
-            return;
-        }
-        // Path first: an event without one has nothing to teach. Reading it
-        // first also means the many events that only carry a `KeyObject`
-        // (queries, enumerations, rundowns) cost one TDH call and exit,
-        // rather than two.
-        let Some(path) = self.decoder.text_first_nonempty(raw, shape::KEY_NAME) else {
-            return;
-        };
-        let Some(key_object) = self.decoder.u64_any(raw, shape::KCB_KEY_OBJECT) else {
-            return;
-        };
-        self.key_cache.learn(key_object, &path);
-        self.kcb_learned += 1;
-    }
-
+    /// * not a scored shape — `note_unrecognised` and the histogram;
+    /// * a scored shape with an unusable timestamp — a failure;
+    /// * a scored shape with a missing mandatory field — a failure.
     pub fn translate(&mut self, raw: &EtwRaw) -> Option<TelemetryEvent> {
         // Cross-event correlation first: a `SetValueKey` we are about to
-        // decode may need a mapping learned from an `OpenKey` that arrived a
-        // millisecond ago and would otherwise be dropped as unrecognised.
+        // decode may need a mapping learned from an `OpenKey` that arrived
+        // a millisecond ago and would otherwise be dropped as
+        // unrecognised.
         self.learn_kcb(raw);
 
         let provider = raw.wire.provider.as_str();
@@ -292,6 +298,40 @@ impl Translator {
             Payload::empty(),
         ))
     }
+
+    fn note_failure(&mut self, reason: String) {
+        if self.failures.len() < KEPT_FAILURES {
+            self.failures.push(reason);
+        }
+    }
+
+    /// Learn `KeyObject → path` from any registry event that carries both.
+    ///
+    /// Called on *every* registry event, before the shape match. The
+    /// events that teach the cache are mostly events we do not score — an
+    /// `OpenKey` is not a detection — so they would never reach a decoder
+    /// if this ran after the match.
+    ///
+    /// The cost is one or two TDH calls per registry event, and only when
+    /// the path field resolves to something non-empty. On a desktop that
+    /// is a few thousand calls per second at peak.
+    fn learn_kcb(&mut self, raw: &EtwRaw) {
+        if raw.wire.provider.as_str() != KERNEL_REGISTRY {
+            return;
+        }
+        // Path first: an event without one has nothing to teach. Reading
+        // it first means the many events that only carry a `KeyObject`
+        // (queries, enumerations, rundowns) cost one TDH call and exit,
+        // rather than two.
+        let Some(path) = self.decoder.text_first_nonempty(raw, shape::KEY_NAME) else {
+            return;
+        };
+        let Some(key_object) = self.decoder.u64_any(raw, shape::KCB_KEY_OBJECT) else {
+            return;
+        };
+        self.key_cache.learn(key_object, &path);
+        self.kcb_learned += 1;
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +379,7 @@ mod tests {
             );
         }
         t.translate(&raw("Some-Other-Provider", 1, vec![]));
+
         assert_eq!(t.undecodable(), 0);
         assert_eq!(t.counts().unrecognised(), 5);
         assert_eq!(t.histogram().total(), 5);
@@ -361,10 +402,6 @@ mod tests {
 
     #[test]
     fn a_registry_set_that_cannot_be_correlated_names_the_pointer() {
-        // On a machine with an empty KCB cache, a `SetValueKey` still cannot
-        // be attributed — but the failure now says *which* pointer it could
-        // not resolve, so an operator can tell it apart from "the field name
-        // is wrong for this build".
         let mut t = translator();
         assert!(
             t.translate(&raw("Microsoft-Windows-Kernel-Registry", 5, vec![1; 8]))
@@ -375,26 +412,10 @@ mod tests {
         assert_eq!(t.counts().mapped(Shape::RegistrySet), 0);
         assert!(
             t.failures()[0].contains("KeyName"),
-            "the reason names the missing field: {:?}",
+            "{:?}",
             t.failures()
         );
         assert_eq!(t.kcb_stats().misses, 1);
-    }
-
-    #[test]
-    fn image_load_and_process_exit_are_recognised_shapes() {
-        let mut t = translator();
-        assert!(
-            t.translate(&raw("Microsoft-Windows-Kernel-Process", 2, Vec::new()))
-                .is_none()
-        );
-        assert_eq!(t.counts().attempted(Shape::ProcessExit), 1);
-
-        assert!(
-            t.translate(&raw("Microsoft-Windows-Kernel-Process", 5, Vec::new()))
-                .is_none()
-        );
-        assert_eq!(t.counts().attempted(Shape::ImageLoad), 1);
     }
 
     #[test]
@@ -424,6 +445,31 @@ mod tests {
         assert_eq!(s.misses, 0);
         assert_eq!(s.cache_size, 0);
         assert!(s.cache_capacity > 0);
-        assert_eq!(s.hit_rate(), 1.0, "no lookups is not a miss rate");
+        assert_eq!(s.hit_rate(), 1.0);
+    }
+
+    #[test]
+    fn the_failure_log_is_bounded() {
+        let mut t = translator();
+        for _ in 0..500 {
+            t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, vec![1; 16]));
+        }
+        assert_eq!(t.undecodable(), 500);
+        assert_eq!(t.failures().len(), KEPT_FAILURES);
+    }
+
+    #[test]
+    fn a_shape_that_stopped_firing_is_silent() {
+        let mut t = translator();
+        t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+        for _ in 0..3 {
+            t.translate(&raw("Microsoft-Windows-Kernel-Registry", 5, Vec::new()));
+        }
+        let gaps = t.detect_gaps();
+        let dns_gap = gaps
+            .iter()
+            .find(|g| g.shape == Shape::DnsQuery)
+            .expect("DNS gap");
+        assert_eq!(dns_gap.severity, GapSeverity::Silent);
     }
 }

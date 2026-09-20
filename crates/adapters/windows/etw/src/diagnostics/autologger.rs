@@ -1,54 +1,63 @@
-//! Boot-time sessions: reading what is configured, and saying what to write.
+//! Boot-time sessions: reading what is configured, and saying what to
+//! write.
 //!
-//! A session created by [`crate::EtwSession::start`] begins when the agent does.
-//! Everything before that — the services that started, the logon, the Run key
-//! that fired during it — happened before there was anything listening, and no
-//! amount of care in the consumer recovers it.
+//! A session created by [`crate::boundary::session::EtwSession::start`]
+//! begins when the agent does. Everything before that — the services that
+//! started, the logon, the Run key that fired during it — happened before
+//! there was anything listening, and no amount of care in the consumer
+//! recovers it.
 //!
 //! Windows has a mechanism for exactly this. A subkey under
-//! `HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger` describes a session, and
-//! the kernel starts it during boot, before any user-mode code is in a position to
-//! interfere. That is what "system-managed session" means, and it is a real
-//! difference rather than a configuration preference:
+//! `HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger` describes a
+//! session, and the kernel starts it during boot, before any user-mode
+//! code is in a position to interfere. That is what "system-managed
+//! session" means, and it is a real difference rather than a
+//! configuration preference:
 //!
 //! * the session exists from boot, so early-boot activity is captured;
-//! * it is not owned by the agent, so an agent restart does not interrupt it;
-//! * its buffers are sized by the registry, at boot, not by whatever process
-//!   happens to start first.
+//! * it is not owned by the agent, so an agent restart does not interrupt
+//!   it;
+//! * its buffers are sized by the registry, at boot, not by whatever
+//!   process happens to start first.
 //!
 //! # What this module does and does not do
 //!
-//! It **reads** the configuration and reports what is missing, and it **renders**
-//! the commands that would create it. It does not write: creating the key needs an
-//! elevated token, and a library that quietly rewrites `HKLM` at startup is a
-//! library nobody should trust. The operator gets the commands, the exact values
-//! they came from, and a verification that says whether they took effect.
+//! It **reads** the configuration and reports what is missing, and it
+//! **renders** the commands that would create it. It does not write:
+//! creating the key needs an elevated token, and a library that quietly
+//! rewrites `HKLM` at startup is a library nobody should trust. The
+//! operator gets the commands, the exact values they came from, and a
+//! verification that says whether they took effect.
 //!
 //! # The limit of the idea
 //!
-//! An autologger is not tamper-proof. It is started by the kernel, but it is
-//! *configured* by a registry key, and an administrator can stop the session
-//! (`logman stop -ets`) or edit the key and reboot. What it buys is that the
-//! tampering has to be done deliberately, with privilege, and leaves a trace —
-//! which is why [`AutologgerSpec::problems`] exists, so a host can be asked
-//! whether its own telemetry is still configured the way it was.
+//! An autologger is not tamper-proof. It is started by the kernel, but it
+//! is *configured* by a registry key, and an administrator can stop the
+//! session (`logman stop -ets`) or edit the key and reboot. What it buys
+//! is that the tampering has to be done deliberately, with privilege, and
+//! leaves a trace — which is why [`AutologgerSpec::problems`] exists, so
+//! a host can be asked whether its own telemetry is still configured the
+//! way it was.
 
-use crate::{error::EtwError, session::Buffers};
+use crate::boundary::session::Buffers;
+use crate::error::EtwError;
+use crate::util::format_guid;
 use std::collections::BTreeMap;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_QWORD, REG_SZ,
     REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
 };
-use windows::core::{GUID, PCWSTR, PWSTR};
+use windows::core::{PCWSTR, PWSTR};
 
 /// Where autologger sessions live, under `HKEY_LOCAL_MACHINE`.
 pub const AUTOLOGGER_ROOT: &str = r"SYSTEM\CurrentControlSet\Control\WMI\Autologger";
 
 /// `EVENT_TRACE_REAL_TIME_MODE`.
 ///
-/// The flag that makes a session consumable while it runs. Without it the session
-/// writes to a file and [`crate::EtwSession::attach`] has nothing to join.
+/// The flag that makes a session consumable while it runs. Without it the
+/// session writes to a file and
+/// [`crate::boundary::session::EtwSession::attach`] has nothing to join.
 pub const REAL_TIME_MODE: u32 = 0x0000_0100;
 
 /// One provider under a session key.
@@ -73,17 +82,18 @@ pub struct AutologgerState {
     pub minimum_buffers: Option<u32>,
     pub maximum_buffers: Option<u32>,
     pub flush_seconds: Option<u32>,
-    /// Provider subkeys, keyed by the subkey name (a `{guid}` string). Ordered so
-    /// that rendering it twice produces the same bytes.
+    /// Provider subkeys, keyed by the subkey name (a `{guid}` string).
+    /// Ordered so that rendering it twice produces the same bytes.
     pub providers: BTreeMap<String, ProviderEntry>,
 }
 
 impl AutologgerState {
     /// Read the configuration for one session.
     ///
-    /// A session that does not exist is `Ok` with `present == false`: an unconfigured
-    /// host is a fact to report, not a failure. A refusal is an error, because "there
-    /// is nothing here" and "I was not allowed to look" are different answers.
+    /// A session that does not exist is `Ok` with `present == false`: an
+    /// unconfigured host is a fact to report, not a failure. A refusal is
+    /// an error, because "there is nothing here" and "I was not allowed
+    /// to look" are different answers.
     pub fn read(session: &str) -> Result<Self, EtwError> {
         let path = format!("{AUTOLOGGER_ROOT}\\{session}");
         let Some(key) = open_key(&path)? else {
@@ -138,15 +148,15 @@ pub struct AutologgerSpec {
     pub session: String,
     /// The session's GUID as Windows will know it.
     ///
-    /// Provided by the caller rather than derived, because a consumer attaches by
-    /// *name*: the GUID only has to be stable and unique, and inventing one by
-    /// hashing the name would be a guess about an implementation detail that
-    /// nothing here depends on.
+    /// Provided by the caller rather than derived, because a consumer
+    /// attaches by *name*: the GUID only has to be stable and unique, and
+    /// inventing one by hashing the name would be a guess about an
+    /// implementation detail that nothing here depends on.
     pub guid: String,
     pub buffers: Buffers,
-    /// `START` is always 1: a session that is not started at boot is not an
-    /// autologger.
-    pub providers: Vec<crate::session::ProviderSpec>,
+    /// `START` is always 1: a session that is not started at boot is not
+    /// an autologger.
+    pub providers: Vec<crate::boundary::session::ProviderSpec>,
 }
 
 impl AutologgerSpec {
@@ -159,7 +169,10 @@ impl AutologgerSpec {
         }
     }
 
-    pub fn with_providers(mut self, providers: Vec<crate::session::ProviderSpec>) -> Self {
+    pub fn with_providers(
+        mut self,
+        providers: Vec<crate::boundary::session::ProviderSpec>,
+    ) -> Self {
         self.providers = providers;
         self
     }
@@ -174,12 +187,13 @@ impl AutologgerSpec {
         format!("{AUTOLOGGER_ROOT}\\{}", self.session)
     }
 
-    /// Every command needed to create the session, in order, for an elevated
-    /// prompt.
+    /// Every command needed to create the session, in order, for an
+    /// elevated prompt.
     ///
-    /// Rendered rather than applied: see the module docs. The values come from this
-    /// struct, so a change to the buffer sizing or the provider list cannot drift
-    /// away from the instructions an operator was given.
+    /// Rendered rather than applied: see the module docs. The values come
+    /// from this struct, so a change to the buffer sizing or the provider
+    /// list cannot drift away from the instructions an operator was
+    /// given.
     pub fn reg_commands(&self) -> String {
         let key = format!("HKLM\\{}", self.key_path());
         let mut out = String::new();
@@ -245,9 +259,9 @@ impl AutologgerSpec {
 
     /// What is wrong with a session that was read back, as sentences.
     ///
-    /// Empty means the host telemetry is configured as this deployment expects. Each
-    /// string is a fact about a specific value, because "the autologger is broken" is
-    /// not something an operator can act on.
+    /// Empty means the host telemetry is configured as this deployment
+    /// expects. Each string is a fact about a specific value, because "the
+    /// autologger is broken" is not something an operator can act on.
     pub fn problems(&self, state: &AutologgerState) -> Vec<String> {
         let mut problems = Vec::new();
 
@@ -294,7 +308,8 @@ impl AutologgerSpec {
             let name = format_guid(&spec.guid);
             match state.providers.get(&name) {
                 None => problems.push(format!(
-                    "provider {name} ({}) is not in the session, so nothing it emits is collected",
+                    "provider {name} ({}) is not in the session, so nothing it emits is \
+                     collected",
                     spec.name
                 )),
                 Some(entry) if entry.enabled != Some(1) => problems.push(format!(
@@ -307,12 +322,13 @@ impl AutologgerSpec {
                          subscribed to every keyword ({:#x} intended)",
                         spec.name, spec.keywords
                     )),
-                    // The check that was missing: an altered mask is a tamper,
-                    // and the whole module exists to notice one. Absent is the
-                    // only case that used to fire, and absent is not the shape
-                    // a tamper actually takes — the tamper narrows the mask,
-                    // which silently drops a subset of the traffic while the
-                    // check reports nothing.
+                    // The check that was missing: an altered mask is a
+                    // tamper, and the whole module exists to notice one.
+                    // Absent is the only case that used to fire, and absent
+                    // is not the shape a tamper actually takes — the
+                    // tamper narrows the mask, which silently drops a
+                    // subset of the traffic while the check reports
+                    // nothing.
                     Some(actual) if spec.keywords != 0 && actual != spec.keywords => {
                         problems.push(format!(
                             "provider {name} ({}) has `MatchAnyKeyword` = {actual:#x}, \
@@ -329,18 +345,8 @@ impl AutologgerSpec {
     }
 }
 
-/// A GUID in the canonical `{8-4-4-4-12}` spelling, which is what the registry
-/// and every other Windows tool use.
-pub fn format_guid(guid: &GUID) -> String {
-    let b = guid.data4;
-    format!(
-        "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
-        guid.data1, guid.data2, guid.data3, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
-    )
-}
-
 // ---------------------------------------------------------------------------
-// registry plumbing
+// Registry plumbing
 // ---------------------------------------------------------------------------
 
 /// Closes a key on every path out of the scope that opened it.
@@ -393,8 +399,9 @@ fn read_raw(key: HKEY, name: &str) -> Option<(Vec<u8>, REG_VALUE_TYPE)> {
     let mut kind = REG_VALUE_TYPE::default();
     let mut size = 0u32;
 
-    // Size first: the values here are small and fixed, but a registry is not a
-    // place to assume, and `RegQueryValueExW` writes the needed size back.
+    // Size first: the values here are small and fixed, but a registry is
+    // not a place to assume, and `RegQueryValueExW` writes the needed size
+    // back.
     let rc = unsafe {
         RegQueryValueExW(
             key,
@@ -434,8 +441,9 @@ fn read_u32(key: HKEY, name: &str) -> Option<u32> {
         REG_DWORD => bytes
             .get(..4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        // Windows is happy to store a small number as a QWORD, and a reader that
-        // insists on exactly four bytes reports "not set" on a value that is set.
+        // Windows is happy to store a small number as a QWORD, and a
+        // reader that insists on exactly four bytes reports "not set" on a
+        // value that is set.
         REG_QWORD => bytes
             .get(..8)
             .map(|b| u32::try_from(u64::from_le_bytes(b[..8].try_into().ok()?)).ok())
@@ -462,8 +470,9 @@ fn read_string(key: HKEY, name: &str) -> Option<String> {
     if kind != REG_SZ && kind != REG_EXPAND_SZ {
         return None;
     }
-    // A `wstring` value: UTF-16, normally NUL-terminated, and with or without the
-    // terminator in the returned length depending on who wrote it.
+    // A `wstring` value: UTF-16, normally NUL-terminated, and with or
+    // without the terminator in the returned length depending on who
+    // wrote it.
     let mut units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -498,8 +507,9 @@ fn subkey_names(key: HKEY) -> Vec<String> {
             )
         };
         if rc != ERROR_SUCCESS {
-            // ERROR_NO_MORE_ITEMS and anything else end the walk: a partial list of
-            // subkeys is reported as what it is, not as a complete one.
+            // `ERROR_NO_MORE_ITEMS` and anything else end the walk: a
+            // partial list of subkeys is reported as what it is, not as a
+            // complete one.
             break;
         }
         names.push(String::from_utf16_lossy(&buf[..len as usize]));
@@ -512,8 +522,9 @@ fn subkey_names(key: HKEY) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boundary::session::ProviderSpec;
     use crate::provider;
-    use crate::session::ProviderSpec;
+    use windows::core::GUID;
 
     /// A session name nothing should be using.
     const ABSENT: &str = "chaos-no-such-autologger-7c41";
@@ -530,11 +541,12 @@ mod tests {
 
     #[test]
     fn a_boot_session_can_be_read_off_a_real_machine() {
-        // `EventLog-System` is an autologger that ships with Windows, so this
-        // exercises the whole read path against a key that exists — the only way to
-        // test registry plumbing without writing to the registry. Skips rather than
-        // fails on a host that does not have it, because that is a fact about the
-        // host and not about this code.
+        // `EventLog-System` is an autologger that ships with Windows, so
+        // this exercises the whole read path against a key that exists —
+        // the only way to test registry plumbing without writing to the
+        // registry. Skips rather than fails on a host that does not have
+        // it, because that is a fact about the host and not about this
+        // code.
         let Ok(state) = AutologgerState::read("EventLog-System") else {
             return; // a refusal is a host fact; the absent-name test covers the API
         };
@@ -601,8 +613,8 @@ mod tests {
         };
         assert_eq!(spec.problems(&good), Vec::<String>::new());
 
-        // Now take it apart one value at a time. Each deviation has to be named
-        // separately: "the autologger is broken" is not actionable.
+        // Now take it apart one value at a time. Each deviation has to be
+        // named separately: "the autologger is broken" is not actionable.
         let disabled = AutologgerState {
             start: Some(0),
             ..good.clone()
@@ -653,10 +665,10 @@ mod tests {
     #[test]
     fn a_narrowed_keyword_mask_is_reported_even_though_the_value_is_present() {
         // The tamper that used to slip through: `MatchAnyKeyword` present,
-        // `Enabled` 1, level correct — and the mask quietly narrowed so image
-        // loads stop arriving. An absent-value check cannot see this, and it is
-        // exactly the shape a tamper takes: nothing is missing, something is
-        // smaller.
+        // `Enabled` 1, level correct — and the mask quietly narrowed so
+        // image loads stop arriving. An absent-value check cannot see
+        // this, and it is exactly the shape a tamper takes: nothing is
+        // missing, something is smaller.
         let spec = AutologgerSpec::new("chaos-sensor", "{11111111-2222-3333-4444-555555555555}")
             .with_providers(vec![ProviderSpec {
                 guid: provider::KERNEL_PROCESS,
@@ -709,9 +721,8 @@ mod tests {
             }]);
         let commands = spec.reg_commands();
 
-        assert!(
-            commands.contains(r"HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\chaos-sensor")
-        );
+        assert!(commands
+            .contains(r"HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\chaos-sensor"));
         assert!(
             commands.contains("/v Start /t REG_DWORD /d 1 /f"),
             "{commands}"
@@ -721,16 +732,16 @@ mod tests {
             commands.contains("/v BufferSize /t REG_DWORD /d 0x80"),
             "{commands}"
         );
-        // The provider is a *subkey* of the session, so its GUID follows the
-        // separator rather than ending the path.
+        // The provider is a *subkey* of the session, so its GUID follows
+        // the separator rather than ending the path.
         assert!(
             commands.contains(r"chaos-sensor\{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}"),
             "the provider subkey is its GUID: {commands}"
         );
         assert!(commands.contains("/v MatchAnyKeyword /t REG_QWORD /d 0x0000000000000050"));
 
-        // One line per value, no blank lines, and nothing that runs by itself:
-        // seven session values plus three for the one provider.
+        // One line per value, no blank lines, and nothing that runs by
+        // itself: seven session values plus three for the one provider.
         assert_eq!(commands.lines().count(), 7 + 3, "{commands}");
         assert!(commands.lines().all(|l| l.starts_with("reg add \"")));
     }

@@ -1,28 +1,29 @@
 [package]
 name = "etw"
-description = "Windows ETW real-time sensor: session lifecycle, hot-path callback, and TDH decoding."
+description = "Windows ETW real-time sensor: session, callback, TDH decode, wire translation."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "README.md"
+readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-crossbeam-channel.workspace = true
 model.workspace = true
 ports.workspace = true
-thiserror.workspace = true
+crossbeam-channel.workspace = true
 chrono.workspace = true
-
-[target.'cfg(windows)'.dependencies]
+thiserror.workspace = true
+sha2.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_Etw",
-    "Win32_System_Performance",
-    "Win32_System_Registry",
-    "Win32_System_Time",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
-    "Win32_Storage_FileSystem"
+    "Win32_System_Registry",
+    "Win32_System_Time",
+    "Win32_System_Threading",
 ] }

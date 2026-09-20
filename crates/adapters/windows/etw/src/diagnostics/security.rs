@@ -1,49 +1,44 @@
 //! ETW security self-checks.
 //!
-//! Five layers of detection, each assuming the one below it may have failed:
+//! Five layers of detection, each assuming the one below it may have
+//! failed:
 //!
 //! 1. **ntdll export prologues** — matches the first 16 bytes of the ETW
 //!    exports against known patch patterns. Fast, and it *names* the
-//!    technique, but bypassed by a patch whose first byte lands past the scan
-//!    window. The whole-`.text` comparison below is the check that catches
-//!    those.
+//!    technique, but bypassed by a patch whose first byte lands past the
+//!    scan window. The whole-`.text` comparison below is the check that
+//!    catches those.
 //! 2. **ntdll `.text` comparison** — compares the entire code section of
 //!    `ntdll.dll` against the on-disk copy. Catches any byte modification
 //!    anywhere in the section, regardless of pattern.
 //! 3. **Jump scan** — flags trampolines in the prologue. The scan is
-//!    byte-level, not instruction-level, so it can false-positive on a jump
-//!    opcode that appears as part of a longer instruction. The `.text`
-//!    comparison is the check that has no false positives; the jump scan is a
-//!    *naming* convenience that surfaces trampolines for an operator.
-//! 4. **Session health** — detects a stopped or reconfigured trace session.
+//!    byte-level, not instruction-level, so it can false-positive on a
+//!    jump opcode that appears as part of a longer instruction. The
+//!    `.text` comparison is the check that has no false positives; the
+//!    jump scan is a *naming* convenience that surfaces trampolines for
+//!    an operator.
+//! 4. **Session health** — detects a stopped or reconfigured trace
+//!    session.
 //! 5. **Kernel integrity** — reports whether VBS/HVCI is constraining
 //!    kernel-level tampering.
 //!
-//! None of these *prevent* an attack. They make it **visible**. The goal is
-//! that a bypass requires privilege, is deliberate, and leaves evidence.
-//!
-//! # The residual gap
-//!
-//! Three bypasses are not caught by any check in this module:
-//!
-//! - **IAT hooks** — modifying the import table of a *calling* module so the
-//!   call never reaches `ntdll`. The bytes in `ntdll` are untouched.
-//! - **Hardware breakpoints** — setting `DR0`–`DR3` via a vectored exception
-//!   handler. No bytes change, so no byte comparison can see it.
-//! - **Detector self-patching** — patching the code of `check_ntdll_exports`
-//!   itself. This is the "who watches the watchmen" problem and cannot be
-//!   solved from inside the same process.
-//!
-//! Closing these requires either a separate process reading this one's
-//! memory, or kernel-level monitoring. That is the correct architecture for
-//! a high-assurance deployment and is documented in the README.
+//! None of these *prevent* an attack. They make it **visible**. The goal
+//! is that a bypass requires privilege, is deliberate, and leaves
+//! evidence.
 
+use crate::boundary::session::session_state;
 use crate::error::EtwError;
 use std::path::PathBuf;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleW, GetProcAddress,
+};
 use windows::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows::core::{PCSTR, PCWSTR};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 /// The ETW export functions a user-mode attacker patches.
 const ETW_EXPORTS: &[&str] = &[
@@ -55,10 +50,11 @@ const ETW_EXPORTS: &[&str] = &[
 
 /// Known patch patterns, as byte sequences.
 ///
-/// **Order matters.** `starts_with` checks a prefix, so a longer pattern must
-/// come before any shorter pattern that it begins with. This list is a *hint*
-/// — the `.text` comparison catches everything a pattern list would, and
-/// more — but it names the technique, which a byte diff alone cannot.
+/// **Order matters.** `starts_with` checks a prefix, so a longer pattern
+/// must come before any shorter pattern that it begins with. This list is
+/// a *hint* — the `.text` comparison catches everything a pattern list
+/// would, and more — but it names the technique, which a byte diff alone
+/// cannot.
 const PATCH_PATTERNS: &[(&str, &[u8])] = &[
     ("xor eax, eax; ret", &[0x31, 0xC0, 0xC3]),
     ("xor eax, eax; ret (alt)", &[0x33, 0xC0, 0xC3]),
@@ -72,12 +68,16 @@ const PATCH_PATTERNS: &[(&str, &[u8])] = &[
 
 /// How many bytes of each export to read for the pattern match.
 ///
-/// The matcher sees every 8-byte window that starts within these bytes, so a
-/// pattern whose first byte lands at offset `PROLOGUE_SCAN_BYTES - 8 + 1` or
-/// later is outside the scan window. The `.text` comparison in
-/// [`verify_text_section`] is the check that catches it. The scan is a
-/// *naming* convenience, not the load-bearing check.
+/// The matcher sees every 8-byte window that starts within these bytes, so
+/// a pattern whose first byte lands at offset
+/// `PROLOGUE_SCAN_BYTES - 8 + 1` or later is outside the scan window. The
+/// `.text` comparison in [`verify_text_section`] is the check that catches
+/// it. The scan is a *naming* convenience, not the load-bearing check.
 const PROLOGUE_SCAN_BYTES: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Export integrity
+// ---------------------------------------------------------------------------
 
 /// A jump instruction found in a function's prologue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,12 +136,12 @@ impl ExportIntegrity {
 /// Find a known patch pattern in a byte slice.
 ///
 /// Returns the label of the first pattern found and the offset at which it
-/// starts. The pattern matches only at the *start* of an 8-byte window, so
-/// the search effectively covers offsets `0..=(len - 8)`.
+/// starts. The pattern matches only at the *start* of an 8-byte window,
+/// so the search effectively covers offsets `0..=(len - 8)`.
 ///
 /// This is the matcher the prologue check uses, exposed so tests can call
-/// it directly and so a caller diagnosing a false positive can see what the
-/// matcher found.
+/// it directly and so a caller diagnosing a false positive can see what
+/// the matcher found.
 pub fn find_patch_in(bytes: &[u8]) -> Option<(&'static str, usize)> {
     if bytes.len() < 8 {
         return None;
@@ -156,7 +156,92 @@ pub fn find_patch_in(bytes: &[u8]) -> Option<(&'static str, usize)> {
     None
 }
 
-/// The result of comparing `ntdll`'s `.text` section against the on-disk copy.
+/// Scan a byte slice for jump instructions.
+///
+/// A normal function prologue does not begin with a jump. A trampoline
+/// does. The scanner is deliberately naive — it walks byte-by-byte and
+/// looks for jump opcodes rather than decoding x86 — because a false
+/// positive (a `jmp` that happens to be part of an instruction operand)
+/// is safer than a false negative.
+///
+/// Only a jump at offset 0 is reported. A jump later in the prologue is
+/// usually part of a legitimate instruction; the `.text` comparison
+/// catches those when they are not.
+pub fn scan_for_jumps(bytes: &[u8]) -> Vec<JumpScan> {
+    let mut jumps = Vec::new();
+    for (offset, byte) in bytes.iter().enumerate() {
+        let description = match *byte {
+            0xE9 => "jmp rel32",
+            0xEB => "jmp rel8",
+            0xE8 => "call rel32",
+            0xCC => "int3",
+            _ => continue,
+        };
+        jumps.push(JumpScan {
+            offset,
+            opcode: *byte,
+            description,
+        });
+    }
+    // A `ret` at offset 0 is a patch, not a trampoline; it is already
+    // covered by the pattern list. A jump at offset 0 is the trampoline
+    // signal.
+    jumps.retain(|j| j.offset == 0);
+    jumps
+}
+
+/// Check every ETW export in the current process.
+pub fn check_ntdll_exports() -> Vec<ExportIntegrity> {
+    let Some(ntdll) = load_ntdll() else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::with_capacity(ETW_EXPORTS.len());
+
+    for name in ETW_EXPORTS {
+        let Some(ptr) = resolve_export(ntdll, name) else {
+            continue;
+        };
+
+        // SAFETY: `ptr` is a valid function address returned by
+        // `GetProcAddress`. Every exported function is at least
+        // `PROLOGUE_SCAN_BYTES` long.
+        let mut memory_bytes = [0u8; PROLOGUE_SCAN_BYTES];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr as *const u8,
+                memory_bytes.as_mut_ptr(),
+                PROLOGUE_SCAN_BYTES,
+            );
+        }
+
+        let (known_patch, patch_offset) = match find_patch_in(&memory_bytes) {
+            Some((label, offset)) => (Some(label), Some(offset)),
+            None => (None, None),
+        };
+
+        let jumps = scan_for_jumps(&memory_bytes);
+        let private_page = page_is_private(ptr);
+
+        results.push(ExportIntegrity {
+            name,
+            memory_bytes,
+            known_patch,
+            patch_offset,
+            jumps,
+            private_page,
+        });
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Whole-section comparison
+// ---------------------------------------------------------------------------
+
+/// The result of comparing `ntdll`'s `.text` section against the on-disk
+/// copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextIntegrity {
     /// The path the on-disk copy was read from.
@@ -190,87 +275,6 @@ impl TextIntegrity {
     }
 }
 
-/// Check every ETW export in the current process.
-pub fn check_ntdll_exports() -> Vec<ExportIntegrity> {
-    let Some(ntdll) = load_ntdll() else {
-        return Vec::new();
-    };
-
-    let mut results = Vec::with_capacity(ETW_EXPORTS.len());
-
-    for name in ETW_EXPORTS {
-        let Some(ptr) = resolve_export(ntdll, name) else {
-            continue;
-        };
-
-        // SAFETY: `ptr` is a valid function address returned by GetProcAddress.
-        // Every exported function is at least `PROLOGUE_SCAN_BYTES` long.
-        let mut memory_bytes = [0u8; PROLOGUE_SCAN_BYTES];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                ptr as *const u8,
-                memory_bytes.as_mut_ptr(),
-                PROLOGUE_SCAN_BYTES,
-            );
-        }
-
-        let (known_patch, patch_offset) = match find_patch_in(&memory_bytes) {
-            Some((label, offset)) => (Some(label), Some(offset)),
-            None => (None, None),
-        };
-
-        // Scan for jumps in the prologue. A function whose first bytes are a
-        // jump is a trampoline.
-        let jumps = scan_for_jumps(&memory_bytes);
-
-        let private_page = page_is_private(ptr);
-
-        results.push(ExportIntegrity {
-            name,
-            memory_bytes,
-            known_patch,
-            patch_offset,
-            jumps,
-            private_page,
-        });
-    }
-
-    results
-}
-
-/// Scan a byte slice for jump instructions.
-///
-/// A normal function prologue does not begin with a jump. A trampoline does.
-/// The scanner is deliberately naive — it walks byte-by-byte and looks for
-/// jump opcodes rather than decoding x86 — because a false positive (a `jmp`
-/// that happens to be part of an instruction operand) is safer than a false
-/// negative.
-///
-/// Only a jump at offset 0 is reported. A jump later in the prologue is
-/// usually part of a legitimate instruction; the `.text` comparison catches
-/// those when they are not.
-pub fn scan_for_jumps(bytes: &[u8]) -> Vec<JumpScan> {
-    let mut jumps = Vec::new();
-    for (offset, byte) in bytes.iter().enumerate() {
-        let description = match *byte {
-            0xE9 => "jmp rel32",
-            0xEB => "jmp rel8",
-            0xE8 => "call rel32",
-            0xCC => "int3",
-            _ => continue,
-        };
-        jumps.push(JumpScan {
-            offset,
-            opcode: *byte,
-            description,
-        });
-    }
-    // A `ret` at offset 0 is a patch, not a trampoline; it is already covered
-    // by the pattern list. A jump at offset 0 is the trampoline signal.
-    jumps.retain(|j| j.offset == 0);
-    jumps
-}
-
 /// Compare `ntdll`'s `.text` section in memory against the on-disk copy.
 ///
 /// This is the strongest user-mode check available. It catches any byte
@@ -279,9 +283,11 @@ pub fn scan_for_jumps(bytes: &[u8]) -> Vec<JumpScan> {
 /// it does not depend on a pattern list knowing what the patch looks like.
 ///
 /// It does **not** catch:
-/// - IAT hooks (another module's import table is modified, not `ntdll`).
-/// - Hardware breakpoints (no bytes change).
-/// - A patch that is applied and reverted between two calls to this function.
+///
+/// * IAT hooks (another module's import table is modified, not `ntdll`).
+/// * Hardware breakpoints (no bytes change).
+/// * A patch that is applied and reverted between two calls to this
+///   function.
 pub fn verify_text_section() -> Option<TextIntegrity> {
     let ntdll = load_ntdll()?;
     let path = module_path(ntdll)?;
@@ -292,9 +298,9 @@ pub fn verify_text_section() -> Option<TextIntegrity> {
     let disk_end = disk_start.checked_add(virtual_size)?;
     let disk_bytes = disk.get(disk_start..disk_end)?;
 
-    // SAFETY: `virtual_address` and `virtual_size` come from the PE header
-    // of a loaded module, so the resulting slice is within the module's
-    // mapped image.
+    // SAFETY: `virtual_address` and `virtual_size` come from the PE
+    // header of a loaded module, so the resulting slice is within the
+    // module's mapped image.
     let base = ntdll.0 as *const u8;
     let memory_bytes =
         unsafe { std::slice::from_raw_parts(base.add(virtual_address), virtual_size) };
@@ -326,6 +332,10 @@ pub fn verify_text_section() -> Option<TextIntegrity> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// PE helpers
+// ---------------------------------------------------------------------------
+
 /// Load `ntdll.dll` in the current process.
 fn load_ntdll() -> Option<HMODULE> {
     let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
@@ -355,7 +365,8 @@ fn module_path(module: HMODULE) -> Option<PathBuf> {
 /// Returns `(virtual_address, virtual_size, raw_file_offset)`.
 fn find_text_section(module: HMODULE) -> Option<(usize, usize, u64)> {
     // SAFETY: the offsets below are the documented PE layout. Each read is
-    // guarded by the check that the previous one produced a plausible value.
+    // guarded by the check that the previous one produced a plausible
+    // value.
     unsafe {
         let base = module.0 as *const u8;
 
@@ -456,7 +467,7 @@ impl SessionHealth {
 
 /// Query the kernel for the session's state.
 pub fn session_health(name: &str) -> Result<SessionHealth, EtwError> {
-    match crate::session::session_state(name)? {
+    match session_state(name)? {
         Some(state) => Ok(SessionHealth {
             running: true,
             real_time: state.real_time,
@@ -488,16 +499,19 @@ pub struct KernelIntegrityStatus {
     pub firmware_page_protection: bool,
 }
 
-// NtQuerySystemInformation is exported by ntdll.dll but is not in the
-// windows crate's safe bindings, so it is declared here. Rustdoc does not
-// generate documentation for extern blocks, which is why these are plain
-// `//` comments rather than `///`.
+// `NtQuerySystemInformation` is exported by `ntdll.dll` but is not in the
+// windows crate's safe bindings, so it is declared here.
 //
-// SAFETY: the caller must pass a buffer of at least `len` bytes, and `class`
-// must be a valid information class. Only class 0xA5
-// (SystemIsolatedUserModeInformation) is used by this module.
+// SAFETY: the caller must pass a buffer of at least `len` bytes, and
+// `class` must be a valid information class. Only class 0xA5
+// (`SystemIsolatedUserModeInformation`) is used by this module.
 unsafe extern "system" {
-    fn NtQuerySystemInformation(class: u32, info: *mut u8, len: u32, returned: *mut u32) -> i32;
+    fn NtQuerySystemInformation(
+        class: u32,
+        info: *mut u8,
+        len: u32,
+        returned: *mut u32,
+    ) -> i32;
 }
 
 pub fn query_kernel_integrity() -> Option<KernelIntegrityStatus> {
@@ -548,6 +562,12 @@ impl SecurityReport {
             && self.kernel.map(|k| k.hvci_enabled).unwrap_or(false)
     }
 
+    /// Every problem the report found, as sentences.
+    ///
+    /// Empty means nothing in this crate's detection surface is
+    /// complaining. Each string names the specific check that fired,
+    /// because "the sensor is broken" is not something an operator can
+    /// act on.
     pub fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
 
@@ -580,6 +600,7 @@ impl SecurityReport {
     }
 }
 
+/// The full self-check: exports, text, session, kernel.
 pub fn full_report(session_name: &str) -> SecurityReport {
     SecurityReport {
         exports: check_ntdll_exports(),
@@ -644,8 +665,7 @@ mod tests {
         assert_eq!(find_patch_in(&at_eight), Some(("xor eax, eax; ret", 8)));
 
         // Patch at offset 9, past the last window start: not caught by
-        // this matcher. The `.text` comparison catches it, and that is
-        // why both checks exist.
+        // this matcher.
         let mut at_nine = [0u8; PROLOGUE_SCAN_BYTES];
         at_nine[9..12].copy_from_slice(&[0x31, 0xC0, 0xC3]);
         assert_eq!(find_patch_in(&at_nine), None);

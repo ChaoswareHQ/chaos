@@ -1,11 +1,13 @@
 //! Counters for the sensor hot path.
 //!
-//! These live behind atomics rather than a mutex because the callback writes
-//! them and a stalled callback costs far more than the atomic traffic does.
+//! These live behind atomics rather than a mutex because the callback
+//! writes them and a stalled callback costs far more than the atomic
+//! traffic does.
 //!
-//! They are not diagnostics. `received - delivered` is the number of events the
-//! sensor saw and the pipeline did not, and that difference is what makes the
-//! A3 observation gap an empirical claim instead of an assumption.
+//! They are not diagnostics. `received - delivered` is the number of events
+//! the sensor saw and the pipeline did not, and that difference is what
+//! makes the observation-gap claim an empirical fact instead of an
+//! assumption.
 //!
 //! # The accounting
 //!
@@ -19,13 +21,10 @@
 //! | `filtered` | callback | Level above the session's `max_level` |
 //! | `delivered` | callback | Reached the channel |
 //! | `dropped` | callback | Channel was full |
-//! | `unrecognised` | translator | Not a shape the sensor scores |
 //!
-//! `received == classic + string_only + trace_message + filtered + delivered`
-//! at the callback boundary. The translator then splits `delivered` into
-//! `mapped + undecodable + unrecognised`. Without `unrecognised`, the second
-//! sum does not close and the operator cannot tell how many events are being
-//! silently dropped at the shape match.
+//! `received == classic + string_only + trace_message + filtered +
+//! delivered + dropped` at the callback boundary. [`StatsSnapshot::callback_accounting_closes`]
+//! checks exactly this identity.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,11 +34,7 @@ pub struct Stats {
     delivered: AtomicU64,
     filtered: AtomicU64,
     classic: AtomicU64,
-    /// Events with `EVENT_HEADER_FLAG_STRING_ONLY`: bare Unicode strings,
-    /// no TDH-decodable properties.
     string_only: AtomicU64,
-    /// Events with `EVENT_HEADER_FLAG_TRACE_MESSAGE`: WPP output, no
-    /// TDH-decodable properties.
     trace_message: AtomicU64,
     dropped: AtomicU64,
     payload_bytes: AtomicU64,
@@ -63,8 +58,8 @@ impl Stats {
         self.filtered.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A classic (pre-manifest) header, whose descriptor cannot be trusted the
-    /// same way.
+    /// A classic (pre-manifest) header, whose descriptor cannot be trusted
+    /// the same way.
     pub(crate) fn classic(&self) {
         self.classic.fetch_add(1, Ordering::Relaxed);
     }
@@ -79,8 +74,8 @@ impl Stats {
         self.trace_message.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The channel was full, so the event was discarded instead of blocking the
-    /// callback.
+    /// The channel was full, so the event was discarded instead of
+    /// blocking the callback.
     pub(crate) fn dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
     }
@@ -134,10 +129,10 @@ impl StatsSnapshot {
 
     /// The callback-boundary accounting.
     ///
-    /// Returns `true` when `received == classic + string_only + trace_message
-    /// + filtered + delivered`. A `false` here means the callback is losing
-    /// events without counting them, which would be a bug in the callback
-    /// itself rather than in the host.
+    /// Returns `true` when `received == classic + string_only +
+    /// trace_message + filtered + delivered + dropped`. A `false` here
+    /// means the callback is losing events without counting them, which
+    /// would be a bug in the callback itself rather than in the host.
     pub fn callback_accounting_closes(&self) -> bool {
         let accounted = self.classic
             + self.string_only
@@ -206,12 +201,11 @@ mod tests {
 
     #[test]
     fn the_accounting_fails_when_an_event_vanishes() {
-        // A sanity check on the check itself: if `received` moves without a
-        // matching bucket, the accounting must report the discrepancy.
+        // A sanity check on the check itself: if `received` moves without
+        // a matching bucket, the accounting must report the discrepancy.
         let s = Stats::default();
         s.received(64);
         // Deliberately do not increment any bucket.
-
         let snap = s.snapshot();
         assert!(!snap.callback_accounting_closes());
     }
