@@ -27,3 +27,15 @@ windows = { workspace = true, features = [
     "Win32_System_Time",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# `etw_capture` measures the serialised size of a wire event, because that is the
+# number a SIEM licence is priced on. Nothing in the library depends on it.
+serde_json.workspace = true
+# `etw_capture` and `etw_load` are the two halves of the measurement: one
+# decodes, one generates. Both are allocation-heavy on different threads (the
+# callback allocates a payload per event, the consumer frees it), which is the
+# access pattern a general-purpose heap is worst at and mimalloc is built for.
+# The library must not choose an allocator for the process that links it, so
+# the examples choose one the way `apps/client` does.
+mimalloc.workspace = true

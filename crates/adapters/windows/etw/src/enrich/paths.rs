@@ -98,9 +98,8 @@ impl DevicePaths {
                 .collect();
 
             let mut device_buffer = vec![0u16; 1024];
-            let device_len = unsafe {
-                QueryDosDeviceW(PCWSTR(drive_query.as_ptr()), Some(&mut device_buffer))
-            };
+            let device_len =
+                unsafe { QueryDosDeviceW(PCWSTR(drive_query.as_ptr()), Some(&mut device_buffer)) };
             if device_len == 0 {
                 continue;
             }
@@ -222,14 +221,8 @@ mod tests {
         mappings.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         let paths = DevicePaths { mappings };
-        assert_eq!(
-            paths.translate(r"\Device\HarddiskVolume10\foo"),
-            r"D:\foo"
-        );
-        assert_eq!(
-            paths.translate(r"\Device\HarddiskVolume1\foo"),
-            r"C:\foo"
-        );
+        assert_eq!(paths.translate(r"\Device\HarddiskVolume10\foo"), r"D:\foo");
+        assert_eq!(paths.translate(r"\Device\HarddiskVolume1\foo"), r"C:\foo");
     }
 
     #[test]
@@ -240,10 +233,7 @@ mod tests {
         // mapping by hand so it does not depend on the host's drive
         // configuration.
         let paths = DevicePaths {
-            mappings: vec![(
-                r"\Device\HarddiskVolume3".to_string(),
-                "C:".to_string(),
-            )],
+            mappings: vec![(r"\Device\HarddiskVolume3".to_string(), "C:".to_string())],
         };
 
         assert_eq!(

@@ -29,8 +29,7 @@ use crossbeam_channel::Sender;
 use model::{EventSource, ProviderId, RawEvent};
 use std::slice;
 use windows::Win32::System::Diagnostics::Etw::{
-    EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
-    EVENT_RECORD,
+    EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID, EVENT_RECORD,
 };
 use windows::core::GUID;
 
@@ -207,10 +206,9 @@ unsafe fn prepare(
     // the caller; `ctx` is installed by `EtwSession` and outlives the
     // session. The `transmute` is how we tell the borrow checker that,
     // without lying about either pointer's real lifetime.
-    Some((
-        unsafe { std::mem::transmute(rec) },
-        unsafe { std::mem::transmute(ctx) },
-    ))
+    Some((unsafe { std::mem::transmute(rec) }, unsafe {
+        std::mem::transmute(ctx)
+    }))
 }
 
 /// Pull the two extended items worth the walk: the causal parent, and the

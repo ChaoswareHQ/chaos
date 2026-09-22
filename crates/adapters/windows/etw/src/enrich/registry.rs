@@ -5,59 +5,66 @@
 //! The Windows registry has three namespaces layered on each other:
 //!
 //! * The **object manager** namespace, which is what the kernel sees:
-//!   `\REGISTRY\MACHINE\SOFTWARE\...`. Every kernel structure that names
-//!   a registry object uses this form. `SetValueKey` events carry it when
-//!   they carry a path at all.
-//!
+//!   `\REGISTRY\MACHINE\SOFTWARE\...`.
 //! * The **predefined root keys** — `HKEY_LOCAL_MACHINE`,
-//!   `HKEY_USERS`, etc. These are not paths; they are handles, and they
-//!   are the constants the Win32 API takes.
-//!
+//!   `HKEY_USERS`, etc. Handles, not paths.
 //! * The **documentation spelling** — `HKLM`, `HKU`, `HKCR`, `HKCU`,
-//!   `HKCC`, `HKPD`. These are names for the predefined handles that
-//!   appear in every registry editor, every Sysinternals tool, and every
-//!   ATT&CK rule anyone has written.
+//!   `HKCC`, `HKPD`.
 //!
-//! `HKLM` is not a path. It is the name of a handle. The kernel has never
-//! heard of it — no `StartTrace` code path parses the string `"HKLM"`,
-//! and the object manager does not maintain an alias table. The
-//! translation from `HKLM` to `\REGISTRY\MACHINE` happens in user mode,
-//! in `advapi32.dll`, before any kernel call is made.
+//! `HKLM` is not a path. It is the name of a handle. This module
+//! translates the kernel's form to the documentation form so a rule
+//! author never has to know the difference.
 //!
-//! The sensor is a kernel-side observer. Every registry path it emits
-//! from TDH comes from walking the KCB, which produces the object-manager
-//! form. Every rule author, on the other hand, writes rules in the
-//! documentation form. This module translates one to the other at the
-//! wire boundary — the same principle as `paths.rs`, applied to a fixed
-//! prefix table instead of a machine-specific one.
+//! # The boundary check
 //!
-//! # Why `HKU` and not `HKCU`
+//! `\REGISTRY\MACHINE` is a prefix of `\REGISTRY\MACHINERY`, and a bare
+//! `strip_prefix` matches both. The two are different mount points and
+//! translating the second as if it were the first produces a path that
+//! looks like `HKLMRY\Foo` — syntactically valid-looking, semantically
+//! wrong, and impossible to notice without seeing the input.
 //!
-//! `HKCU` means "the current user's hive", and the sensor does not know
-//! which user a given registry event belongs to — the SID in the path is
-//! the fact, and a rule that wants to say "the current user" has to spell
-//! out the SID or match any SID under `HKU`. Sysmon resolves it; the
-//! sensor has less context, so `HKU\<sid>` is the honest answer.
+//! [`strip_prefix_at_boundary`] is what stops the match: the prefix
+//! must be followed by a `\` separator or the end of the string.
 
 use std::borrow::Cow;
 
 /// Translate a kernel registry path to its user-facing form.
 ///
-/// Covers the three mount points that appear in practice. Anything else —
-/// a path that is already in `HKLM\...` form, or an unrecognised mount
-/// point — is returned unchanged, which is what makes this safe to call
-/// on every path regardless of origin.
+/// Covers the three mount points that appear in practice. Anything else
+/// — a path already in `HKLM\...` form, or an unrecognised mount point —
+/// is returned unchanged, which is what makes this safe to call on
+/// every path regardless of origin.
 pub fn translate(path: &str) -> Cow<'_, str> {
-    if let Some(rest) = path.strip_prefix(r"\REGISTRY\MACHINE") {
+    if let Some(rest) = strip_prefix_at_boundary(path, r"\REGISTRY\MACHINE") {
         return Cow::Owned(format!("HKLM{rest}"));
     }
-    if let Some(rest) = path.strip_prefix(r"\REGISTRY\USER") {
+    if let Some(rest) = strip_prefix_at_boundary(path, r"\REGISTRY\USER") {
         return Cow::Owned(format!("HKU{rest}"));
     }
-    if let Some(rest) = path.strip_prefix(r"\REGISTRY\WC") {
+    if let Some(rest) = strip_prefix_at_boundary(path, r"\REGISTRY\WC") {
         return Cow::Owned(format!("HKWC{rest}"));
     }
     Cow::Borrowed(path)
+}
+
+/// Strip `prefix` from `path` only when the prefix is followed by a path
+/// separator or the end of the string.
+///
+/// A bare `strip_prefix` matches `\REGISTRY\MACHINERY` against
+/// `\REGISTRY\MACHINE`, which is wrong. The boundary check is what makes
+/// the match be the prefix and not a longer name that happens to start
+/// with it.
+fn strip_prefix_at_boundary<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(prefix)?;
+    match rest.as_bytes().first() {
+        // Exact match — the path is *only* the prefix.
+        None => Some(rest),
+        // A separator follows — the prefix is a complete component.
+        Some(b'\\') => Some(rest),
+        // Something else follows — the prefix is part of a longer
+        // component and this is not the mount point we are looking for.
+        Some(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -99,10 +106,6 @@ mod tests {
 
     #[test]
     fn an_unknown_mount_point_is_unchanged() {
-        // Only the three we know about are translated. A future Windows
-        // build that adds a fourth mount point returns through this path
-        // and produces a path that is still usable, just not the
-        // documentation spelling.
         assert_eq!(
             translate(r"\REGISTRY\UNKNOWN\Foo"),
             r"\REGISTRY\UNKNOWN\Foo"
@@ -112,18 +115,26 @@ mod tests {
     #[test]
     fn the_prefix_must_match_at_a_boundary() {
         // `\REGISTRY\MACHINERY` is not `\REGISTRY\MACHINE` + `RY`. The
-        // `strip_prefix` is exact, so this is a test that it does not
-        // over-match. It would if the check were `starts_with` + slicing.
+        // boundary check is what stops the match.
         assert_eq!(
             translate(r"\REGISTRY\MACHINERY\Foo"),
             r"\REGISTRY\MACHINERY\Foo"
+        );
+        assert_eq!(
+            translate(r"\REGISTRY\USERS\Foo"),
+            r"\REGISTRY\USERS\Foo",
+            "`USERS` is not `USER`"
+        );
+        assert_eq!(
+            translate(r"\REGISTRY\WCRT\Foo"),
+            r"\REGISTRY\WCRT\Foo",
+            "`WCRT` is not `WC`"
         );
     }
 
     #[test]
     fn the_machine_prefix_without_a_trailing_backslash_is_translated() {
-        // A path that is *exactly* `\REGISTRY\MACHINE` — no subkey. Rare
-        // but legal: someone can write to the root of HKLM.
+        // A path that is *exactly* `\REGISTRY\MACHINE` — no subkey.
         assert_eq!(translate(r"\REGISTRY\MACHINE"), r"HKLM");
     }
 }

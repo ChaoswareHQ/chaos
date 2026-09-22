@@ -21,7 +21,7 @@ pub use host::{Host, HostId, OperatingSystem};
 pub use kind::{
     DnsQueryPayload, EventKind, FileCreate, FileDelete, FileRename, FileWrite, ImageLoad,
     IntegrityLevel, NetworkConnect, NetworkDisconnect, NetworkProtocol, ProcessExit, ProcessStart,
-    RegistryDelete, RegistrySet, ScriptBlock,
+    RegistryDelete, RegistrySet, ScriptBlock, TaskRegistered, WmiProcess, WmiSubscription,
 };
 pub use process::{Process, ProcessId};
 pub use redact::{redact, redact_in_place, strip_sensitive, strip_sensitive_in_place};

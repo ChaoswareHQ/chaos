@@ -15,7 +15,7 @@
 //! The example name comes from the file stem. If the file is renamed, the
 //! command changes with it.
 
-use etw::security::{ExportIntegrity, check_ntdll_exports, full_report, verify_text_section};
+use etw::{ExportIntegrity, check_ntdll_exports, full_report, verify_text_section};
 use std::ffi::c_void;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{

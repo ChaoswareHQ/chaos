@@ -8,8 +8,13 @@
 //! `UserData` into our own buffer, we rebuild a synthetic record that
 //! points at that copy, restores the descriptor fields TDH keys its
 //! schema lookup on, and hand it over. Everything else here follows from
-//! that: the decode is deferred, so it costs nothing on the hot path, and
-//! it is free to be as slow as it needs to be.
+//! that: the decode is deferred, so it costs nothing on the hot path, and it
+//! is free to be as slow as it needs to be.
+//!
+//! That is the *only* copy. The record points straight at the event's own
+//! payload for every field read, and the buffer TDH fills is the decoder's,
+//! reused field after field — see [`decoder`] for why those two matter more
+//! than they look.
 //!
 //! # Why the schema is fetched, not guessed
 //!
@@ -34,7 +39,7 @@
 //!
 //! # What is in each file
 //!
-//! * [`decoder`] — the `Decoder` type. Holds the scratch buffer, the name
+//! * [`decoder`] — the `Decoder` type. Holds the property buffer, the name
 //!   buffer, and the schema cache. The `typed_field` / `text_any` /
 //!   `u32_any` surface lives here.
 //! * [`schema`] — the `TRACE_EVENT_INFO` parse and the schema cache key.

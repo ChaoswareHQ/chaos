@@ -175,6 +175,11 @@ pub fn evaluate(event: &TelemetryEvent, facts: &Facts<'_>) -> Vec<Finding> {
         script_block_obfuscated,
         script_block_remote_fetch,
         script_block_defence_evasion,
+        wmi_process_creation,
+        wmi_permanent_subscription,
+        scheduled_task_registered,
+        unsigned_image_from_writable_location,
+        executable_dropped_in_writable_location,
     ] {
         if let Some(finding) = rule(event, facts) {
             findings.push(finding);
@@ -564,6 +569,240 @@ fn process_fanout_burst(event: &TelemetryEvent, facts: &Facts<'_>) -> Option<Fin
     })
 }
 
+/// The image a command line names, capped for an alert body.
+///
+/// The first whitespace-delimited token is the image; the rest is arguments,
+/// which is both more than an analyst needs and the part most likely to carry a
+/// credential. Quote-stripping is deliberate: `"C:\a b\x.exe" -arg` is one
+/// token that means one path.
+fn command_image(command_line: &str) -> String {
+    // `split_whitespace` already skips leading and trailing whitespace, so no
+    // `trim` is needed before it.
+    let first = command_line.split_whitespace().next().unwrap_or("");
+    let first = first.trim_matches('"');
+    const CAP: usize = 80;
+    if first.chars().count() <= CAP {
+        first.to_string()
+    } else {
+        first.chars().take(CAP).collect()
+    }
+}
+
+/// T1047: a process created through WMI.
+///
+/// WMI is the execution channel that avoids touching a shell on the target at
+/// all, so the interesting part of an id-23 event is what `WmiPrvSE.exe` was
+/// asked to run and whether the caller was remote. The tiers say that: a remote
+/// caller spawning an interpreter is the textbook shape, a local caller running
+/// something ordinary is what monitoring software does all day.
+fn wmi_process_creation(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let EventKind::WmiProcess(wmi) = &event.kind else {
+        return None;
+    };
+
+    let cmd = lower(&wmi.command_line);
+    let interpreter =
+        INTERPRETERS.iter().any(|i| cmd.contains(i)) || LOLBINS.iter().any(|l| cmd.contains(l));
+    // `is_local: None` means the manifest did not say, which is not the same
+    // fact as `Some(false)`. A named client machine is the tie-breaker.
+    let remote = wmi.is_local == Some(false)
+        || wmi
+            .client_machine
+            .as_deref()
+            .is_some_and(|m| !m.is_empty() && m != ".");
+
+    let (likelihood, reason) = match (interpreter, remote) {
+        (true, true) => (
+            evidence(0.90, 0.010),
+            "remote WMI call spawning an interpreter",
+        ),
+        (true, false) => (evidence(0.70, 0.020), "WMI call spawning an interpreter"),
+        (false, true) => (evidence(0.55, 0.015), "remote WMI process creation"),
+        (false, false) => (evidence(0.35, 0.040), "WMI process creation"),
+    };
+
+    Some(Finding {
+        rule: "wmi_process_creation",
+        technique: "T1047",
+        likelihood,
+        detail: format!("{reason}: {}", command_image(&wmi.command_line)).into(),
+    })
+}
+
+/// T1546.003: a permanent WMI event subscription.
+///
+/// The strongest single event this sensor ships, and the one whose false
+/// positives an operator has to baseline deliberately: a stock Windows host
+/// already carries a few permanent subscriptions (the SCM event-log consumer
+/// among them), so "any 5861" is not the rule. What is specific is the
+/// *consumer*: only a `CommandLineEventConsumer` or an
+/// `ActiveScriptEventConsumer` can run attacker-supplied code, and a
+/// subscription backed by one of those has almost no innocent explanation.
+fn wmi_permanent_subscription(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let EventKind::WmiSubscription(sub) = &event.kind else {
+        return None;
+    };
+
+    let consumer = lower(sub.consumer.as_deref().unwrap_or(""));
+    let runs_code = consumer.contains("commandlineeventconsumer")
+        || consumer.contains("activescripteventconsumer");
+
+    let (likelihood, detail) = if runs_code {
+        (
+            evidence(0.85, 0.008),
+            format!(
+                "permanent WMI subscription with a code-running consumer ({})",
+                command_image(sub.consumer.as_deref().unwrap_or(""))
+            ),
+        )
+    } else {
+        // No consumer, or a consumer class that cannot run a command. Still
+        // worth surfacing — a subscription that survives reboot is rare — but
+        // the host's own maintenance subscriptions live here too.
+        (
+            evidence(0.45, 0.030),
+            format!("permanent WMI subscription in {}", sub.namespace),
+        )
+    };
+
+    Some(Finding {
+        rule: "wmi_permanent_subscription",
+        technique: "T1546.003",
+        likelihood,
+        detail: detail.into(),
+    })
+}
+
+/// T1053.005: a scheduled task registered from outside the Windows namespace.
+///
+/// Task Scheduler 106 carries a task name and an account, and nothing else, so
+/// this rule is deliberately about those two things. Windows registers its own
+/// maintenance tasks under `\Microsoft\`, and a task registered anywhere else is
+/// third-party software or an attacker — which is a real distinction, and also
+/// why the baseline likelihood is modest: installers register tasks there
+/// constantly.
+fn scheduled_task_registered(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let EventKind::TaskRegistered(task) = &event.kind else {
+        return None;
+    };
+
+    let name = lower(&task.task_name);
+    if name.starts_with("\\microsoft\\") {
+        return None;
+    }
+
+    // A task outside the Windows namespace is unremarkable on its own. One
+    // *named* like a Windows component, while sitting outside the namespace
+    // Windows components live in, is the T1036 shape and is worth more.
+    //
+    // `update` is deliberately not one of the markers: Google Update, Edge
+    // Update and a dozen other benign updaters register tasks outside
+    // `\Microsoft\`, and matching on the word alone would price every one of
+    // them as a masquerade.
+    let masquerading =
+        name.contains("microsoft") || name.contains("windows") || name.contains("defender");
+
+    let (likelihood, detail) = if masquerading {
+        (
+            evidence(0.60, 0.020),
+            format!(
+                "task {} uses a Windows-sounding name outside \\Microsoft\\",
+                task.task_name
+            ),
+        )
+    } else {
+        (
+            evidence(0.40, 0.035),
+            format!("task registered: {}", task.task_name),
+        )
+    };
+
+    Some(Finding {
+        rule: "scheduled_task_registered",
+        technique: "T1053.005",
+        likelihood,
+        detail: detail.into(),
+    })
+}
+
+/// Extensions that are executable, in the sense that something on a stock host
+/// will run them when it is handed the path.
+///
+/// `.lnk` is in the list deliberately: a shortcut is how a dropper gets a user
+/// to run something, and it is the extension an analyst is most likely to miss.
+const EXECUTABLE_EXTENSIONS: &[&str] = &[
+    ".exe", ".dll", ".scr", ".sys", ".ps1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".hta",
+    ".lnk", ".wsf", ".msi", ".cpl",
+];
+
+/// T1574 behind T1055: an image with no valid signature loaded from a location
+/// any user can write to.
+///
+/// Neither half is the signal. Unsigned modules are normal — plenty of in-house
+/// and open-source software ships them — and `%LOCALAPPDATA%` is where a great
+/// deal of legitimate software installs itself per user. Together they describe
+/// the place a side-loaded or reflectively loaded image lives, which is why this
+/// is a conjunction and why the ratio is modest rather than overwhelming.
+fn unsigned_image_from_writable_location(
+    event: &TelemetryEvent,
+    _facts: &Facts<'_>,
+) -> Option<Finding> {
+    let EventKind::ImageLoad(image) = &event.kind else {
+        return None;
+    };
+    // `Some(false)` only. `None` means the host could not tell us, and silence is
+    // not evidence of a missing signature.
+    if image.signed != Some(false) {
+        return None;
+    }
+    if !in_writable_location(&image.image_path) {
+        return None;
+    }
+
+    Some(Finding {
+        rule: "unsigned_image_from_writable_location",
+        technique: "T1574.002",
+        likelihood: evidence(0.42, 0.030),
+        detail: format!("unsigned image loaded from {}", image.image_path).into(),
+    })
+}
+
+/// T1105: a file with an executable extension written to a location any user can
+/// write to.
+///
+/// This is the shape that makes `file_create` worth shipping at all. It is
+/// deliberately weak — installers drop executables into `%TEMP%` and `%APPDATA%`
+/// constantly, and this fires on every one of them — so it is the kind of
+/// evidence the engine counts rather than the kind it alerts on alone. One of
+/// these next to a process start from the same path is a different story, and
+/// that is the point: the rule reports a fact, and the conjunction is the
+/// engine's job.
+fn executable_dropped_in_writable_location(
+    event: &TelemetryEvent,
+    _facts: &Facts<'_>,
+) -> Option<Finding> {
+    let EventKind::FileCreate(file) = &event.kind else {
+        return None;
+    };
+    let path = lower(&file.path);
+    if !EXECUTABLE_EXTENSIONS.iter().any(|e| path.ends_with(e)) {
+        return None;
+    }
+    // The check is on the original path, not the lowercased one, because the
+    // markers are case-sensitive path fragments and `lower` is only for the
+    // extension test above.
+    if !in_writable_location(&file.path) {
+        return None;
+    }
+
+    Some(Finding {
+        rule: "executable_dropped_in_writable_location",
+        technique: "T1105",
+        likelihood: evidence(0.35, 0.040),
+        detail: format!("executable written to {}", file.path).into(),
+    })
+}
+
 /// A human name for a rule, for an alert title.
 ///
 /// Deliberately not the rule id. The alert table already carries the technique
@@ -584,6 +823,11 @@ pub fn rule_title(rule: &str) -> &'static str {
         "script_block_obfuscated" => "PowerShell script that decodes itself",
         "script_block_remote_fetch" => "PowerShell script fetching from the network",
         "script_block_defence_evasion" => "PowerShell script touching the defences",
+        "wmi_process_creation" => "Process created through WMI",
+        "wmi_permanent_subscription" => "Permanent WMI event subscription",
+        "scheduled_task_registered" => "Scheduled task registered outside the Windows namespace",
+        "unsigned_image_from_writable_location" => "Unsigned image loaded from a writable location",
+        "executable_dropped_in_writable_location" => "Executable written to a writable location",
         _ => "Suspicious activity",
     }
 }
@@ -621,6 +865,8 @@ mod tests {
             started_at: chrono::Utc::now(),
             image_hash: None,
             integrity_level: None,
+            is_wow64: false,
+            parent_image: None,
         }))
     }
 
@@ -638,6 +884,64 @@ mod tests {
             message_number: Some(1),
             message_total: Some(1),
             recorded_at: chrono::Utc::now(),
+        }))
+    }
+
+    /// A WMI-initiated process, as the sensor would build one from id 23.
+    fn wmi_process(
+        command_line: &str,
+        is_local: Option<bool>,
+        client_machine: Option<&str>,
+    ) -> TelemetryEvent {
+        event(EventKind::WmiProcess(model::WmiProcess {
+            pid: ProcessId::new(4242),
+            command_line: command_line.into(),
+            user: None,
+            client_pid: Some(ProcessId::new(900)),
+            client_machine: client_machine.map(Into::into),
+            is_local,
+            created_at: chrono::Utc::now(),
+        }))
+    }
+
+    /// A permanent WMI subscription, as the sensor would build one from 5861.
+    fn wmi_subscription(consumer: Option<&str>) -> TelemetryEvent {
+        event(EventKind::WmiSubscription(model::WmiSubscription {
+            namespace: "root\\subscription".into(),
+            event_filter: "SELECT * FROM __InstanceModificationEvent".into(),
+            consumer: consumer.map(Into::into),
+            recorded_at: chrono::Utc::now(),
+        }))
+    }
+
+    /// A task registration, as the sensor would build one from 106.
+    fn task_registered(name: &str) -> TelemetryEvent {
+        event(EventKind::TaskRegistered(model::TaskRegistered {
+            task_name: name.into(),
+            user: Some("SYSTEM".into()),
+            recorded_at: chrono::Utc::now(),
+        }))
+    }
+
+    /// A file creation, as the sensor would build one from Kernel-File 12.
+    fn file_create(path: &str) -> TelemetryEvent {
+        event(EventKind::FileCreate(model::FileCreate {
+            pid: ProcessId::new(100),
+            path: path.into(),
+            created_at: chrono::Utc::now(),
+        }))
+    }
+
+    /// A module load, as the sensor would build one from Kernel-Process 5.
+    fn image_load(path: &str, signed: Option<bool>) -> TelemetryEvent {
+        event(EventKind::ImageLoad(model::ImageLoad {
+            pid: ProcessId::new(100),
+            image_path: path.into(),
+            image_hash: None,
+            signed,
+            signer: None,
+            loaded_at: chrono::Utc::now(),
+            is_wow64: false,
         }))
     }
 
@@ -911,6 +1215,15 @@ mod tests {
             "high_abuse_tld",
             "novel_binary_in_writable_location",
             "process_fanout_burst",
+            "script_block_encoded_command",
+            "script_block_obfuscated",
+            "script_block_remote_fetch",
+            "script_block_defence_evasion",
+            "wmi_process_creation",
+            "wmi_permanent_subscription",
+            "scheduled_task_registered",
+            "unsigned_image_from_writable_location",
+            "executable_dropped_in_writable_location",
         ];
         for rule in RULES {
             let title = rule_title(rule);
@@ -958,5 +1271,180 @@ mod tests {
             rule_names(&evaluate(&novel_tmp, &novel_temp))
                 .contains(&"novel_binary_in_writable_location")
         );
+    }
+
+    #[test]
+    fn a_remote_wmi_call_spawning_an_interpreter_is_the_loudest_wmi_shape() {
+        // T1047's textbook form: no shell on the target, spawned from off-box.
+        let remote_shell = wmi_process(
+            "cmd.exe /c powershell -nop -w hidden -enc SQBFAFgA",
+            Some(false),
+            Some("ws-042.corp.example"),
+        );
+        let strong = evaluate(&remote_shell, &Facts::default());
+        assert_eq!(rule_names(&strong), vec!["wmi_process_creation"]);
+        assert_eq!(strong[0].technique, "T1047");
+
+        // The same command locally is still WMI, but not the remote shape.
+        let local_shell = wmi_process("cmd.exe /c whoami", Some(true), None);
+        let weaker = evaluate(&local_shell, &Facts::default());
+        assert!(
+            weaker[0].likelihood.log_ratio() < strong[0].likelihood.log_ratio(),
+            "a local caller must not score the same as a remote one"
+        );
+    }
+
+    #[test]
+    fn every_wmi_process_creation_is_reported_at_some_strength() {
+        // Even the blandest local call is a WMI process creation, and the shape
+        // exists so that fact is on the wire. The rule says so quietly rather
+        // than staying silent: monitoring software runs this all day, which is
+        // why the tier is weak and not why it is absent.
+        let managed = wmi_process(
+            "C:\\Windows\\System32\\wbem\\WmiPrvSE.exe //.\\root:__Namespace",
+            Some(true),
+            None,
+        );
+        let findings = evaluate(&managed, &Facts::default());
+        assert_eq!(rule_names(&findings), vec!["wmi_process_creation"]);
+        assert!(findings[0].likelihood.log_ratio() < 3.0, "must stay weak");
+
+        // The alert detail names the image and not the whole command line.
+        assert!(findings[0].detail.contains("WmiPrvSE.exe"));
+    }
+
+    #[test]
+    fn a_subscription_whose_consumer_runs_code_is_strong_evidence() {
+        // This is the rule the whole WMI shape exists for: a consumer that can
+        // run a command survives reboot with no process to find.
+        let command = wmi_subscription(Some("CommandLineEventConsumer.Name=\"Updater\""));
+        let findings = evaluate(&command, &Facts::default());
+        assert_eq!(rule_names(&findings), vec!["wmi_permanent_subscription"]);
+        assert_eq!(findings[0].technique, "T1546.003");
+        assert!(findings[0].likelihood.log_ratio() > 4.0, "must be strong");
+
+        let script = wmi_subscription(Some("ActiveScriptEventConsumer.Name=\"Persist\""));
+        assert!(
+            evaluate(&script, &Facts::default())[0]
+                .likelihood
+                .log_ratio()
+                > 4.0
+        );
+    }
+
+    #[test]
+    fn a_hosts_own_maintenance_subscription_is_reported_but_weakly() {
+        // Windows ships permanent subscriptions of its own, and a rule that
+        // screamed on them equally would be turned off on the first host it
+        // met. The distinction is the consumer class, and the tiers price it.
+        let builtin = wmi_subscription(Some(
+            "NTEventLogEventConsumer.Name=\"SCM Event Log Consumer\"",
+        ));
+        let weak = evaluate(&builtin, &Facts::default());
+        assert_eq!(rule_names(&weak), vec!["wmi_permanent_subscription"]);
+
+        let code_consumer = wmi_subscription(Some("CommandLineEventConsumer.Name=\"Updater\""));
+        let strong = evaluate(&code_consumer, &Facts::default());
+        assert!(
+            strong[0].likelihood.log_ratio() > weak[0].likelihood.log_ratio() * 1.5,
+            "a code-running consumer must outrank a log consumer by a lot"
+        );
+
+        // A subscription with no consumer at all is still worth shipping, but
+        // it is not the strong tier.
+        let anonymous = evaluate(&wmi_subscription(None), &Facts::default());
+        assert_eq!(rule_names(&anonymous), vec!["wmi_permanent_subscription"]);
+    }
+
+    #[test]
+    fn windows_own_scheduled_tasks_stay_quiet() {
+        for quiet in [
+            "\\Microsoft\\Windows\\UpdateOrchestrator\\Schedule Scan",
+            "\\Microsoft\\Windows\\Defrag\\ScheduledDefrag",
+            "\\Microsoft\\Windows\\CertificateServicesClient\\SystemTask",
+        ] {
+            let findings = evaluate(&task_registered(quiet), &Facts::default());
+            assert!(findings.is_empty(), "{quiet} must stay quiet");
+        }
+    }
+
+    #[test]
+    fn a_task_masquerading_as_a_windows_component_scores_above_a_plain_one() {
+        // Both are registered outside the Windows namespace, so both are worth
+        // reporting; only one of them is named as though it belonged there.
+        let plain = evaluate(
+            &task_registered("\\Acme Corp App\\AcmeAgent"),
+            &Facts::default(),
+        );
+        let masquerade = evaluate(
+            &task_registered("\\MicrosoftEdgeUpdate\\MicrosoftUpdate"),
+            &Facts::default(),
+        );
+
+        assert_eq!(rule_names(&plain), vec!["scheduled_task_registered"]);
+        assert_eq!(rule_names(&masquerade), vec!["scheduled_task_registered"]);
+        assert!(
+            masquerade[0].likelihood.log_ratio() > plain[0].likelihood.log_ratio(),
+            "a Windows-sounding name outside the namespace must score higher"
+        );
+    }
+
+    #[test]
+    fn an_executable_drop_is_reported_only_for_executable_extensions() {
+        // The whole reason `file_create` has a rule: without an extension and a
+        // location test it would fire on every file the host ever writes.
+        let dropped = evaluate(
+            &file_create("C:\\Users\\alice\\AppData\\Local\\Temp\\invoice.exe"),
+            &Facts::default(),
+        );
+        assert_eq!(
+            rule_names(&dropped),
+            vec!["executable_dropped_in_writable_location"]
+        );
+        assert_eq!(dropped[0].technique, "T1105");
+
+        // A document in the same directory is not an executable drop.
+        assert!(
+            evaluate(
+                &file_create("C:\\Users\\alice\\AppData\\Local\\Temp\\invoice.pdf"),
+                &Facts::default()
+            )
+            .is_empty()
+        );
+
+        // An executable outside a writable location — an update landing in
+        // Program Files — is not the shape either.
+        assert!(
+            evaluate(
+                &file_create("C:\\Program Files\\Acme\\acme.exe"),
+                &Facts::default()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unsigned_image_needs_both_halves_to_fire() {
+        let writable = "C:\\Users\\alice\\AppData\\Local\\Acme\\helper.dll";
+        let system = "C:\\Windows\\System32\\amsi.dll";
+
+        // Unsigned *and* in a writable location: the shape.
+        let both = evaluate(&image_load(writable, Some(false)), &Facts::default());
+        assert_eq!(
+            rule_names(&both),
+            vec!["unsigned_image_from_writable_location"]
+        );
+
+        // Signed, in the same place: normal per-user software.
+        assert!(evaluate(&image_load(writable, Some(true)), &Facts::default()).is_empty());
+
+        // Unsigned, but in System32: a system image the host cannot vouch for is
+        // someone else's problem, not this rule's.
+        assert!(evaluate(&image_load(system, Some(false)), &Facts::default()).is_empty());
+
+        // Unknown signature must not be read as unsigned. Silence is not
+        // evidence, and the difference is the whole reason `signed` is an
+        // `Option` rather than a `bool`.
+        assert!(evaluate(&image_load(writable, None), &Facts::default()).is_empty());
     }
 }

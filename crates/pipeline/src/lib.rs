@@ -878,6 +878,8 @@ mod tests {
                 started_at: chrono::Utc::now(),
                 image_hash: None,
                 integrity_level: None,
+                is_wow64: false,
+                parent_image: None,
             }),
             Payload::new(Value::Null).unwrap(),
         )

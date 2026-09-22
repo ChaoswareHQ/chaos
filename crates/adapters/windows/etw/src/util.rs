@@ -7,8 +7,7 @@ pub fn format_guid(guid: &GUID) -> String {
     let b = guid.data4;
     format!(
         "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
-        guid.data1, guid.data2, guid.data3,
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
+        guid.data1, guid.data2, guid.data3, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
     )
 }
 

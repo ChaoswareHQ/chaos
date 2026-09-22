@@ -319,11 +319,7 @@ const WINTRUST_ACTION_GENERIC_VERIFY_V2: GUID =
 
 #[link(name = "wintrust")]
 unsafe extern "system" {
-    fn WinVerifyTrust(
-        hwnd: isize,
-        action_id: *const GUID,
-        data: *mut core::ffi::c_void,
-    ) -> i32;
+    fn WinVerifyTrust(hwnd: isize, action_id: *const GUID, data: *mut core::ffi::c_void) -> i32;
 }
 
 fn hex(bytes: &[u8]) -> String {

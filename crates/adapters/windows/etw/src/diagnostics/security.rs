@@ -30,9 +30,7 @@ use crate::boundary::session::session_state;
 use crate::error::EtwError;
 use std::path::PathBuf;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::System::LibraryLoader::{
-    GetModuleFileNameW, GetModuleHandleW, GetProcAddress,
-};
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
 use windows::core::{PCSTR, PCWSTR};
 
@@ -506,12 +504,7 @@ pub struct KernelIntegrityStatus {
 // `class` must be a valid information class. Only class 0xA5
 // (`SystemIsolatedUserModeInformation`) is used by this module.
 unsafe extern "system" {
-    fn NtQuerySystemInformation(
-        class: u32,
-        info: *mut u8,
-        len: u32,
-        returned: *mut u32,
-    ) -> i32;
+    fn NtQuerySystemInformation(class: u32, info: *mut u8, len: u32, returned: *mut u32) -> i32;
 }
 
 pub fn query_kernel_integrity() -> Option<KernelIntegrityStatus> {

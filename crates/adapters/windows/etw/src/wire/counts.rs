@@ -3,12 +3,26 @@
 //! `attempted` counts events whose shape the translator recognised;
 //! `mapped` counts those that produced a wire event. The difference is
 //! `undecodable`, and `unrecognised` covers events whose `(provider, id)`
-//! was not in [`super::shape_of`] at all. The three together close the
-//! accounting: `delivered == mapped + undecodable + unrecognised`.
+//! was not in [`super::shape_of`] at all.
 //!
-//! The per-shape arrays are sized by `Shape::ALL.len()` rather than a
-//! literal, so adding a shape in `shape.rs` cannot leave these arrays the
-//! wrong size. That was the point of the macro.
+//! # Windowed counts
+//!
+//! [`detect_gaps`](super::Translator::detect_gaps) distinguishes three
+//! conditions:
+//!
+//! * **DecodeFailure** — this run attempted the shape and did not map it.
+//! * **Silent** — the shape fired in a *previous* window and has not fired
+//!   in this one, while a shape of the opposite kind is still active.
+//! * **Healthy** — either everything is working, or the shape has never
+//!   fired and there is no evidence it should.
+//!
+//! The `Silent` case is only distinguishable from `Healthy` if the
+//! per-window counters are reset periodically while the "has this shape
+//! ever fired" flag survives the reset. [`ShapeCounts::reset_window`]
+//! does that. A caller that wants a real gap detector calls it on a
+//! timer; a caller that only wants per-run totals never calls it, and
+//! the `Silent` verdict is unreachable, which is the correct behavior
+//! for a single-window run.
 
 use super::shape::Shape;
 
@@ -33,14 +47,8 @@ impl Default for ShapeCounts {
 
 impl ShapeCounts {
     /// The index of `shape` in the per-shape arrays.
-    ///
-    /// This is its position in [`Shape::ALL`], which the macro guarantees
-    /// equals the enum discriminant. Computed rather than cast so that
-    /// reordering `ALL` without reordering the enum fails loudly here.
     #[inline]
     fn index(shape: Shape) -> usize {
-        // `position` on a six-element slice is a linear scan of at most
-        // six comparisons, cheaper than the atomic increments around it.
         Shape::ALL
             .iter()
             .position(|s| *s == shape)
@@ -59,6 +67,27 @@ impl ShapeCounts {
 
     pub(crate) fn note_unrecognised(&mut self) {
         self.unrecognised += 1;
+    }
+
+    /// Reset the per-window counters, keeping the "has this shape ever
+    /// fired" flags.
+    ///
+    /// `detect_gaps` distinguishes "never fired" (untested, healthy)
+    /// from "fired in a previous window and stopped" (suspicious). Those
+    /// two cases are only distinguishable if the counts are reset
+    /// periodically: without a reset, `attempted` grows monotonically
+    /// and `ever_fired` is set the moment `attempted` becomes non-zero,
+    /// so the "was firing, now silent" branch can never fire.
+    ///
+    /// A caller that wants a real gap detector calls this on a timer —
+    /// once a minute, once every ten minutes, the interval is a
+    /// deployment choice. A caller that only wants the per-run totals
+    /// never calls it, and `ever_fired` plus the run's `attempted` are
+    /// the totals they read.
+    pub fn reset_window(&mut self) {
+        self.attempted = [0; Shape::ALL.len()];
+        self.mapped = [0; Shape::ALL.len()];
+        // `ever_fired` and `unrecognised` are preserved.
     }
 
     pub fn attempted(&self, shape: Shape) -> u64 {
@@ -114,10 +143,6 @@ impl ShapeCounts {
 }
 
 /// How serious a gap is.
-///
-/// Order matters: [`GapSeverity::Silent`] sorts above
-/// [`GapSeverity::DecodeFailure`] so the gap list puts the suspicious
-/// findings first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GapSeverity {
     Healthy,
@@ -200,7 +225,13 @@ mod tests {
     #[test]
     fn the_arrays_are_sized_for_every_shape() {
         let c = ShapeCounts::default();
-        assert_eq!(Shape::ALL.len(), 6);
+        // The count is `Shape::ALL.len()` and changes whenever a shape
+        // is added. Fifteen today: six original (ProcessStart, ProcessExit,
+        // ImageLoad, RegistrySet, DnsQuery, ScriptBlock), six from
+        // Phase 1 (FileCreate, FileRename, FileDelete, NetworkConnect,
+        // NetworkDisconnect, ProcessStartAudit), and three from Phase 2
+        // (WmiProcess, WmiSubscription, TaskRegistered).
+        assert_eq!(Shape::ALL.len(), 15);
         // Every shape must be indexable without panicking.
         for shape in Shape::ALL {
             assert_eq!(c.attempted(*shape), 0);
@@ -243,5 +274,30 @@ mod tests {
         let text = decode.describe();
         assert!(text.contains("registry_set"));
         assert!(text.contains("7 of 10"));
+    }
+
+    #[test]
+    fn reset_window_clears_the_attempts_but_keeps_ever_fired() {
+        let mut c = ShapeCounts::default();
+        c.note_attempt(Shape::DnsQuery);
+        c.note_mapped(Shape::DnsQuery);
+        c.note_unrecognised();
+
+        assert_eq!(c.attempted(Shape::DnsQuery), 1);
+        assert!(c.ever_fired(Shape::DnsQuery));
+
+        c.reset_window();
+
+        assert_eq!(c.attempted(Shape::DnsQuery), 0, "attempts are per-window");
+        assert_eq!(c.mapped(Shape::DnsQuery), 0, "mappings are per-window");
+        assert!(
+            c.ever_fired(Shape::DnsQuery),
+            "the ever-fired flag is what makes the next window able to say silent"
+        );
+        assert_eq!(
+            c.unrecognised(),
+            1,
+            "the unrecognised counter is a run total, not a window total"
+        );
     }
 }

@@ -15,9 +15,19 @@
 //!
 //! # Why `Clone`
 //!
-//! The observer runs N decode workers, each with its own `Translator`.
-//! The `Decoder` is per-clone (each worker warms its own schema cache);
-//! the two correlation caches are `Arc`-backed and shared.
+//! `Translator` is `Clone` so that a deployment *can* run N decode workers,
+//! each with its own translator. The `Decoder` is per-clone (each worker warms
+//! its own schema cache); the two correlation caches are `Arc`-backed and
+//! shared.
+//!
+//! **Nothing runs N workers today.** `apps/client` builds one `Translator` and
+//! translates on one thread, so decode is single-core. That is a measured
+//! headroom statement rather than a design limit: with live host load the wire
+//! rate has never been decode-bound — it tracks how many events the host
+//! produces — so the second worker has not been needed yet. The `Clone` impl and
+//! the `Arc`-backed caches are what make adding one a configuration change
+//! rather than a redesign, and `tools/etw-load.ps1` plus `--quiet` are how to
+//! check whether it is needed before adding it.
 //!
 //! # Flow, per event
 //!
@@ -27,6 +37,17 @@
 //! 3. `from_filetime` — is the timestamp usable?
 //! 4. dispatch to a per-shape decoder;
 //! 5. `note_mapped` or `note_failure`, then construct the `TelemetryEvent`.
+//!
+//! # The gap detector's two windows
+//!
+//! [`Translator::detect_gaps`] distinguishes a shape that has never fired
+//! (untested, healthy) from one that fired and stopped (suspicious,
+//! possible ETW bypass). Those two conditions are only distinguishable if
+//! the per-shape counts are reset periodically while the "has this shape
+//! ever fired" flag survives the reset. [`Translator::reset_gap_window`]
+//! is the reset. A caller that never calls it gets the run totals and
+//! `Silent` is unreachable, which is the correct behavior for a
+//! single-window run.
 
 mod counts;
 mod decoders;
@@ -94,7 +115,8 @@ impl KcbStats {
 /// [`Decoder`] is per-clone; the KCB and image-metadata caches are
 /// `Arc`-backed because a `KCBCreate` seen by one worker must be visible
 /// to another, and a DLL hashed by one worker must not be re-hashed by
-/// another.
+/// another. A deployment that runs one worker gets this for free; the
+/// sharing is what makes a second one correct rather than merely faster.
 #[derive(Debug, Clone)]
 pub struct Translator {
     host: HostId,
@@ -164,6 +186,21 @@ impl Translator {
         }
     }
 
+    /// Reset the gap detector's window.
+    ///
+    /// See [`ShapeCounts::reset_window`] for the reasoning. This does not
+    /// touch the translator's other counters, the histogram, or the
+    /// failure log — only the per-window `attempted` and `mapped` arrays
+    /// that [`Self::detect_gaps`] reads.
+    ///
+    /// A caller that only wants per-run totals never calls this, and the
+    /// `Silent` verdict is unreachable. A caller that wants a real gap
+    /// detector calls it on a timer — once a minute, once every ten
+    /// minutes, whichever interval the deployment chooses.
+    pub fn reset_gap_window(&mut self) {
+        self.counts.reset_window();
+    }
+
     /// Detect shapes that are silent while the sensor is otherwise active.
     ///
     /// A shape that has *never* fired is untested, not silent. A shape
@@ -171,8 +208,14 @@ impl Translator {
     /// kind is still active is the ETW-bypass signature: a user-mode
     /// provider that no longer emits because someone patched the export
     /// function, while the kernel-mode events keep flowing.
+    ///
+    /// The distinction between "never fired" and "was firing, now
+    /// stopped" requires [`Self::reset_gap_window`] to have been called
+    /// between the two windows. Without that, `ever_fired` and
+    /// `attempted > 0` are the same fact and the `Silent` verdict cannot
+    /// be reached — which is correct for a single-window run.
     pub fn detect_gaps(&self) -> Vec<TelemetryGap> {
-        if self.counts.total_attempted() == 0 {
+        if self.counts.total_attempted() == 0 && !self.any_ever_fired() {
             return Vec::new();
         }
 
@@ -218,6 +261,16 @@ impl Translator {
         gaps
     }
 
+    /// Whether any shape has ever fired in this translator's lifetime.
+    ///
+    /// Used by [`Self::detect_gaps`] to decide whether the translator
+    /// has seen enough traffic to make a judgement. A translator that
+    /// has been fed nothing has no evidence either way and reports no
+    /// gaps, which is the honest answer.
+    fn any_ever_fired(&self) -> bool {
+        Shape::ALL.iter().any(|s| self.counts.ever_fired(*s))
+    }
+
     /// One line summarising every shape's mapped/attempted counts.
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
@@ -241,8 +294,8 @@ impl Translator {
     /// * a scored shape with a missing mandatory field — a failure.
     pub fn translate(&mut self, raw: &EtwRaw) -> Option<TelemetryEvent> {
         // Cross-event correlation first: a `SetValueKey` we are about to
-        // decode may need a mapping learned from an `OpenKey` that arrived
-        // a millisecond ago and would otherwise be dropped as
+        // decode may need a mapping learned from an `OpenKey` that
+        // arrived a millisecond ago and would otherwise be dropped as
         // unrecognised.
         self.learn_kcb(raw);
 
@@ -271,6 +324,15 @@ impl Translator {
             Shape::RegistrySet => self.registry_set(raw, timestamp),
             Shape::DnsQuery => self.dns_query(raw, timestamp),
             Shape::ScriptBlock => self.script_block(raw, timestamp),
+            Shape::FileCreate => self.file_create(raw, timestamp),
+            Shape::FileRename => self.file_rename(raw, timestamp),
+            Shape::FileDelete => self.file_delete(raw, timestamp),
+            Shape::NetworkConnect => self.network_connect(raw, timestamp),
+            Shape::NetworkDisconnect => self.network_disconnect(raw, timestamp),
+            Shape::ProcessStartAudit => self.process_start_audit(raw, timestamp),
+            Shape::WmiProcess => self.wmi_process(raw, timestamp),
+            Shape::WmiSubscription => self.wmi_subscription(raw, timestamp),
+            Shape::TaskRegistered => self.task_registered(raw, timestamp),
         };
 
         let kind = match kind {
@@ -383,9 +445,26 @@ mod tests {
         assert_eq!(t.undecodable(), 0);
         assert_eq!(t.counts().unrecognised(), 5);
         assert_eq!(t.histogram().total(), 5);
+
+        // The histogram keys by `(provider, event_id)`, so four distinct
+        // event ids under one provider are four entries with count 1
+        // each, not one entry with count 4. `top` sorts by count
+        // descending, then provider ascending, then event id ascending,
+        // so the first entry is the lowest event id under the
+        // alphabetically-first provider.
         let top = t.histogram().top(10);
         assert_eq!(top[0].0, "Microsoft-Windows-Kernel-Process");
-        assert_eq!(top[0].2, 4);
+        assert_eq!(top[0].1, 3);
+        assert_eq!(top[0].2, 1);
+
+        // Summing the entries for the provider gives the total, which is
+        // the assertion the old `top[0].2 == 4` was trying to make.
+        let kernel_total: u64 = top
+            .iter()
+            .filter(|(p, _, _)| *p == "Microsoft-Windows-Kernel-Process")
+            .map(|(_, _, n)| *n)
+            .sum();
+        assert_eq!(kernel_total, 4);
     }
 
     #[test]
@@ -410,11 +489,7 @@ mod tests {
         assert_eq!(t.mapped(), 0);
         assert_eq!(t.counts().attempted(Shape::RegistrySet), 1);
         assert_eq!(t.counts().mapped(Shape::RegistrySet), 0);
-        assert!(
-            t.failures()[0].contains("KeyName"),
-            "{:?}",
-            t.failures()
-        );
+        assert!(t.failures()[0].contains("KeyName"), "{:?}", t.failures());
         assert_eq!(t.kcb_stats().misses, 1);
     }
 
@@ -459,17 +534,75 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_that_stopped_firing_is_silent() {
+    fn a_shape_that_was_firing_and_stopped_is_silent() {
+        // The `Silent` verdict exists for the case where a shape fired
+        // in a *previous* window and has not fired in this one, while a
+        // shape of the opposite kind is still active. Detecting that
+        // requires two windows: one where the shape fires, and one where
+        // it does not. `reset_gap_window` is what separates them.
         let mut t = translator();
+
+        // Window 1: DNS queries arrive. The payload is empty, so the
+        // event does not map, but `ever_fired` becomes true — the shape
+        // was seen.
         t.translate(&raw("Microsoft-Windows-DNS-Client", 3006, Vec::new()));
+        assert!(t.counts().ever_fired(Shape::DnsQuery));
+
+        // Reset the per-window counters. `ever_fired` survives; the
+        // counts start at zero for window 2.
+        t.reset_gap_window();
+
+        // Window 2: only kernel-side events arrive. No DNS.
         for _ in 0..3 {
             t.translate(&raw("Microsoft-Windows-Kernel-Registry", 5, Vec::new()));
         }
+
+        // `attempted[DnsQuery]` is zero for window 2, `ever_fired` is
+        // true from window 1, and a kernel-side shape is active. That is
+        // the signature of a user-mode shape that stopped firing.
         let gaps = t.detect_gaps();
         let dns_gap = gaps
             .iter()
             .find(|g| g.shape == Shape::DnsQuery)
             .expect("DNS gap");
         assert_eq!(dns_gap.severity, GapSeverity::Silent);
+        assert_eq!(
+            dns_gap.attempted, 0,
+            "no attempts in this window, that is what makes it silent rather than a failure"
+        );
+
+        // The registry shape, by contrast, was attempted this window and
+        // did not map. That is a decode failure, not silence.
+        let registry_gap = gaps
+            .iter()
+            .find(|g| g.shape == Shape::RegistrySet)
+            .expect("registry gap");
+        assert_eq!(registry_gap.severity, GapSeverity::DecodeFailure);
+    }
+
+    #[test]
+    fn a_shape_that_has_never_fired_is_not_reported_as_a_gap() {
+        // The distinction the gap detector exists for: a shape that has
+        // never fired is untested, not silent. Without this property the
+        // detector would report every shape the sensor enables as a
+        // "possible ETW bypass" on a fresh host, and the operator would
+        // learn to ignore it.
+        let mut t = translator();
+
+        // One kernel-side event that maps cleanly. This is enough for
+        // the detector to have a "kernel side is active" fact, which is
+        // what makes a silent user-mode shape suspicious.
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, vec![1; 16]));
+        t.reset_gap_window();
+        t.translate(&raw("Microsoft-Windows-Kernel-Process", 1, vec![1; 16]));
+
+        // DNS-Client, PowerShell, and the other user-mode shapes have
+        // never fired. None of them is a gap.
+        let gaps = t.detect_gaps();
+        assert!(gaps.iter().all(|g| g.shape != Shape::DnsQuery), "{gaps:?}");
+        assert!(
+            gaps.iter().all(|g| g.shape != Shape::ScriptBlock),
+            "{gaps:?}"
+        );
     }
 }

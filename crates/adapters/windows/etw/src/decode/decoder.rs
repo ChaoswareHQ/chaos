@@ -4,11 +4,25 @@
 //!
 //! One `Decoder` per decode thread. It holds:
 //!
-//! * A scratch buffer, reused for every TDH call, so a run of events
+//! * A name buffer, reused for every TDH call, so a run of events
 //!   sharing a schema does not allocate per field.
-//! * A name buffer, similarly reused.
+//! * A property buffer, likewise reused. It is the buffer TDH fills; the
+//!   caller gets a borrow of it rather than an owned copy, because the
+//!   next field read overwrites it and nobody wants both.
 //! * A schema cache, so a field's declared type is fetched once per
 //!   `(provider, event id, version)` rather than guessed per event.
+//!
+//! # Why the payload is not copied
+//!
+//! TDH addresses a property by name and walks the payload to find it, which
+//! means every field read needs a record whose `UserData` points at the
+//! event's bytes. Those bytes live in the caller's [`EtwRaw`], which
+//! outlives the call, so the record is pointed straight at them. The
+//! `*const` → `*mut` cast is the C API's shape (`UserData` is `*mut c_void`)
+//! and not a promise to write: `TdhGetProperty` and `TdhGetEventInformation`
+//! read the payload and nothing else. Copying it into a scratch buffer once
+//! per field was the previous shape of this module, and it was pure
+//! traffic: a decode reads several fields per event.
 //!
 //! # Why `Clone`
 //!
@@ -22,11 +36,11 @@
 //!
 //! `Decoder` is not `Sync`. It holds mutable buffers that are reused
 //! across calls, and two threads calling `text_any` on the same `Decoder`
-//! at the same time would trample each other's scratch. It is `Send`, so
+//! at the same time would trample each other's buffers. It is `Send`, so
 //! it can be moved to a worker thread, but not shared across threads.
 
 use super::schema::{Schema, SchemaKey, load_schema};
-use super::value::{FieldType, FieldValue, classify, classify_typed, render_text};
+use super::value::{FieldType, FieldValue, classify, classify_typed, hex, render_text};
 use crate::boundary::callback::EtwRaw;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -44,8 +58,11 @@ pub const MAX_FIELD_BYTES: usize = 4096;
 
 #[derive(Debug, Default, Clone)]
 pub struct Decoder {
-    scratch: Vec<u8>,
     name: Vec<u16>,
+    /// TDH's output buffer for the field being read. Reused, so a decode
+    /// that reads six fields allocates once for the decoder's lifetime
+    /// rather than six times per event.
+    prop: Vec<u8>,
     schemas: HashMap<SchemaKey, Schema>,
 }
 
@@ -70,7 +87,7 @@ impl Decoder {
     pub fn typed_field(&mut self, raw: &EtwRaw, name: &str) -> Option<(FieldValue, FieldType)> {
         let ty = self.declared_type(raw, name)?;
         let bytes = self.raw_property(raw, name)?;
-        Some((classify_typed(&bytes, ty), ty))
+        Some((classify_typed(bytes, ty), ty))
     }
 
     /// Read a property as an owned value, classifying it by byte width.
@@ -81,7 +98,7 @@ impl Decoder {
     /// prefer [`Self::typed_field`] where the type is not obvious.
     pub fn field(&mut self, raw: &EtwRaw, name: &str) -> Option<FieldValue> {
         let bytes = self.raw_property(raw, name)?;
-        Some(classify(&bytes))
+        Some(classify(bytes))
     }
 
     /// Look up the declared type of `property` in the event's schema.
@@ -105,12 +122,7 @@ impl Decoder {
         let schema = match self.schemas.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                // The scratch is repopulated below for the property call;
-                // building it here and again there is the one place this
-                // happens twice, and it is only on a schema's first event.
-                self.scratch.clear();
-                self.scratch.extend_from_slice(&raw.wire.data);
-                let record = synthetic_record(raw, self.scratch.as_mut_ptr());
+                let record = synthetic_record(raw, payload_pointer(raw));
                 // SAFETY: `record` is a valid synthetic record for the
                 // duration of this scope, and `load_schema` does not
                 // retain it.
@@ -121,17 +133,23 @@ impl Decoder {
         if schema.unresolvable {
             return None;
         }
-        let raw_type = *schema.properties.get(property)?;
+        let raw_type = schema.get(property)?;
         Some(FieldType::from_tdh(raw_type))
     }
 
-    /// The TDH round trip: size, copy, return the bytes.
+    /// The TDH round trip: size, fill, hand back a borrow of the buffer.
     ///
     /// Deliberately does *not* interpret the bytes. Two callers want the
     /// same bytes for different reasons — the typed path wants to classify
     /// by declared type, the untyped path by width — and this is the
     /// shared half.
-    fn raw_property(&mut self, raw: &EtwRaw, name: &str) -> Option<Vec<u8>> {
+    ///
+    /// The returned slice is valid until the next call on this decoder.
+    /// Every caller consumes it immediately (classify, decode, render), so
+    /// the reuse costs nothing and saves an allocation per field, which on
+    /// a host where the sensor is decoding 300,000 events a second is a
+    /// million allocations a second.
+    fn raw_property(&mut self, raw: &EtwRaw, name: &str) -> Option<&[u8]> {
         if raw.wire.data.is_empty() {
             // TDH needs the payload to parse anything at all, but a
             // header-only event is still legitimate.
@@ -148,13 +166,7 @@ impl Decoder {
             Reserved: 0,
         };
 
-        // The payload must be mutable for the synthetic record's pointer,
-        // even though TDH only reads it. Copying into scratch also
-        // guarantees the borrow outlives the call.
-        self.scratch.clear();
-        self.scratch.extend_from_slice(&raw.wire.data);
-
-        let record = synthetic_record(raw, self.scratch.as_mut_ptr());
+        let record = synthetic_record(raw, payload_pointer(raw));
 
         let mut size: u32 = 0;
         // SAFETY: `record` is a valid synthetic record; `descriptor` holds
@@ -164,33 +176,45 @@ impl Decoder {
             return None;
         }
 
-        let mut buffer = vec![0u8; size as usize];
-        // SAFETY: same as above; `buffer` is exactly `size` bytes.
-        let rc = unsafe { TdhGetProperty(&record, None, &[descriptor], &mut buffer) };
+        self.prop.clear();
+        self.prop.resize(size as usize, 0);
+        // SAFETY: same as above; `self.prop` is exactly `size` bytes, which
+        // is the size TDH just asked for.
+        let rc = unsafe { TdhGetProperty(&record, None, &[descriptor], &mut self.prop) };
         if rc != 0 {
             return None;
         }
 
-        Some(buffer)
+        Some(&self.prop)
     }
 
     /// Read a property as text.
     ///
-    /// Uses the **typed** path first. TDH's declared type is what tells us
-    /// a field is a `UnicodeString` (decode as UTF-16) rather than a
-    /// `Binary` blob (render as hex). The untyped path can only guess from
-    /// byte width, and a 26-byte UTF-16 DNS name looks like a 26-byte blob
-    /// to it — which is why the first live run printed
-    /// `hif-leim.deepseek.com` as `6800690066002d006c00650069006d...`.
+    /// Renders the bytes using the **declared type** when the schema
+    /// resolves. TDH's declared type is what tells us a field is a
+    /// `UnicodeString` (decode as UTF-16) rather than a `Binary` blob
+    /// (render as hex). The untyped path can only guess from byte width, and
+    /// a 26-byte UTF-16 DNS name looks like a 26-byte blob to it — which is
+    /// why the first live run printed `hif-leim.deepseek.com` as
+    /// `6800690066002d006c00650069006d...`.
     ///
-    /// Falls back to the untyped path when the schema does not resolve,
+    /// Falls back to the byte-width guess when the schema does not resolve,
     /// which is normal for a provider whose manifest is not registered on
-    /// this build.
+    /// this build, and when it resolves but does not declare this name.
+    ///
+    /// # One TDH round trip, not two
+    ///
+    /// This used to read the bytes through [`Self::typed_field`] and, when
+    /// that returned `None` — which it does for every field of a schema
+    /// that does not resolve, and for every declared-but-empty field, of
+    /// which the registry provider's `KeyName` is the one that matters —
+    /// read them *again* through [`Self::field`]. The declared type and the
+    /// bytes are independent facts, so the type is looked up once and the
+    /// bytes are fetched once, whatever the type turns out to be.
     pub fn text(&mut self, raw: &EtwRaw, name: &str) -> Option<String> {
-        if let Some((value, _ty)) = self.typed_field(raw, name) {
-            return Some(render_text(&value));
-        }
-        Some(render_text(&self.field(raw, name)?))
+        let ty = self.declared_type(raw, name);
+        let bytes = self.raw_property(raw, name)?;
+        Some(render_bytes(bytes, ty))
     }
 
     pub fn u32(&mut self, raw: &EtwRaw, name: &str) -> Option<u32> {
@@ -260,10 +284,12 @@ impl Decoder {
     }
 }
 
-/// Rebuild a record TDH will accept from bytes we own.
+/// Rebuild a record TDH will accept, pointing at the event's own payload.
 ///
-/// `payload` must be the same buffer that `UserData` points at. The
-/// returned record borrows it, so it must not outlive the caller's scope.
+/// `payload` must be the buffer the record's `UserData` points at, and it
+/// must outlive every TDH call made against the record. The `*const` →
+/// `*mut` cast is the C API's shape, not a promise to write: every TDH
+/// entry point used here reads `UserData` and nothing else.
 fn synthetic_record(raw: &EtwRaw, payload: *mut u8) -> EVENT_RECORD {
     let mut record = EVENT_RECORD::default();
 
@@ -285,6 +311,43 @@ fn synthetic_record(raw: &EtwRaw, payload: *mut u8) -> EVENT_RECORD {
     record.UserDataLength = raw.wire.data.len().min(u16::MAX as usize) as u16;
     record.UserData = payload as *mut c_void;
     record
+}
+
+/// The event's payload as the C API's `*mut c_void`, without copying it.
+///
+/// The `EtwRaw` the caller borrowed the payload from outlives every TDH
+/// call made with it, which is what makes handing out a pointer instead of
+/// a copy sound.
+fn payload_pointer(raw: &EtwRaw) -> *mut u8 {
+    raw.wire.data.as_ptr() as *mut u8
+}
+
+/// Render property bytes as text, using the declared type when the schema
+/// gave us one and the byte width when it did not.
+///
+/// Split out of [`Decoder::text`] so the borrow of the property buffer ends
+/// before the `String` is built.
+fn render_bytes(bytes: &[u8], ty: Option<FieldType>) -> String {
+    match ty {
+        // A string type decodes straight to the answer. Going through
+        // `FieldValue::Str` would build one `String` in `classify_typed`
+        // and then clone it in `render_text`, which is a copy of every
+        // path and every script block the sensor ships.
+        Some(ty) if ty.is_string() => classify_string(bytes),
+        Some(ty) => render_text(&classify_typed(bytes, ty)),
+        None => render_text(&classify(bytes)),
+    }
+}
+
+/// Decode a property the manifest declares as one of the UTF-16 string
+/// types, including the two cases that are not a UTF-16 decode: an empty
+/// value (which arrives as a lone terminator) is an empty string, and a
+/// malformed one is rendered as bytes rather than dropped.
+fn classify_string(bytes: &[u8]) -> String {
+    if !bytes.is_empty() && bytes.iter().all(|b| *b == 0) {
+        return String::new();
+    }
+    super::utf16_to_string(bytes).unwrap_or_else(|| hex(bytes))
 }
 
 #[cfg(test)]
@@ -377,6 +440,36 @@ mod tests {
         let record = synthetic_record(&r, scratch.as_mut_ptr());
         assert_eq!(record.UserDataLength, u16::MAX);
         let _ = payload;
+    }
+
+    #[test]
+    fn a_declared_string_renders_as_text_and_a_malformed_one_as_bytes() {
+        // The typed path's whole point, plus the two cases that are not a
+        // UTF-16 decode: an empty value arrives as a lone terminator and is
+        // an empty string, and bytes that are not UTF-16 are rendered as
+        // bytes rather than dropped.
+        let wide = b"C\x00:\x00\\\x00x\x00\x00\x00";
+        assert_eq!(render_bytes(wide, Some(FieldType::UnicodeString)), "C:\\x");
+
+        let empty = [0u8, 0];
+        assert_eq!(render_bytes(&empty, Some(FieldType::UnicodeString)), "");
+
+        let lone_surrogate = [0x00, 0xd8];
+        assert_eq!(
+            render_bytes(&lone_surrogate, Some(FieldType::UnicodeString)),
+            "00d8"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_schema_falls_back_to_the_byte_width() {
+        // Four bytes with no declared type are a `UInt32`; the same four
+        // bytes declared `Binary` are four bytes. That distinction is the
+        // reason the schema is fetched at all, and it survives the rewrite
+        // that fetches the type and the bytes independently.
+        let four = [1u8, 0, 0, 0];
+        assert_eq!(render_bytes(&four, None), "1");
+        assert_eq!(render_bytes(&four, Some(FieldType::Binary)), "01000000");
     }
 
     #[test]

@@ -46,8 +46,8 @@ pub use boundary::{
         REAL_TIME_MODE,
     },
     session::{
-        Buffers, EnableReport, EtwSession, ProviderSpec, SessionConfig, SessionState,
-        is_running, session_state,
+        Buffers, EnableReport, EtwSession, ProviderSpec, SessionConfig, SessionState, is_running,
+        session_state,
     },
     stats::{Stats, StatsSnapshot},
 };
@@ -58,8 +58,8 @@ pub use diagnostics::{
     autologger::{AUTOLOGGER_ROOT, AutologgerSpec, AutologgerState},
     security::{
         ExportIntegrity, JumpScan, KernelIntegrityStatus, SecurityReport, SessionHealth,
-        TextIntegrity, check_ntdll_exports, find_patch_in, full_report,
-        query_kernel_integrity, scan_for_jumps, session_health, verify_text_section,
+        TextIntegrity, check_ntdll_exports, find_patch_in, full_report, query_kernel_integrity,
+        scan_for_jumps, session_health, verify_text_section,
     },
 };
 
@@ -73,13 +73,12 @@ pub use enrich::{
 pub use error::{EtwError, hint, remedy};
 
 pub use provider::{
-    DNS_CLIENT, KERNEL_FILE, KERNEL_NETWORK, KERNEL_PROCESS, KERNEL_REGISTRY,
-    default_providers,
+    DNS_CLIENT, KERNEL_FILE, KERNEL_NETWORK, KERNEL_PROCESS, KERNEL_REGISTRY, default_providers,
 };
 
 pub use util::format_guid;
 
 pub use wire::{
-    GapSeverity, KcbStats, Shape, ShapeCounts, TelemetryGap, Translator,
-    UnrecognisedHistogram, render_registry_value,
+    GapSeverity, KcbStats, Shape, ShapeCounts, TelemetryGap, Translator, UnrecognisedHistogram,
+    render_registry_value,
 };

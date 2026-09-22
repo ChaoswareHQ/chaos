@@ -23,6 +23,21 @@
 //! is not a tuning choice; without both the `INDEPENDENT` and `PERSIST`
 //! bits, the kernel silently drops events with its own loss counters at
 //! zero.
+//!
+//! # Why some providers need `ENABLE_KEYWORD_0`
+//!
+//! `Microsoft-Windows-Security-Auditing` (and a handful of other system
+//! providers) will accept an `EnableTraceEx2` call, report
+//! `ERROR_SUCCESS`, register on the session — and then never emit a
+//! single event. The provider is not broken and the session is not
+//! broken; the enable call simply did not ask for keyword-0 events.
+//!
+//! `EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0` is the property that says
+//! "yes, deliver the events whose keyword mask includes bit 0." Without
+//! it, a provider whose events carry the keyword-0 flag stays silent for
+//! this session. The `ProviderSpec::enable_keyword_zero` flag controls
+//! whether the property is set; it defaults to `false` so providers that
+//! do not need it pay nothing for the option.
 
 use crate::boundary::callback::{CallbackContext, EtwRaw, on_event};
 use crate::boundary::constants::LOG_FILE_MODE;
@@ -37,13 +52,28 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use windows::Win32::Foundation::{ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND};
 use windows::Win32::System::Diagnostics::Etw::{
-    CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-    EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
-    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+    CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, ENABLE_TRACE_PARAMETERS,
+    EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP,
+    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2,
+    OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
     ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
+
+/// `EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0` from `evntrace.h`.
+///
+/// The property that tells the kernel "yes, deliver keyword-0 events to
+/// this session." Without it, a provider whose events carry the
+/// keyword-0 flag — Security-Auditing among them — registers
+/// successfully and stays silent.
+///
+/// Not exposed as a named constant in this version of windows-rs. The
+/// value is stable.
+const EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0: u32 = 0x40;
+
+/// `ENABLE_TRACE_PARAMETERS_VERSION_2`, the version the parameters
+/// struct uses when it carries a filter descriptor.
+const ENABLE_TRACE_PARAMETERS_VERSION_2: u32 = 2;
 
 /// One provider to enable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +86,21 @@ pub struct ProviderSpec {
     /// Keyword mask. `0` means "every keyword", which against a manifest
     /// provider is rarely what a production deployment wants.
     pub keywords: u64,
+    /// Whether to set `EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0` in the
+    /// `EnableTraceEx2` call.
+    ///
+    /// Most providers do not care. A few system providers —
+    /// `Microsoft-Windows-Security-Auditing` is the one this crate has
+    /// hit — will accept the enable call, register on the session, and
+    /// then never emit a single event unless this property is set.
+    ///
+    /// The symptom is subtle: `EnableTraceEx2` returns
+    /// `ERROR_SUCCESS`, the run report shows the provider as enabled,
+    /// and the shape that reads its events has a `0/0` count. Without
+    /// this property the provider is registered but silent.
+    ///
+    /// Defaults to `false`.
+    pub enable_keyword_zero: bool,
 }
 
 /// Kernel buffer sizing and flush cadence.
@@ -281,6 +326,24 @@ impl EtwSession {
 
         let mut reports = Vec::with_capacity(cfg.providers.len());
         for spec in &cfg.providers {
+            // The enable call itself. Most providers work with the
+            // default behavior — no parameter block, "enable everything
+            // the keyword mask asks for." Security-Auditing is the
+            // notable exception: without `ENABLE_KEYWORD_0` set, the
+            // call succeeds and the provider stays silent.
+            let params = if spec.enable_keyword_zero {
+                Some(ENABLE_TRACE_PARAMETERS {
+                    Version: ENABLE_TRACE_PARAMETERS_VERSION_2,
+                    EnableProperty: EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0,
+                    ControlFlags: 0,
+                    SourceId: GUID::from_u128(0),
+                    EnableFilterDesc: std::ptr::null_mut(),
+                    FilterDescCount: 0,
+                })
+            } else {
+                None
+            };
+
             let rc = unsafe {
                 EnableTraceEx2(
                     handle,
@@ -290,7 +353,7 @@ impl EtwSession {
                     spec.keywords,
                     0,
                     0,
-                    None,
+                    params.as_ref().map(|p| p as *const ENABLE_TRACE_PARAMETERS),
                 )
             };
             reports.push(EnableReport {
@@ -413,11 +476,33 @@ impl EtwSession {
     /// Pull up to `max` events, waiting no longer than `timeout` for the
     /// first.
     pub fn drain(&mut self, out: &mut Vec<EtwRaw>, max: usize, timeout: Duration) -> usize {
+        self.drain_each(max, timeout, |event| out.push(event))
+    }
+
+    /// Pull up to `max` events, waiting no longer than `timeout` for the
+    /// first, and hand each one to `f` as it arrives.
+    ///
+    /// This is [`Self::drain`] without the batch. An `EtwRaw` is 144 bytes
+    /// — the payload's `Vec` header, the GUID, both activity ids, the
+    /// descriptor fields — and every hop between the kernel and the
+    /// decoder moves all of it: into the channel, out of the channel, into
+    /// the batch vector, and out of the batch vector again. A consumer that
+    /// translates in place makes the last two of those hops disappear, and
+    /// on a host producing 200,000 events a second that is 200,000
+    /// 144-byte pairs of copies the process does not make.
+    ///
+    /// `f` runs on the caller's thread and may block: it is not the ETW
+    /// callback, which is a different thread with different rules (see
+    /// [`crate::boundary::callback`]).
+    pub fn drain_each<F>(&mut self, max: usize, timeout: Duration, mut f: F) -> usize
+    where
+        F: FnMut(EtwRaw),
+    {
         let mut count = 0;
 
         match self.rx.recv_timeout(timeout) {
             Ok(item) => {
-                out.push(item);
+                f(item);
                 count += 1;
             }
             Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return 0,
@@ -426,7 +511,7 @@ impl EtwSession {
         while count < max {
             match self.rx.try_recv() {
                 Ok(item) => {
-                    out.push(item);
+                    f(item);
                     count += 1;
                 }
                 Err(_) => break,
@@ -507,10 +592,11 @@ impl EventSource for EtwSession {
         max: usize,
         timeout: Duration,
     ) -> Result<usize, SourceError> {
-        let mut batch = Vec::new();
-        let n = self.drain(&mut batch, max, timeout);
-        out.extend(batch.into_iter().map(|e| e.wire));
-        Ok(n)
+        // Straight from the channel into the caller's vector. The obvious
+        // shape — drain into a local `Vec<EtwRaw>`, then move each event's
+        // `wire` field into `out` — allocates a batch vector per call and
+        // moves every event twice.
+        Ok(self.drain_each(max, timeout, |event| out.push(event.wire)))
     }
 
     fn dropped_count(&self) -> u64 {
@@ -607,13 +693,14 @@ mod tests {
             }
             let terminator = units.last().copied();
             let text: Vec<u16> = units.into_iter().take_while(|u| *u != 0).collect();
-            (
-                String::from_utf16(&text).expect("valid UTF-16"),
-                terminator,
-            )
+            (String::from_utf16(&text).expect("valid UTF-16"), terminator)
         };
         assert_eq!(recovered, "chaos-test-session");
-        assert_eq!(terminator, Some(0), "the tail must end in a terminated name");
+        assert_eq!(
+            terminator,
+            Some(0),
+            "the tail must end in a terminated name"
+        );
     }
 
     fn wide(s: &str) -> Vec<u16> {

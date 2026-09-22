@@ -72,6 +72,17 @@ impl Schema {
             unresolvable: true,
         }
     }
+
+    /// The declared `InType` of `name`, or `None` when the template has no
+    /// such property.
+    ///
+    /// A `None` here is a fact and not a failure: the field tables in
+    /// [`crate::wire::shape`] carry alternative spellings precisely because
+    /// manifests differ between builds, and a name that does not resolve is
+    /// how the chain moves on to the next one.
+    pub(crate) fn get(&self, name: &str) -> Option<u16> {
+        self.properties.get(name).copied()
+    }
 }
 
 /// Ask TDH for a schema.

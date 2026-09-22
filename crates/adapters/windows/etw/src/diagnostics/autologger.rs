@@ -524,7 +524,6 @@ mod tests {
     use super::*;
     use crate::boundary::session::ProviderSpec;
     use crate::provider;
-    use windows::core::GUID;
 
     /// A session name nothing should be using.
     const ABSENT: &str = "chaos-no-such-autologger-7c41";
@@ -588,6 +587,7 @@ mod tests {
                 level: provider::LEVEL_INFORMATIONAL,
                 keywords: provider::KERNEL_PROCESS_KEYWORD_PROCESS
                     | provider::KERNEL_PROCESS_KEYWORD_IMAGE,
+                enable_keyword_zero: false,
             }]);
 
         let good = AutologgerState {
@@ -676,6 +676,7 @@ mod tests {
                 level: provider::LEVEL_INFORMATIONAL,
                 keywords: provider::KERNEL_PROCESS_KEYWORD_PROCESS
                     | provider::KERNEL_PROCESS_KEYWORD_IMAGE,
+                enable_keyword_zero: false,
             }]);
 
         let narrowed = AutologgerState {
@@ -718,11 +719,13 @@ mod tests {
                 name: "Microsoft-Windows-Kernel-Process",
                 level: provider::LEVEL_INFORMATIONAL,
                 keywords: 0x50,
+                enable_keyword_zero: false,
             }]);
         let commands = spec.reg_commands();
 
-        assert!(commands
-            .contains(r"HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\chaos-sensor"));
+        assert!(
+            commands.contains(r"HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\chaos-sensor")
+        );
         assert!(
             commands.contains("/v Start /t REG_DWORD /d 1 /f"),
             "{commands}"
@@ -748,7 +751,7 @@ mod tests {
 
     #[test]
     fn guids_are_spelled_the_way_windows_spells_them() {
-        let guid = GUID::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+        let guid = windows::core::GUID::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
         assert_eq!(format_guid(&guid), "{00112233-4455-6677-8899-aabbccddeeff}");
         assert_eq!(
             format_guid(&provider::KERNEL_PROCESS),
