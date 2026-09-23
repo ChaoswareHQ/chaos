@@ -9,3 +9,4 @@ target/
 # Local run logs
 *.out
 *.err
+*.log

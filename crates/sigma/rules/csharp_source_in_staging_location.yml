@@ -1,0 +1,44 @@
+title: C# Source File Written To A Staging Directory
+id: 6c1f0b7e-3a2d-4f5c-9e8b-1d2c3a4b5e6f
+status: experimental
+description: |
+    A C# source file written into a location a user can write to.
+
+    "Compile after delivery" (T1027.004) starts with source landing somewhere a
+    developer's own build does not put it. This fires on the arrival of the
+    source; the compiler invocation that follows is a separate rule's job, and
+    the two together are the behaviour.
+
+    Note what this does *not* claim: this sensor has no file-*open* event. The
+    kernel file provider reports create, rename and delete, so "a process opened
+    a .cs file" is not observable here at all. Arrival is.
+references:
+    - https://attack.mitre.org/techniques/T1027/004/
+author: chaos
+date: 2026-09-23
+level: low
+tags:
+    - attack.defense_evasion
+    - attack.t1027.004
+logsource:
+    product: windows
+    category: file_event
+detection:
+    selection_extension:
+        TargetFilename|endswith:
+            - '.cs'
+            - '.csx'
+    selection_staging:
+        TargetFilename|contains:
+            - '\Temp\'
+            - '\Downloads\'
+            - '\Public\'
+            - '\ProgramData\'
+    filter_developer:
+        TargetFilename|contains:
+            - '\source\repos\'
+            - '\Visual Studio\'
+            - '\.nuget\'
+    condition: selection_extension and selection_staging and not filter_developer
+falsepositives:
+    - A build or IDE writing generated source into a temporary directory

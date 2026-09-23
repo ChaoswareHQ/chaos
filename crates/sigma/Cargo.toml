@@ -1,0 +1,24 @@
+[package]
+name = "sigma"
+description = "SIGMA detection-rule engine: community YAML rules scored as pipeline evidence."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+asmr.workspace = true
+model.workspace = true
+# YAML. The only dependency this crate adds that the rest of the workspace does
+# not already carry, and the reason the engine is a crate of its own: the
+# algebra stays free of it, and a deployment that does not use Sigma does not
+# link it.
+saphyr = "0.1"
+
+[dev-dependencies]
+# The tests and the example build wire events, and a wire event carries a
+# timestamp. `model` is repeated here so the example can name it directly.
+chrono.workspace = true
+model.workspace = true
