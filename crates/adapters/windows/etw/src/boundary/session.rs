@@ -50,15 +50,19 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use windows::Win32::Foundation::{ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_SUCCESS,
+    ERROR_WMI_INSTANCE_NOT_FOUND,
+};
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, ENABLE_TRACE_PARAMETERS,
     EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP,
     EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2,
     OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
-    ProcessTrace, StartTraceW, WNODE_FLAG_TRACED_GUID,
+    ProcessTrace, QueryAllTracesW, StartTraceW, WNODE_FLAG_TRACED_GUID,
 };
-use windows::core::{GUID, PCWSTR, PWSTR};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::core::{GUID, HRESULT, PCWSTR, PWSTR};
 
 /// `EVENT_ENABLE_PROPERTY_ENABLE_KEYWORD_0` from `evntrace.h`.
 ///
@@ -284,6 +288,203 @@ pub fn session_state(name: &str) -> Result<Option<SessionState>, EtwError> {
 /// Whether a session by this name exists.
 pub fn is_running(name: &str) -> Result<bool, EtwError> {
     Ok(session_state(name)?.is_some())
+}
+
+/// Stop a running session by name.
+///
+/// `Ok(false)` means nothing was running under that name, which is an answer
+/// rather than a failure: it is what "it is already gone" looks like.
+pub fn stop_session(name: &str) -> Result<bool, EtwError> {
+    if name.is_empty() {
+        return Err(EtwError::EmptySessionName);
+    }
+
+    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut props = build_props(&name, Buffers::default());
+
+    let rc = unsafe {
+        ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            PCWSTR(name.as_ptr()),
+            props_ptr(&mut props),
+            EVENT_TRACE_CONTROL_STOP,
+        )
+    };
+
+    match rc {
+        ERROR_SUCCESS => Ok(true),
+        ERROR_WMI_INSTANCE_NOT_FOUND => Ok(false),
+        other => Err(EtwError::ControlTrace(other.0)),
+    }
+}
+
+/// The names of every session the kernel is running.
+///
+/// `QueryAllTracesW` cannot be asked how many sessions exist, so it is handed a
+/// fixed array and told how many did not fit. The array grows and the call is
+/// retried, which needs a bound: a retry whose stop condition is decided by
+/// another process on the machine is a way to spin forever.
+pub fn running_sessions() -> Result<Vec<String>, EtwError> {
+    let mut capacity = 64usize;
+    for _ in 0..4 {
+        let mut buffers: Vec<Box<PropertiesBuffer>> =
+            (0..capacity).map(|_| Box::new(query_buffer())).collect();
+        let mut pointers: Vec<*mut EVENT_TRACE_PROPERTIES> =
+            buffers.iter_mut().map(|b| props_ptr(&mut b.0)).collect();
+        let mut written = 0u32;
+
+        let rc = unsafe { QueryAllTracesW(pointers.as_mut_slice(), &mut written) };
+        if rc == ERROR_MORE_DATA {
+            // `written` is now the number of sessions that exist, so the next
+            // pass is sized for them. The slack covers sessions that appear
+            // while this is running, rather than requiring another pass.
+            capacity = (written as usize).saturating_add(8).max(capacity + 1);
+            continue;
+        }
+        if rc != ERROR_SUCCESS {
+            return Err(EtwError::ControlTrace(rc.0));
+        }
+
+        let found = (written as usize).min(buffers.len());
+        return Ok(buffers[..found]
+            .iter()
+            .filter_map(|buf| logger_name_of(&buf.0))
+            .collect());
+    }
+
+    Err(EtwError::ControlTrace(ERROR_MORE_DATA.0))
+}
+
+/// One session's properties, as `QueryAllTracesW` fills it in.
+///
+/// Aligned, because the API writes an `EVENT_TRACE_PROPERTIES` into it and is
+/// entitled to assume the memory it was handed can hold one. This crate only
+/// ever reads a single field of it, byte-wise.
+#[repr(align(8))]
+struct PropertiesBuffer([u8; Self::BYTES]);
+
+impl PropertiesBuffer {
+    /// Windows writes each logger name into the tail of its own buffer and does
+    /// not say how long it will be. The sample code for this API uses 1024 bytes
+    /// per session, which is far past the longest name a host runs.
+    const BYTES: usize = 1024;
+}
+
+/// A properties buffer empty except for the two fields `QueryAllTracesW` reads.
+///
+/// `Wnode.BufferSize` is not decoration. It is how the API knows how much room
+/// each buffer has for the logger name it writes into the tail, and a zeroed
+/// `EVENT_TRACE_PROPERTIES` does not fail — it returns success and reports *no
+/// sessions at all*, which is a machine with forty of them reporting none.
+fn query_buffer() -> PropertiesBuffer {
+    let mut buffer = PropertiesBuffer([0u8; PropertiesBuffer::BYTES]);
+    let p = props_ptr(&mut buffer.0);
+    // SAFETY: `buffer` is `BYTES` bytes and `EVENT_TRACE_PROPERTIES` is far
+    // smaller than that, so both fields written here are in bounds.
+    unsafe {
+        (*p).Wnode.BufferSize = PropertiesBuffer::BYTES as u32;
+        (*p).LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+    }
+    buffer
+}
+
+/// The logger name the kernel wrote into a session's properties buffer.
+///
+/// Reads the offset field byte-wise rather than casting the buffer to
+/// `EVENT_TRACE_PROPERTIES`: the buffer is a byte array whose alignment is only
+/// as good as its type says, and a dereference there is undefined behaviour the
+/// compiler is entitled to reject — which it does.
+///
+/// Reading through `LoggerNameOffset`, which is relative to the start of the
+/// buffer, rather than assuming the name sits immediately after the struct, is
+/// what makes this work for buffers the kernel filled in and not just for the
+/// ones this crate builds.
+fn logger_name_of(buf: &[u8]) -> Option<String> {
+    const FIELD: usize = std::mem::offset_of!(EVENT_TRACE_PROPERTIES, LoggerNameOffset);
+
+    if buf.len() < size_of::<EVENT_TRACE_PROPERTIES>() {
+        return None;
+    }
+    let offset = u32::from_ne_bytes(buf[FIELD..FIELD + 4].try_into().ok()?) as usize;
+    if offset == 0 || offset + 2 > buf.len() {
+        return None;
+    }
+
+    let mut units = Vec::new();
+    for at in (offset..buf.len().saturating_sub(1)).step_by(2) {
+        let unit = u16::from_ne_bytes([buf[at], buf[at + 1]]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    let name = String::from_utf16(&units).ok()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// Stop the sessions a previous run of this program left behind.
+///
+/// A session survives the process that created it: kill an agent and its
+/// session stays registered, holding its buffers and one of the finite number
+/// of session slots the kernel has. Enough runs of a program that crashes or is
+/// interrupted — which is every run during development — and the machine runs
+/// out of sessions and every later run fails to start.
+///
+/// The name is what makes the orphans findable. Every session this crate starts
+/// under `prefix` ends in `-<pid>`, so a trailing number naming a process that
+/// no longer exists is a run that ended without cleaning up. A live pid is left
+/// alone, so a second agent on the same host is never disturbed — the test is
+/// deliberately one-sided, because stopping a working sensor is far worse than
+/// leaving a dead session behind.
+///
+pub fn retire_orphaned_sessions(prefix: &str) -> Result<Vec<String>, EtwError> {
+    let mut retired = Vec::new();
+    for name in running_sessions()? {
+        let Some(pid) = orphan_pid(&name, prefix) else {
+            continue;
+        };
+        if process_is_alive(pid) {
+            continue;
+        }
+        if stop_session(&name)? {
+            retired.push(name);
+        }
+    }
+    Ok(retired)
+}
+
+/// The pid a session name encodes, when the name has this program's shape:
+/// `prefix-<pid>`, or `prefix-<something>-<pid>`.
+///
+/// Strict about the shape so an unrelated session can never be mistaken for one
+/// of ours: `prefix` must match, the last `-`-separated field must be all digits
+/// and must parse.
+fn orphan_pid(name: &str, prefix: &str) -> Option<u32> {
+    let rest = name.strip_prefix(prefix)?.strip_prefix('-')?;
+    let last = rest.rsplit('-').next().unwrap_or(rest);
+    if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    last.parse().ok()
+}
+
+/// Whether a process is still running.
+///
+/// `OpenProcess` is the only check available without a handle of our own, and it
+/// is the *failure* that carries the answer: `ERROR_INVALID_PARAMETER` is the
+/// documented "no such process", while `ERROR_ACCESS_DENIED` means the process
+/// exists and belongs to someone else. Only a definite "no such process" counts
+/// as gone; everything else, including an error nobody anticipated, errs towards
+/// leaving the session alone.
+fn process_is_alive(pid: u32) -> bool {
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            // SAFETY: the handle came from `OpenProcess` and is ours to close.
+            let _ = unsafe { CloseHandle(handle) };
+            true
+        }
+        Err(e) => e.code() != HRESULT::from_win32(ERROR_INVALID_PARAMETER.0),
+    }
 }
 
 impl EtwSession {
@@ -705,5 +906,133 @@ mod tests {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Enumerating sessions needs rights on sessions this process did not
+    /// create, so an unelevated run cannot have the answer. Returning `None`
+    /// skips; returning an empty list would be a lie, because an empty list
+    /// means "there are no orphans" and a refusal means "no answer at all".
+    fn sessions_or_none() -> Option<Vec<String>> {
+        match running_sessions() {
+            Ok(names) => Some(names),
+            Err(EtwError::ControlTrace(5)) => None,
+            Err(e) => panic!("enumeration failed for a reason that is not access: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn the_logger_name_reader_matches_the_writer() {
+        // `logger_name_of` reads through `LoggerNameOffset` so it also works on
+        // buffers Windows filled in; this pins it against the one buffer this
+        // crate builds, where the offset and the layout are both known.
+        let props = build_props(&wide("chaos-reader-test"), Buffers::default());
+        assert_eq!(logger_name_of(&props).as_deref(), Some("chaos-reader-test"));
+    }
+
+    #[test]
+    fn a_buffer_too_short_to_hold_a_name_yields_none_rather_than_a_panic() {
+        assert_eq!(logger_name_of(&[]), None);
+        assert_eq!(logger_name_of(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn only_this_programs_session_names_carry_an_orphan_pid() {
+        // The accepted shape.
+        assert_eq!(orphan_pid("chaos-12108", "chaos"), Some(12108));
+        assert_eq!(orphan_pid("chaos-etw-capture-26592", "chaos"), Some(26592));
+        // Everything else, including another product's session, a name with no
+        // pid, and a near-miss on the prefix.
+        assert_eq!(orphan_pid("NT Kernel Logger", "chaos"), None);
+        assert_eq!(orphan_pid("chaos", "chaos"), None);
+        assert_eq!(orphan_pid("chaos-", "chaos"), None);
+        assert_eq!(orphan_pid("chaos-sensor", "chaos"), None);
+        assert_eq!(orphan_pid("chaosx-1234", "chaos"), None);
+        assert_eq!(orphan_pid("rechaos-1234", "chaos"), None);
+        assert_eq!(orphan_pid("chaos-1234a", "chaos"), None);
+        assert_eq!(
+            orphan_pid("chaos-99999999999999", "chaos"),
+            None,
+            "not a pid"
+        );
+    }
+
+    #[test]
+    fn a_live_process_is_alive_and_an_impossible_pid_is_not() {
+        // The whole safety of reclamation rests on this: only a definite "no
+        // such process" may be treated as gone, or a second agent's session
+        // gets stopped underneath it.
+        assert!(process_is_alive(std::process::id()));
+        assert!(!process_is_alive(0xFFFF_FFFC));
+    }
+
+    #[test]
+    fn an_unknown_prefix_retires_nothing() {
+        // The safety property in one call. A prefix no session on this machine
+        // is named with must never stop anything; if this ever returns a name,
+        // the shape check matched a session that is not ours.
+        match retire_orphaned_sessions("chaos-no-such-agent-9f3c1a") {
+            Ok(retired) => assert!(retired.is_empty(), "{retired:?}"),
+            Err(EtwError::ControlTrace(5)) => {}
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn stopping_an_absent_session_is_an_answer_and_not_a_failure() {
+        assert_eq!(stop_session(ABSENT).expect("stop is permitted"), false);
+        assert!(matches!(stop_session(""), Err(EtwError::EmptySessionName)));
+    }
+
+    #[test]
+    fn enumeration_finds_the_sessions_this_machine_is_running() {
+        let Some(names) = sessions_or_none() else {
+            return;
+        };
+        // A Windows host runs trace sessions the moment it boots, so an empty
+        // answer means the reader failed rather than that the machine is idle.
+        // That is not hypothetical: this returned zero sessions for a machine
+        // running forty-four of them, because the query buffers were not stamped
+        // with `Wnode.BufferSize`.
+        assert!(!names.is_empty(), "enumeration found no sessions at all");
+        for name in &names {
+            assert!(!name.is_empty(), "a session with no name: {names:?}");
+            assert!(
+                !name.contains('\0'),
+                "the reader ran past the terminator: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_orphan_shaped_session_is_recognised_in_a_real_enumeration() {
+        // The join between the shape check and the machine: whatever this host is
+        // running, the names the kernel reports must round-trip through the
+        // parser, and reclamation must not name a session whose pid is alive.
+        //
+        // This test stops real sessions. That is deliberate and it is the only
+        // way to test the thing that matters — the check is that it stops
+        // *nothing but* orphans, and an orphan is by definition a session whose
+        // owner died and which nobody will ever stop. It is also why this is
+        // worth running: the machine that ran it had thirty-seven leaked
+        // sessions on it.
+        let Some(names) = sessions_or_none() else {
+            return;
+        };
+        let matched: Vec<&String> = names
+            .iter()
+            .filter(|name| orphan_pid(name, "chaos").is_some())
+            .collect();
+        for name in &matched {
+            assert!(
+                name.starts_with("chaos-"),
+                "the parser matched a name outside the prefix: {name}"
+            );
+        }
+        if let Ok(retired) = retire_orphaned_sessions("chaos") {
+            for name in &retired {
+                let pid = orphan_pid(name, "chaos").expect("a retired name has a pid");
+                assert!(!process_is_alive(pid), "retired a live session: {name}");
+            }
+        }
     }
 }

@@ -39,7 +39,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use journal::{Journal, Record};
 use protocol::{
     API_VERSION, ApiError, ENROLL_PATH, ENROLLMENT_HEADER, EnrollRequest, EnrollResponse,
@@ -70,6 +70,41 @@ struct AppState {
     /// `None` means state lives only in memory and a restart is a reset. A
     /// failure to append is never fatal to a request; see [`append_best_effort`].
     journal: Option<Arc<Mutex<Journal>>>,
+    /// Where the journal lives, for the console to print.
+    data_dir: Option<PathBuf>,
+    /// When this process started, so the console can say how long it has been up.
+    started: DateTime<Utc>,
+}
+
+impl AppState {
+    /// What the console shows about the server itself.
+    ///
+    /// Built per request rather than cached, because every number in it moves:
+    /// the journal's record count, the store's occupancy, the counters. The one
+    /// cost worth naming is the journal's lock, which is taken, read for four
+    /// integers, and released before anything is rendered.
+    fn status(&self) -> dashboard::Status {
+        dashboard::Status {
+            started: self.started,
+            store_cap: self.store.alert_cap(),
+            batch_cap: self.store.batch_cap(),
+            host_cap: self.enrollment.max_hosts,
+            journal: self.journal.as_ref().map(|journal| {
+                let stats = journal.lock().unwrap_or_else(|e| e.into_inner()).stats();
+                dashboard::JournalFacts {
+                    path: self
+                        .data_dir
+                        .as_ref()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_default(),
+                    segments: stats.segments,
+                    replayed: stats.replayed,
+                    skipped: stats.skipped,
+                    bytes: stats.bytes,
+                }
+            }),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +146,43 @@ impl IntoResponse for Failure {
 }
 
 type ApiResult<T> = Result<T, Failure>;
+
+/// A body that would inflate past this is refused *while* inflating, so the
+/// buffer is never built. Sized well above a full batch of typed events and well
+/// below anything that would matter to a host.
+const MAX_INFLATED_BYTES: usize = 32 * 1024 * 1024;
+
+/// The request body, decompressed if the headers say it is compressed.
+///
+/// Shared by every handler that takes a body, which is the point. When this
+/// lived inside `ingest`, `enroll` did not have it, and a client that compresses
+/// everything — which is what a client with one POST path does — got
+/// `400 malformed_request` on enrollment, naming nothing that pointed at the
+/// cause. A shared function makes forgetting cost a compile error instead.
+///
+/// Decompression happens in the handler rather than in a layer so each handler's
+/// own size limit is enforced on the *decompressed* request: a layer that
+/// inflated first would let a small compressed body expand into something the
+/// handler's limits do not describe.
+fn inflated(headers: &HeaderMap, body: Bytes) -> ApiResult<Bytes> {
+    match headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(encoding) if encoding.eq_ignore_ascii_case(protocol::GZIP_ENCODING) => {
+            let body = protocol::gunzip(&body, MAX_INFLATED_BYTES)
+                .map_err(|_| Failure::client(StatusCode::BAD_REQUEST, "bad_gzip"))?;
+            Ok(Bytes::from(body))
+        }
+        // Fail closed on an encoding we do not implement, rather than reading it
+        // as if it were absent and parsing compressed bytes as JSON.
+        Some(_) => Err(Failure::client(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_content_encoding",
+        )),
+        None => Ok(body),
+    }
+}
 
 /// Parse a JSON body, keeping the error opaque.
 fn parse_json<T: serde::de::DeserializeOwned>(body: &Bytes) -> ApiResult<T> {
@@ -220,6 +292,7 @@ async fn enroll(
         ));
     }
 
+    let body = inflated(&headers, body)?;
     let request: EnrollRequest = parse_json(&body)?;
 
     // Length caps before anything is stored: a hostname is not a place to put
@@ -291,30 +364,7 @@ async fn ingest(
     // A body that would inflate past this is refused while inflating, so the
     // buffer is never built. Sized well above a full batch of typed events and
     // well below anything that would matter to the host.
-    const MAX_INFLATED_BYTES: usize = 32 * 1024 * 1024;
-
-    // The wire body may be gzip. Decompressed here rather than in a layer so the
-    // batch limit below is enforced on the *decompressed* request: a layer that
-    // inflated first would let a small compressed body expand into something the
-    // handlers' own limits do not describe.
-    let body = match headers
-        .get("content-encoding")
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(encoding) if encoding.eq_ignore_ascii_case(protocol::GZIP_ENCODING) => Bytes::from(
-            protocol::gunzip(&body, MAX_INFLATED_BYTES)
-                .map_err(|_| Failure::client(StatusCode::BAD_REQUEST, "bad_gzip"))?,
-        ),
-        // Fail closed on an encoding we do not implement, rather than reading it
-        // as if it were absent and parsing compressed bytes as JSON.
-        Some(_) => {
-            return Err(Failure::client(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported_content_encoding",
-            ));
-        }
-        None => body,
-    };
+    let body = inflated(&headers, body)?;
 
     let request: IngestRequest = parse_json(&body)?;
 
@@ -377,6 +427,7 @@ async fn console(State(state): State<AppState>, RawQuery(query): RawQuery) -> Ht
     let filters = dashboard::Filters::parse(query.as_deref().unwrap_or_default());
     Html(dashboard::page(
         &state.store.snapshot(),
+        &state.status(),
         &filters,
         Utc::now(),
     ))
@@ -733,6 +784,8 @@ async fn main() {
         max_batch_events: args.max_batch_events,
         console_token: args.console_token.as_ref().map(|t| Arc::new(t.clone())),
         journal,
+        data_dir: args.data_dir.clone(),
+        started: Utc::now(),
     };
 
     let listener = match tokio::net::TcpListener::bind(args.bind).await {
@@ -833,5 +886,98 @@ async fn main() {
     {
         eprintln!("fatal: server error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gzip(bytes: &[u8]) -> Bytes {
+        Bytes::from(protocol::gzip(bytes).expect("the test can compress"))
+    }
+
+    fn headers(content_encoding: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(encoding) = content_encoding {
+            headers.insert("content-encoding", encoding.parse().unwrap());
+        }
+        headers
+    }
+
+    /// `Failure` carries no `Debug`, so the tests match rather than unwrap. Which
+    /// is the right shape anyway: each of these asserts on *which* refusal.
+    fn accepted(headers: &HeaderMap, body: Bytes) -> Vec<u8> {
+        match inflated(headers, body) {
+            Ok(body) => body.to_vec(),
+            Err(_) => panic!("expected this body to be accepted"),
+        }
+    }
+
+    fn refusal(headers: &HeaderMap, body: Bytes) -> StatusCode {
+        match inflated(headers, body) {
+            Ok(_) => panic!("expected this body to be refused"),
+            Err(failure) => failure.status,
+        }
+    }
+
+    /// The bug this function exists to prevent.
+    ///
+    /// The client compresses every body, enrollment included. When decompression
+    /// lived inside `ingest`, enrolling returned `400 malformed_request` because
+    /// gzip bytes are not JSON — a message that names nothing and points at the
+    /// agent rather than the server. Both handlers now call this, and this test
+    /// is what says the enrollment path inflates.
+    #[test]
+    fn a_gzipped_body_is_inflated_whatever_handler_reads_it() {
+        let body = gzip(br#"{"hostname":"a-host"}"#);
+        assert_ne!(&body[..1], b"{", "the fixture must really be compressed");
+
+        let body = accepted(&headers(Some("gzip")), body);
+        assert_eq!(&body[..], br#"{"hostname":"a-host"}"#);
+    }
+
+    #[test]
+    fn an_uncompressed_body_passes_through() {
+        let body = accepted(&headers(None), Bytes::from_static(b"{\"a\":1}"));
+        assert_eq!(&body[..], b"{\"a\":1}");
+    }
+
+    #[test]
+    fn an_encoding_we_do_not_implement_is_refused_rather_than_parsed_as_json() {
+        // Fail closed: `br` is not `gzip`, and reading it as though the body were
+        // plain would parse compressed bytes as JSON and report a malformed
+        // request instead of an unsupported encoding.
+        let status = refusal(&headers(Some("br")), Bytes::from_static(b"\x00\x01"));
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn a_body_that_claims_gzip_and_is_not_is_a_client_error() {
+        let status = refusal(
+            &headers(Some("gzip")),
+            Bytes::from_static(b"not gzip at all"),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The decompression bomb guard, which is the reason the limit is checked
+    /// while inflating rather than after.
+    #[test]
+    fn an_expanding_body_is_refused_at_the_limit() {
+        // Highly compressible, so the wire body is tiny and the inflated one is
+        // not — which is exactly the shape of the attack.
+        let bomb = gzip(&vec![0u8; MAX_INFLATED_BYTES + 1024]);
+        // Not a claim about deflate's best case, which is nearer 1000:1, only that
+        // this body is far smaller on the wire than it inflates to — which is the
+        // shape of the attack, whatever the ratio.
+        assert!(
+            bomb.len() * 64 < MAX_INFLATED_BYTES,
+            "the fixture must be far smaller on the wire than it inflates to: {} bytes",
+            bomb.len()
+        );
+
+        let status = refusal(&headers(Some("gzip")), bomb);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

@@ -145,7 +145,15 @@ pub fn build(
         entities,
         distinct_images,
         known_edges,
-        blind_spot: observe.blind_spot(entities.max(1)),
+        // `entities`, not `entities.max(1)`. A universe of zero is not a blind
+        // spot of one: A3's blind spot is the unobserved fraction of a universe
+        // we know of, and when nothing has been projected there is no universe
+        // to be blind to. `ObservationMap` already implements exactly that
+        // convention and tests it — `coverage_ratio(0) == 1.0` — so guarding the
+        // argument here against a division that cannot happen inverted the
+        // answer and reported `coverage 0.000000` for a run that had simply seen
+        // no process starts yet.
+        blind_spot: observe.blind_spot(entities),
         channel_capacity_bits: aggregate_capacity(metrics),
         load_factor: overload(offered_rate, sensor_capacity),
     }
@@ -168,6 +176,7 @@ fn aggregate_capacity(metrics: &Metrics) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asmr::observe::ObsId;
 
     fn metrics() -> Metrics {
         let mut m = Metrics::default();
@@ -239,5 +248,57 @@ mod tests {
         assert_eq!(m.total_capacity_bits(), 0.0);
         assert_eq!(aggregate_capacity(&m), 0.0);
         assert!(m.rules_by_capacity().is_empty());
+    }
+
+    /// The empty universe is not a blind sensor.
+    ///
+    /// A run that has projected no entity yet reported `coverage 0.000000` and
+    /// `blind spot 1.000000`, which reads as "this sensor sees nothing" while
+    /// thousands of events were flowing through it. A3's convention is the
+    /// opposite, and `asmr` implements it; this is the test that says the report
+    /// agrees.
+    #[test]
+    fn a_run_with_no_entities_yet_is_fully_covered_not_fully_blind() {
+        let empty = build(
+            &Metrics::default(),
+            &ObservationMap::new(),
+            0,
+            0,
+            0,
+            0.0,
+            1.0,
+        );
+        assert_eq!(empty.blind_spot, 0.0);
+        assert_eq!(empty.coverage(), 1.0);
+        assert_eq!(empty.entities, 0);
+    }
+
+    #[test]
+    fn an_entity_that_was_never_observed_is_a_blind_spot() {
+        // The other direction, so the fix cannot be "return zero always": a
+        // projected entity with nothing recorded against it is exactly the gap
+        // A3 exists to represent.
+        let observation = build(
+            &Metrics::default(),
+            &ObservationMap::new(),
+            4,
+            0,
+            0,
+            0.0,
+            1.0,
+        );
+        assert_eq!(observation.blind_spot, 1.0);
+        assert_eq!(observation.coverage(), 0.0);
+    }
+
+    #[test]
+    fn a_fully_observed_universe_has_no_blind_spot() {
+        let mut observe = ObservationMap::new();
+        for entity in 0..4 {
+            observe.observe(entity, ObsId(entity));
+        }
+        let observation = build(&Metrics::default(), &observe, 4, 0, 0, 0.0, 1.0);
+        assert_eq!(observation.blind_spot, 0.0);
+        assert_eq!(observation.coverage(), 1.0);
     }
 }

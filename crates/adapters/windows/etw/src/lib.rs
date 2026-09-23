@@ -52,7 +52,7 @@ pub use boundary::{
     },
     session::{
         Buffers, EnableReport, EtwSession, ProviderSpec, SessionConfig, SessionState, is_running,
-        session_state,
+        retire_orphaned_sessions, running_sessions, session_state, stop_session,
     },
     stats::{Stats, StatsSnapshot},
 };

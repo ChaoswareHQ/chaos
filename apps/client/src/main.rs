@@ -662,6 +662,27 @@ fn run_etw(args: &Args, host: HostId) -> Result<(), String> {
         ..Default::default()
     };
 
+    // Reclaim the sessions earlier runs left behind before adding another one.
+    // A session outlives the process that created it, so every run that was
+    // interrupted — which is every run during development — leaves one holding a
+    // session slot forever, and the kernel runs out. Names this program starts
+    // end in `-<pid>`, which is what makes the orphans findable.
+    match etw::retire_orphaned_sessions("chaos") {
+        Ok(retired) if !retired.is_empty() => {
+            println!(
+                "  reclaimed {} session{} left by a previous run: {}",
+                retired.len(),
+                if retired.len() == 1 { "" } else { "s" },
+                retired.join(", ")
+            );
+        }
+        Ok(_) => {}
+        // Never a reason to refuse to start: without the rights to enumerate
+        // other sessions the sensor simply cannot tidy up, and a sensor that
+        // does not run because housekeeping failed is the worse outcome.
+        Err(e) => eprintln!("  warning: could not check for sessions left behind: {e}"),
+    }
+
     // The failure an operator actually hits, so it gets a real explanation
     // rather than a bare OS code. `EtwObservation::start` is the only place we
     // still hold the typed error; by the time it is a `String` the code is gone.

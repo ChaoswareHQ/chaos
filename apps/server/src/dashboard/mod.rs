@@ -42,6 +42,7 @@
 //! like to have one. Read-only until there is an identity to attribute writes to.
 
 mod format;
+mod icons;
 mod style;
 mod views;
 
@@ -63,6 +64,8 @@ pub enum View {
     Detections,
     Hosts,
     Techniques,
+    /// What the server itself is doing: ingest, retention, the journal.
+    Status,
     /// One detection, opened from the queue.
     Detection,
 }
@@ -73,6 +76,7 @@ impl View {
             View::Detections => "detections",
             View::Hosts => "hosts",
             View::Techniques => "techniques",
+            View::Status => "status",
             View::Detection => "detection",
         }
     }
@@ -82,6 +86,7 @@ impl View {
             "detections" => Some(View::Detections),
             "hosts" => Some(View::Hosts),
             "techniques" => Some(View::Techniques),
+            "status" => Some(View::Status),
             "detection" => Some(View::Detection),
             _ => None,
         }
@@ -96,6 +101,22 @@ impl View {
         match self {
             View::Detection => View::Detections,
             other => other,
+        }
+    }
+
+    /// The section's name in the rail, and the browser tab's label.
+    ///
+    /// The browser tab is labelled by section rather than by page title: a
+    /// detection's `h1` is the alert's own title, and putting that in the tab
+    /// strip too would make the same sentence appear twice in the document — once
+    /// in chrome a person reads, once in chrome the browser draws.
+    pub fn label(self) -> &'static str {
+        match self {
+            View::Detections => "Detections",
+            View::Hosts => "Hosts",
+            View::Techniques => "Techniques",
+            View::Status => "Status",
+            View::Detection => "Detection",
         }
     }
 }
@@ -276,6 +297,22 @@ pub struct TechniqueRollup {
     pub hosts: u32,
 }
 
+/// Per-rule totals.
+///
+/// The queue is one row per `(host, rule)`; this is the same firings gathered the
+/// other way, which is the view that answers "which rule is doing this to my
+/// day". Both exist because both questions are asked, and neither grouping
+/// answers the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleRollup {
+    pub rule_id: String,
+    pub title: String,
+    pub severity: Severity,
+    pub technique: String,
+    pub firings: u64,
+    pub hosts: u32,
+}
+
 /// Per-host totals, for the Hosts tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRollup {
@@ -304,6 +341,7 @@ pub struct Stats {
     pub by_severity: BTreeMap<Severity, u32>,
     pub by_technique: Vec<TechniqueRollup>,
     pub by_host: Vec<HostRollup>,
+    pub by_rule: Vec<RuleRollup>,
     /// Detections matching the current facets.
     pub visible: usize,
     /// Detections in the queue at all.
@@ -319,6 +357,8 @@ impl Stats {
 
         let mut techniques: BTreeMap<String, TechniqueRollup> = BTreeMap::new();
         let mut hosts: BTreeMap<String, HostRollup> = BTreeMap::new();
+        let mut rules: BTreeMap<String, (RuleRollup, std::collections::BTreeSet<String>)> =
+            BTreeMap::new();
         let mut hosts_per_technique: BTreeMap<String, std::collections::BTreeSet<String>> =
             BTreeMap::new();
 
@@ -329,6 +369,23 @@ impl Stats {
 
             let severity = stats.by_severity.entry(alert.severity).or_default();
             *severity = severity.saturating_add(1);
+
+            let rule = rules.entry(alert.rule_id.clone()).or_insert_with(|| {
+                (
+                    RuleRollup {
+                        rule_id: alert.rule_id.clone(),
+                        title: alert.title.clone(),
+                        severity: alert.severity,
+                        technique: alert.technique.clone(),
+                        firings: 0,
+                        hosts: 0,
+                    },
+                    std::collections::BTreeSet::new(),
+                )
+            });
+            rule.0.firings = rule.0.firings.saturating_add(alert.firings);
+            rule.0.severity = rule.0.severity.max(alert.severity);
+            rule.1.insert(alert.host_id.clone());
 
             let technique = techniques
                 .entry(alert.technique.clone())
@@ -382,6 +439,19 @@ impl Stats {
                 .then_with(|| a.host_id.cmp(&b.host_id))
         });
 
+        stats.by_rule = rules
+            .into_values()
+            .map(|(mut rollup, hosts)| {
+                rollup.hosts = hosts.len() as u32;
+                rollup
+            })
+            .collect();
+        stats.by_rule.sort_by(|a, b| {
+            b.firings
+                .cmp(&a.firings)
+                .then_with(|| a.rule_id.cmp(&b.rule_id))
+        });
+
         stats
     }
 
@@ -405,16 +475,54 @@ pub const QUEUE_PAGE: usize = 200;
 pub struct Ctx<'a> {
     pub snapshot: &'a Snapshot,
     pub stats: &'a Stats,
+    pub status: &'a Status,
     pub filters: &'a Filters,
     pub now: DateTime<Utc>,
 }
 
+/// What the server itself is doing, as opposed to what the fleet reported.
+///
+/// None of this is derivable from a [`Snapshot`]: it is properties of the
+/// process — how long it has been up, what the journal has done, how close each
+/// bounded collection is to the cap it will be trimmed at. The console is the
+/// only place an operator can see them without a second terminal, which is the
+/// whole reason the status page exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Status {
+    /// When this server started. The uptime on the status page is `now - this`.
+    pub started: DateTime<Utc>,
+    /// Alert rows kept before the least recently active are dropped.
+    pub store_cap: usize,
+    /// Batch ids remembered for deduplication.
+    pub batch_cap: usize,
+    /// Hosts this server will enroll.
+    pub host_cap: usize,
+    /// The journal, when the server was told to keep one.
+    pub journal: Option<JournalFacts>,
+}
+
+/// The journal's own numbers, flattened.
+///
+/// Copied out of the journal's stats rather than borrowed, so that a view does
+/// not hold a lock on the file while it renders a page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JournalFacts {
+    pub path: String,
+    pub segments: usize,
+    /// Records read back at startup.
+    pub replayed: usize,
+    /// Torn records discarded from the end of a segment.
+    pub skipped: usize,
+    pub bytes: u64,
+}
+
 /// Render the page the filters ask for.
-pub fn page(snapshot: &Snapshot, filters: &Filters, now: DateTime<Utc>) -> String {
+pub fn page(snapshot: &Snapshot, status: &Status, filters: &Filters, now: DateTime<Utc>) -> String {
     let stats = Stats::compute(snapshot, filters);
     let ctx = Ctx {
         snapshot,
         stats: &stats,
+        status,
         filters,
         now,
     };

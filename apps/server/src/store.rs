@@ -481,6 +481,15 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// The alert-row cap, for the console's retention panel.
+    pub fn alert_cap(&self) -> usize {
+        self.max_alerts
+    }
+
+    /// The deduplication cap, for the console's retention panel.
+    pub fn batch_cap(&self) -> usize {
+        self.max_batches
+    }
     pub fn new(max_alerts: usize, max_batches: usize) -> Self {
         Self {
             inner: RwLock::new(Inner::default()),
