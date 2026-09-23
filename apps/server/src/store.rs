@@ -36,8 +36,10 @@
 //! the count, which is the one direction this must never be wrong in: a count
 //! that is too low hides firings an analyst needed to see.
 
+use crate::journal::Record;
 use chrono::{DateTime, Utc};
 use model::Severity;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
 
@@ -52,7 +54,7 @@ use std::sync::RwLock;
 const MAX_ITEMISED_OCCURRENCES: usize = 64;
 
 /// What the server remembers about one enrolled host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostRecord {
     pub host_id: String,
     pub hostname: String,
@@ -78,7 +80,7 @@ impl HostRecord {
 }
 
 /// An alert as it arrived, before it is folded into a row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomingAlert {
     /// The agent's alert id: unique per occurrence, stable across restatements
     /// of that same occurrence. This is what makes folding idempotent.
@@ -97,7 +99,7 @@ pub struct IncomingAlert {
 }
 
 /// One row of the alert queue: a single detection on a single host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAlert {
     pub host_id: String,
     pub rule_id: String,
@@ -128,7 +130,17 @@ pub struct IngestOutcome {
     pub duplicate: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+/// What a rebuild from the journal accounted for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplayOutcome {
+    pub applied: usize,
+    /// Ingest records naming a host the journal never enrolled. Skipped, because
+    /// the store refuses writes from unknown hosts live and must refuse them on
+    /// replay too, or it would rebuild a state the server could not have reached.
+    pub unknown_hosts: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub hosts: Vec<HostRecord>,
     pub alerts: Vec<StoredAlert>,
@@ -338,6 +350,83 @@ impl Inner {
         }
     }
 
+    /// The one place a batch becomes state, shared by the live path and replay.
+    ///
+    /// Sharing it is the point: a second copy written for replay would drift the
+    /// moment either side changed, and "the state came back the same" would be a
+    /// coincidence rather than a guarantee.
+    ///
+    /// `at` is the batch's timestamp, and the caller supplies it rather than this
+    /// function reading a clock, because the live path has to journal the *same*
+    /// instant it stamped the rows with. A replay then hands back the recorded
+    /// time and the rebuilt rows are identical instead of microseconds off.
+    fn apply_ingest(
+        &mut self,
+        host_id: &str,
+        batch_id: &str,
+        events: usize,
+        alerts: Vec<IncomingAlert>,
+        at: DateTime<Utc>,
+        max_alerts: usize,
+        max_batches: usize,
+    ) -> IngestOutcome {
+        let now = at;
+
+        // The host must still exist: a host removed between authentication and
+        // ingest must not be able to write.
+        if !self.hosts.contains_key(host_id) {
+            return IngestOutcome {
+                accepted_events: 0,
+                accepted_alerts: 0,
+                duplicate: false,
+            };
+        }
+
+        if !self.seen_batches.insert(batch_id.to_string()) {
+            self.duplicate_batches += 1;
+            return IngestOutcome {
+                accepted_events: 0,
+                accepted_alerts: 0,
+                duplicate: true,
+            };
+        }
+        self.batch_order.push_back(batch_id.to_string());
+        while self.batch_order.len() > max_batches {
+            if let Some(oldest) = self.batch_order.pop_front() {
+                self.seen_batches.remove(&oldest);
+            }
+        }
+
+        // Counted, not received. The agent restates an alert at the end of a run
+        // so the server can pick up its final count, and that message is not
+        // another alert: reporting it as one would contradict both the console's
+        // alert total and the host's own row.
+        let mut accepted_alerts = 0usize;
+        for alert in alerts {
+            let folded = self.fold(host_id, alert, now);
+            if folded.new_occurrence {
+                accepted_alerts += 1;
+                self.total_alerts = self.total_alerts.saturating_add(1);
+            }
+            self.total_firings = self.total_firings.saturating_add(folded.added_firings);
+        }
+        self.enforce_retention(max_alerts);
+
+        self.total_events = self.total_events.saturating_add(events as u64);
+
+        if let Some(host) = self.hosts.get_mut(host_id) {
+            host.last_seen = now;
+            host.events = host.events.saturating_add(events as u64);
+            host.alerts = host.alerts.saturating_add(accepted_alerts as u64);
+        }
+
+        IngestOutcome {
+            accepted_events: events,
+            accepted_alerts,
+            duplicate: false,
+        }
+    }
+
     /// Drop rows until the queue fits, least recently active first.
     ///
     /// By `last_seen` rather than by position: a detection that is still firing
@@ -361,6 +450,26 @@ impl Inner {
 }
 
 /// Bounded, in-memory implementation.
+///
+/// # What bounds growth
+///
+/// Three caps, because three things grow: alert rows (`max_alerts`, least
+/// recently active dropped first), remembered batch ids (`max_batches`), and
+/// enrolled hosts (the enrollment authority's `max_hosts`, which refuses rather
+/// than evicts — silently forgetting a host's credential would de-enroll a
+/// machine that is still reporting). Every collection here is bounded by one of
+/// them, so an enrolled host cannot drive the server out of memory however hard
+/// it tries.
+///
+/// # Why one lock and not one writer
+///
+/// Every ingest takes the write lock, which looks like the obvious thing to
+/// replace with a queue and a single writer task. It is not, yet: the critical
+/// section is a fold over the alerts in one batch — microseconds, no I/O, no
+/// `.await` — and a handoff through a channel costs more than the contention it
+/// removes at any rate one host can produce. What would actually change the
+/// answer is the fold growing into something that does I/O, at which point the
+/// writer task is the right shape and this comment is the wrong one.
 pub struct MemoryStore {
     inner: RwLock<Inner>,
     /// Alert rows kept for the console. The least recently active are dropped
@@ -391,6 +500,91 @@ impl MemoryStore {
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Apply one batch, stamped with the caller's clock.
+    ///
+    /// The live HTTP path calls this rather than the trait method so that the
+    /// instant it journals is the same one the rows were stamped with.
+    pub(crate) fn apply_ingest(
+        &self,
+        host_id: &str,
+        batch_id: &str,
+        events: usize,
+        alerts: Vec<IncomingAlert>,
+        at: DateTime<Utc>,
+    ) -> IngestOutcome {
+        let mut inner = self.write();
+        inner.apply_ingest(
+            host_id,
+            batch_id,
+            events,
+            alerts,
+            at,
+            self.max_alerts,
+            self.max_batches,
+        )
+    }
+
+    /// Rebuild this store from a journal, in the order it was written.
+    ///
+    /// Returns how many records were applied and how many named a host this store
+    /// does not have.
+    ///
+    /// Order is arrival order and it matters: `first_seen`/`last_seen` and the
+    /// rule that severity only rises are defined by the sequence of batches, so
+    /// this is a fold over the file rather than a set of independent writes.
+    ///
+    /// An `Ingest` whose host was never enrolled is skipped and counted rather
+    /// than applied, because the live store refuses writes from an unknown host
+    /// and a replay that accepted them would rebuild a state the server could
+    /// never have reached. Nothing is journaled here: this is a rebuild, and
+    /// re-appending what was just read would double the file on every start.
+    ///
+    /// `duplicate_batches` is the one counter this cannot reproduce — a
+    /// duplicate is not journaled, since it changes nothing — so it reads zero
+    /// after a restart. Every count that describes what was received is exact.
+    pub fn replay(&self, records: &[Record]) -> ReplayOutcome {
+        let mut inner = self.write();
+        let mut outcome = ReplayOutcome::default();
+
+        for record in records {
+            match record {
+                Record::Host { record } => {
+                    // Enrollment is the one record replay cannot refuse: without
+                    // it every later batch for this host would be dropped.
+                    inner
+                        .hosts
+                        .entry(record.host_id.clone())
+                        .or_insert_with(|| record.clone());
+                    outcome.applied += 1;
+                }
+                Record::Ingest {
+                    host_id,
+                    batch_id,
+                    events,
+                    alerts,
+                    at,
+                } => {
+                    if !inner.hosts.contains_key(host_id) {
+                        outcome.unknown_hosts += 1;
+                        continue;
+                    }
+                    inner.apply_ingest(
+                        host_id,
+                        batch_id,
+                        *events,
+                        alerts.clone(),
+                        *at,
+                        self.max_alerts,
+                        self.max_batches,
+                    );
+                    outcome.applied += 1;
+                }
+            }
+        }
+
+        outcome
     }
 }
 
@@ -425,62 +619,10 @@ impl Store for MemoryStore {
         events: usize,
         alerts: Vec<IncomingAlert>,
     ) -> IngestOutcome {
-        let mut inner = self.write();
-
-        // The host must still exist: a host removed between authentication and
-        // ingest must not be able to write.
-        if !inner.hosts.contains_key(host_id) {
-            return IngestOutcome {
-                accepted_events: 0,
-                accepted_alerts: 0,
-                duplicate: false,
-            };
-        }
-
-        if !inner.seen_batches.insert(batch_id.to_string()) {
-            inner.duplicate_batches += 1;
-            return IngestOutcome {
-                accepted_events: 0,
-                accepted_alerts: 0,
-                duplicate: true,
-            };
-        }
-        inner.batch_order.push_back(batch_id.to_string());
-        while inner.batch_order.len() > self.max_batches {
-            if let Some(oldest) = inner.batch_order.pop_front() {
-                inner.seen_batches.remove(&oldest);
-            }
-        }
-
-        let now = Utc::now();
-        // Counted, not received. The agent restates an alert at the end of a run
-        // so the server can pick up its final count, and that message is not
-        // another alert: reporting it as one would contradict both the console's
-        // alert total and the host's own row.
-        let mut accepted_alerts = 0usize;
-        for alert in alerts {
-            let folded = inner.fold(host_id, alert, now);
-            if folded.new_occurrence {
-                accepted_alerts += 1;
-                inner.total_alerts = inner.total_alerts.saturating_add(1);
-            }
-            inner.total_firings = inner.total_firings.saturating_add(folded.added_firings);
-        }
-        inner.enforce_retention(self.max_alerts);
-
-        inner.total_events = inner.total_events.saturating_add(events as u64);
-
-        if let Some(host) = inner.hosts.get_mut(host_id) {
-            host.last_seen = now;
-            host.events = host.events.saturating_add(events as u64);
-            host.alerts = host.alerts.saturating_add(accepted_alerts as u64);
-        }
-
-        IngestOutcome {
-            accepted_events: events,
-            accepted_alerts,
-            duplicate: false,
-        }
+        // The trait path names no instant, so the store reads its own clock. The
+        // live HTTP path uses `apply_ingest` directly instead, because it has to
+        // journal the same instant the rows were stamped with.
+        self.apply_ingest(host_id, batch_id, events, alerts, Utc::now())
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -877,5 +1019,24 @@ mod tests {
         let snapshot = store.snapshot();
         assert_eq!(snapshot.hosts[0].host_id, "new");
         assert_eq!(snapshot.hosts[1].host_id, "old");
+    }
+
+    #[test]
+    fn replay_drops_a_batch_whose_host_was_never_enrolled() {
+        // The live store refuses a write from a host it does not hold, so a
+        // replay that applied one would invent a state the server could not reach.
+        let records = vec![Record::Ingest {
+            host_id: "ghost".to_string(),
+            batch_id: "g-1".to_string(),
+            events: 7,
+            alerts: vec![],
+            at: Utc::now(),
+        }];
+
+        let store = MemoryStore::default();
+        let outcome = store.replay(&records);
+        assert_eq!(outcome.applied, 0);
+        assert_eq!(outcome.unknown_hosts, 1);
+        assert_eq!(store.snapshot().total_events, 0);
     }
 }

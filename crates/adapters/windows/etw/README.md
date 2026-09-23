@@ -7,6 +7,16 @@ This crate is `#![cfg(windows)]` and is the only part of the product that talks
 to the trace API. It produces telemetry; it does not know what a technique is,
 what a rule is, or what an alert is.
 
+> **A note on `tools/`.** This document names four files under `tools/` —
+> `dump-fields.ps1`, `attack-corpus.md`, `verify-coverage.ps1` and
+> `etw-load.ps1`. None of them is in the repository. The provenance they are
+> cited for is real: every field name below was read off a running host with
+> `dump-fields.ps1`. The script itself is not shipped, so re-checking a name on
+> a new build means re-creating it. `attack-corpus.md` and
+> `verify-coverage.ps1` are the measurement half and have never been written,
+> which is why this crate can state what it collects rather than a coverage
+> percentage.
+
 ## Shape
 
 Five layers, in the order an event flows through them:
@@ -353,17 +363,20 @@ only changes a number on a slide. So every shape in the table above has a rule i
 `crates/pipeline/src/rules.rs`, and the rule list is what to read to know what this
 sensor actually detects.
 
-Measuring it needs four things, and this repository has all four:
+Measuring it needs four things. Two are in this repository; the other two are
+not yet written, and saying which is which matters more than a tidy sentence,
+because a coverage *claim* is exactly what this section exists to prevent:
 
-1. **A corpus** — per technique, the exact event that would prove it executed:
-   `tools/attack-corpus.md`.
+1. **A corpus** — per technique, the exact event that would prove it executed.
+   **Not in the tree.** This is the shape `tools/attack-corpus.md` would take.
 2. **A live test** — run the technique on a controlled host with the sensor on.
    This is the operator's step, and no script can do it safely.
 3. **A sensor trace** — did the shape fire? Did it reach the wire? Did the rule
-   score it? `Translator::counts()` reports it, and
-   `tools/verify-coverage.ps1` turns a capture into a per-technique report.
-4. **A count** — techniques detected ÷ techniques tested. Printed by the same
-   script.
+   score it? **In the tree:** `Translator::counts()` reports `attempted`/`mapped`
+   per shape, `undecodable` names a wrong field table, and `detect_gaps()`
+   separates a quiet host from a shape that stopped firing.
+4. **A count** — techniques detected ÷ techniques tested. Needs (1), and the
+   script that would read (3) into a per-technique report. Neither is written.
 
 Step 3 is already instrumented in the sensor itself: `Translator::counts()`
 reports `attempted`/`mapped` per shape, `undecodable` names the shapes whose field
@@ -378,15 +391,30 @@ proves, and it is worth repeating: it measures the sensor, not the adversary. A
 row that reads `none` means no evidence was observed, which is only the same thing
 as "missed" if the technique was actually performed during the window.
 
-### The shapes that still have no rule
+### Every shape now has a rule
 
-One consequence of "coverage is measured by rules" is worth stating plainly: of
-the fifteen shapes in the table above, five currently decode but no rule reads
-them — `file_delete`, `file_rename`, `network_connect`, `network_disconnect` and
-`process_exit`. They are shipped because the counters and the histogram are what
-make the gap visible, and `tools/attack-corpus.md` lists what a rule for each one
-would say. Until then they are telemetry, not detection, and counting them as
-coverage would be exactly the mistake this section exists to avoid.
+The five shapes that used to decode with nothing reading them — `file_delete`,
+`file_rename`, `network_connect`, `network_disconnect` and `process_exit` — now
+have rules. They were last for a reason, and it is the same reason each of them
+is weak: every one is a *single-event* signal from a provider that does not carry
+enough context to do better. What each is worth is written down here rather than
+left for a reader to discover:
+
+| Shape | Rule | Technique | What limits it |
+|---|---|---|---|
+| `file_delete` | `executable_deleted_from_staging_location` | T1070.004 | Installers delete from `%TEMP%` too. The location test is the *staging* subset and not every writable place, so a build under `\users\` does not fire it. |
+| `file_rename` | `ransomware_extension_on_rename` | T1486 | The provider reports a name *fragment* and no rename target, so only the tail of the name is readable. A fragment ending in `.locked` names an encrypted file; nothing else about a rename is ruleable. |
+| `network_connect` | `connect_to_implant_default_port` | T1571 | Needs both a default implant port *and* a routable destination: `127.0.0.1:4444` is a test harness and `10.0.0.5:4444` is a lab. |
+| `network_disconnect` | `large_transfer_to_implant_port` | T1041 | The byte count is the total moved in *both* directions, so on its own it cannot separate an upload from a download. Multiplexed onto an implant port it can. |
+| `process_exit` | `exploitation_crash_exit_code` | T1203 | The exit code is the only field the event carries. `STATUS_STACK_OVERFLOW` is deliberately excluded — a recursive bug produces it far more often than an exploit. |
+
+None of these alerts on its own. Each carries a likelihood pair whose `miss` is a
+substantial fraction of its `hit`, which is the file's way of saying *evidence,
+not verdict*, and the engine's threshold, decay and coalescing are what decide
+when several of them add up to a row. Counting them as coverage would still be
+the mistake this section exists to avoid — but a shape with no rule at all was
+the larger one, because a decode with nothing behind it changes no host's
+behaviour.
 
 ### What ETW cannot see
 

@@ -243,9 +243,104 @@ pub fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Body encoding
+// ---------------------------------------------------------------------------
+
+/// The only body encoding this protocol defines.
+///
+/// A value rather than a bare string so a client and a server cannot disagree
+/// about the spelling: comparing against this is what the server does, and
+/// setting it is what the client does.
+pub const GZIP_ENCODING: &str = "gzip";
+
+/// Compress a batch body.
+///
+/// Batches are typed JSON, which repeats the same field names on every event in
+/// the batch; that redundancy is exactly what a compressor is good at. The level
+/// is `fast` rather than `best` on purpose: the agent is compressing on the host
+/// it is also measuring, and the extra levels buy a few percent of bytes for a
+/// multiple of the CPU.
+///
+/// The output is a complete gzip member, so it can be written to a `.gz` file
+/// or inspected with standard tools when something looks wrong on the wire.
+pub fn gzip(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::with_capacity(body.len() / 2 + 64), Compression::fast());
+    encoder.write_all(body)?;
+    encoder.finish()
+}
+
+/// Decompress a gzip body, refusing to produce more than `max_bytes`.
+///
+/// The bound is not a detail. A few kilobytes of gzip expands to gigabytes, and
+/// the server decompresses a body an authenticated-but-untrusted host sent — so
+/// an unbounded inflate is a denial of service any enrolled host can drive. The
+/// limit is enforced while reading, so the oversized buffer is never built.
+pub fn gunzip(body: &[u8], max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    // One byte past the ceiling, so "exactly the limit" still succeeds.
+    let mut decoder = GzDecoder::new(body).take(max_bytes as u64 + 1);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    if out.len() > max_bytes {
+        return Err(std::io::Error::other("decompressed body exceeds the limit"));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_round_trips_and_actually_shrinks_repetitive_bodies() {
+        // The batch shape: one set of field names, many events.
+        let event =
+            r#"{"kind":"process_start","pid":4242,"provider":"Microsoft-Windows-Kernel-Process"}"#;
+        let body: Vec<u8> = std::iter::repeat_with(|| event.as_bytes())
+            .take(200)
+            .flatten()
+            .copied()
+            .collect();
+
+        let compressed = gzip(&body).expect("compresses");
+        assert!(
+            compressed.len() < body.len() / 4,
+            "repetitive JSON should shrink hard: {} -> {}",
+            body.len(),
+            compressed.len()
+        );
+        assert_eq!(gunzip(&compressed, 1 << 20).expect("decompresses"), body);
+    }
+
+    #[test]
+    fn a_body_that_would_inflate_past_the_limit_is_refused() {
+        // The bomb guard: the server inflates a body an untrusted host sent, and
+        // a bound that is only checked afterwards would have allocated it first.
+        let compressed = gzip(&vec![b'x'; 4 * 1024 * 1024]).expect("compresses");
+        let error = gunzip(&compressed, 1024).expect_err("must be refused");
+        assert!(error.to_string().contains("exceeds the limit"), "{error}");
+    }
+
+    #[test]
+    fn a_truncated_body_is_an_error_rather_than_a_short_batch() {
+        // The failure that must not be silent: half a batch parsing as a whole
+        // one and being counted as if it were complete.
+        let compressed = gzip(b"not a lot of data").expect("compresses");
+        let truncated = &compressed[..compressed.len() - 4];
+        assert!(gunzip(truncated, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn a_body_that_is_not_gzip_is_an_error() {
+        assert!(gunzip(b"{\"events\":[]}", 1 << 20).is_err());
+    }
 
     #[test]
     fn hex_round_trips() {

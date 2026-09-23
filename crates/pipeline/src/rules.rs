@@ -16,6 +16,7 @@
 
 use asmr::infer::Likelihood;
 use model::{EventKind, TelemetryEvent};
+use std::net::IpAddr;
 
 /// One piece of evidence, with the rule that produced it.
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +127,60 @@ const WRITABLE_MARKERS: &[&str] = &[
     "\\users\\",
 ];
 
+/// The subset of the writable places where a *staged* payload lives.
+///
+/// Deliberately narrower than [`WRITABLE_MARKERS`], which contains `\users\`.
+/// That marker is right for a file being *written* — the location is the point —
+/// and wrong for one being *deleted*: every build directory, every IDE output
+/// and every per-user install lives under it, so a deletion rule keyed on it
+/// fires on `cargo clean`. The narrower list is the same mistake avoided a
+/// second time, and the `explorer.exe` entry in the README's testing section is
+/// what the first one cost.
+const STAGING_MARKERS: &[&str] = &[
+    "\\temp\\",
+    "\\tmp\\",
+    "\\downloads\\",
+    "\\public\\",
+    "\\programdata\\",
+];
+
+/// Extensions ransomware leaves on the files it encrypts.
+///
+/// The rename provider reports a name *fragment* rather than a path (see the
+/// `file_rename` decoder for the verified template), so there is almost nothing
+/// about a rename that is ruleable. The tail is the exception: a fragment ending
+/// in `.locked` is a fragment that names an encrypted file.
+const RANSOMWARE_EXTENSIONS: &[&str] = &[
+    ".locked",
+    ".encrypted",
+    ".crypto",
+    ".crypt",
+    ".locky",
+    ".zepto",
+    ".wcry",
+    ".wncry",
+    ".ryuk",
+];
+
+/// TCP ports that are an implant's default far more often than a service's.
+///
+/// Not a blocklist of "bad ports". A port is only evidence when the destination
+/// is off this network, which is what [`is_routable`] is for; this list just
+/// names the ones whose benign use is rare enough to be worth a finding.
+const IMPLANT_PORTS: &[u16] = &[4444, 1337, 31337, 12345, 54321, 6666, 6667, 9001];
+
+/// The `NTSTATUS` values a process fails with when it dies of a fault.
+///
+/// `STATUS_STACK_OVERFLOW` (`0xC00000FD`) is deliberately absent: a recursive
+/// bug produces it far more often than an exploit does, so its `miss` would be
+/// the `hit` and it would be noise wearing a technique code.
+const CRASH_EXIT_CODES: &[u32] = &[
+    0xC000_0005, // STATUS_ACCESS_VIOLATION
+    0xC000_001D, // STATUS_ILLEGAL_INSTRUCTION
+    0xC000_0374, // STATUS_HEAP_CORRUPTION
+    0xC000_0409, // STATUS_STACK_BUFFER_OVERRUN
+];
+
 /// Lowercased final path component.
 fn base_name(path: &str) -> String {
     path.rsplit(['\\', '/'])
@@ -159,6 +214,42 @@ fn in_writable_location(path: &str) -> bool {
     WRITABLE_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Whether an address is one the public internet could reach from here.
+///
+/// The conjunction every network rule below needs: a connect to port 4444 is
+/// worth reporting when the far end is off this network, and unremarkable when
+/// it is `127.0.0.1` or a lab address. Written out rather than delegating to
+/// `Ipv4Addr::is_global` so that the ranges treated as *not* routable are
+/// visible to whoever changes this next.
+fn is_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(o[0] == 0
+                || o[0] == 127
+                || o[0] >= 224
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_documentation()
+                // 100.64.0.0/10 — carrier-grade NAT.
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                // 192.0.0.0/24 and 198.18.0.0/15 — protocol assignment and benchmarking.
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19)))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7 — unique local.
+                || (s[0] & 0xfe00) == 0xfc00
+                // fe80::/10 — link local.
+                || (s[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
 /// Evaluate every rule against one event.
 pub fn evaluate(event: &TelemetryEvent, facts: &Facts<'_>) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -180,6 +271,11 @@ pub fn evaluate(event: &TelemetryEvent, facts: &Facts<'_>) -> Vec<Finding> {
         scheduled_task_registered,
         unsigned_image_from_writable_location,
         executable_dropped_in_writable_location,
+        executable_deleted_from_staging_location,
+        ransomware_extension_on_rename,
+        connect_to_implant_default_port,
+        large_transfer_to_implant_port,
+        exploitation_crash_exit_code,
     ] {
         if let Some(finding) = rule(event, facts) {
             findings.push(finding);
@@ -803,6 +899,144 @@ fn executable_dropped_in_writable_location(
     })
 }
 
+/// T1070.004: an executable or script deleted from a staging location.
+///
+/// The cleanup half of a dropper: a payload that ran out of `%TEMP%` and then
+/// removed itself. Weak on its own — installers and uninstallers delete from
+/// those directories too — which is why the location test is [`STAGING_MARKERS`]
+/// and not every writable place.
+fn executable_deleted_from_staging_location(
+    event: &TelemetryEvent,
+    _facts: &Facts<'_>,
+) -> Option<Finding> {
+    let EventKind::FileDelete(file) = &event.kind else {
+        return None;
+    };
+    let path = lower(&file.path);
+    if !EXECUTABLE_EXTENSIONS.iter().any(|e| path.ends_with(e)) {
+        return None;
+    }
+    if !STAGING_MARKERS.iter().any(|m| path.contains(m)) {
+        return None;
+    }
+
+    Some(Finding {
+        rule: "executable_deleted_from_staging_location",
+        technique: "T1070.004",
+        likelihood: evidence(0.30, 0.080),
+        detail: format!("executable deleted from {}", file.path).into(),
+    })
+}
+
+/// T1486: a rename onto a known ransomware extension.
+///
+/// Read the `file_rename` decoder before trusting this. The provider reports one
+/// name fragment and no rename target, so the only field of a rename that is
+/// still meaningful when it is a fragment is the *end* of it — and a fragment
+/// ending in `.locked` names an encrypted file. It is kept narrow for that
+/// reason: a rule over the rest of a fragment would be reading tea leaves.
+fn ransomware_extension_on_rename(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let EventKind::FileRename(rename) = &event.kind else {
+        return None;
+    };
+    let name = lower(&rename.new_path);
+    let extension = RANSOMWARE_EXTENSIONS.iter().find(|e| name.ends_with(*e))?;
+
+    Some(Finding {
+        rule: "ransomware_extension_on_rename",
+        technique: "T1486",
+        likelihood: evidence(0.35, 0.020),
+        detail: format!("file renamed to a {extension} name").into(),
+    })
+}
+
+/// T1571: a TCP connect to an implant's default port on a routable address.
+///
+/// Both halves are required. A connect to `127.0.0.1:4444` is somebody's test
+/// harness and one to `10.0.0.5:4444` is a lab; only a destination off this
+/// network makes a default implant port a fact worth recording. Even then it is
+/// evidence, not a verdict — which is what the likelihood pair says.
+fn connect_to_implant_default_port(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let EventKind::NetworkConnect(connect) = &event.kind else {
+        return None;
+    };
+    if !IMPLANT_PORTS.contains(&connect.destination_port) {
+        return None;
+    }
+    if !is_routable(connect.destination_ip) {
+        return None;
+    }
+
+    Some(Finding {
+        rule: "connect_to_implant_default_port",
+        technique: "T1571",
+        likelihood: evidence(0.40, 0.030),
+        detail: format!(
+            "connect to {}:{}",
+            connect.destination_ip, connect.destination_port
+        )
+        .into(),
+    })
+}
+
+/// T1041: a large transfer to a routable address on an implant's default port.
+///
+/// `NetworkDisconnect`'s byte count is the total moved in *both* directions —
+/// the decoder says so and refuses to split it — so on its own it cannot tell an
+/// upload from a download. The conjunction is what makes it usable: tens of
+/// megabytes to a routable host on port 4444 is not a download a person asked
+/// for, while the same volume on 443 is whatever they were streaming.
+fn large_transfer_to_implant_port(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let EventKind::NetworkDisconnect(disconnect) = &event.kind else {
+        return None;
+    };
+    if !IMPLANT_PORTS.contains(&disconnect.destination_port) {
+        return None;
+    }
+    if !is_routable(disconnect.destination_ip) {
+        return None;
+    }
+    let bytes = disconnect.bytes_sent.unwrap_or(0);
+    const LARGE: u64 = 8 * 1024 * 1024;
+    if bytes < LARGE {
+        return None;
+    }
+
+    Some(Finding {
+        rule: "large_transfer_to_implant_port",
+        technique: "T1041",
+        likelihood: evidence(0.30, 0.015),
+        detail: format!(
+            "{bytes} bytes to {}:{}",
+            disconnect.destination_ip, disconnect.destination_port
+        )
+        .into(),
+    })
+}
+
+/// T1203: a process that died of a fault an exploit would produce.
+///
+/// The exit code is the only field `ProcessExit` carries, and a crash is what
+/// successful exploitation of a user-mode target looks like from the outside.
+/// Deliberately weak: software crashes on its own all the time, and that is what
+/// the `miss` says. It is evidence *next to* something else, not on its own.
+fn exploitation_crash_exit_code(event: &TelemetryEvent, _facts: &Facts<'_>) -> Option<Finding> {
+    let EventKind::ProcessExit(exit) = &event.kind else {
+        return None;
+    };
+    let code = exit.exit_code? as u32;
+    if !CRASH_EXIT_CODES.contains(&code) {
+        return None;
+    }
+
+    Some(Finding {
+        rule: "exploitation_crash_exit_code",
+        technique: "T1203",
+        likelihood: evidence(0.15, 0.020),
+        detail: format!("process exited with {code:#010X}").into(),
+    })
+}
+
 /// A human name for a rule, for an alert title.
 ///
 /// Deliberately not the rule id. The alert table already carries the technique
@@ -828,6 +1062,11 @@ pub fn rule_title(rule: &str) -> &'static str {
         "scheduled_task_registered" => "Scheduled task registered outside the Windows namespace",
         "unsigned_image_from_writable_location" => "Unsigned image loaded from a writable location",
         "executable_dropped_in_writable_location" => "Executable written to a writable location",
+        "executable_deleted_from_staging_location" => "Executable deleted from a staging directory",
+        "ransomware_extension_on_rename" => "File renamed to a ransomware extension",
+        "connect_to_implant_default_port" => "Connection to an implant's default port",
+        "large_transfer_to_implant_port" => "Large transfer to an implant's default port",
+        "exploitation_crash_exit_code" => "Process died from an exploitation-class fault",
         _ => "Suspicious activity",
     }
 }
@@ -837,6 +1076,10 @@ mod tests {
     use super::*;
     use model::{DnsQueryPayload, EventId, HostId, Payload, ProcessId, ProcessStart, RegistrySet};
     use model::{EventKind, Value};
+    use model::{
+        FileDelete, FileRename, NetworkConnect, NetworkDisconnect, NetworkProtocol, ProcessExit,
+    };
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn event(kind: EventKind) -> TelemetryEvent {
         TelemetryEvent::new(
@@ -872,6 +1115,50 @@ mod tests {
 
     fn rule_names(findings: &[Finding]) -> Vec<&str> {
         findings.iter().map(|f| f.rule).collect()
+    }
+
+    fn file_delete(path: &str) -> TelemetryEvent {
+        event(EventKind::FileDelete(FileDelete {
+            pid: ProcessId::new(100),
+            path: path.into(),
+            deleted_at: chrono::Utc::now(),
+        }))
+    }
+
+    /// A TCP connect from a fixed local address. Only the destination is read by
+    /// the rule, but the model requires both halves of the flow.
+    fn connect(destination: IpAddr, port: u16) -> TelemetryEvent {
+        event(EventKind::NetworkConnect(NetworkConnect {
+            pid: ProcessId::new(100),
+            source_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            source_port: 51000,
+            destination_ip: destination,
+            destination_port: port,
+            protocol: NetworkProtocol::Tcp,
+            initiated_at: chrono::Utc::now(),
+        }))
+    }
+
+    fn transfer(bytes: u64, port: u16) -> TelemetryEvent {
+        event(EventKind::NetworkDisconnect(NetworkDisconnect {
+            pid: ProcessId::new(100),
+            source_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            source_port: 51000,
+            destination_ip: IpAddr::V4(Ipv4Addr::new(185, 199, 108, 153)),
+            destination_port: port,
+            protocol: NetworkProtocol::Tcp,
+            bytes_sent: Some(bytes),
+            bytes_received: None,
+            ended_at: chrono::Utc::now(),
+        }))
+    }
+
+    fn process_exit(exit_code: Option<i32>) -> TelemetryEvent {
+        event(EventKind::ProcessExit(ProcessExit {
+            pid: ProcessId::new(100),
+            exit_code,
+            exited_at: chrono::Utc::now(),
+        }))
     }
 
     /// A PowerShell script block, as the sensor would build one from a 4104.
@@ -1224,6 +1511,11 @@ mod tests {
             "scheduled_task_registered",
             "unsigned_image_from_writable_location",
             "executable_dropped_in_writable_location",
+            "executable_deleted_from_staging_location",
+            "ransomware_extension_on_rename",
+            "connect_to_implant_default_port",
+            "large_transfer_to_implant_port",
+            "exploitation_crash_exit_code",
         ];
         for rule in RULES {
             let title = rule_title(rule);
@@ -1446,5 +1738,125 @@ mod tests {
         // evidence, and the difference is the whole reason `signed` is an
         // `Option` rather than a `bool`.
         assert!(evaluate(&image_load(writable, None), &Facts::default()).is_empty());
+    }
+
+    #[test]
+    fn a_deleted_executable_in_a_staging_directory_is_evidence() {
+        // T1070.004. The *staging* subset is what keeps this honest: `\users\`
+        // is where every build, every IDE and every per-user install writes, and
+        // a rule that fires on `cargo clean` is a rule nobody leaves enabled.
+        let staged = file_delete("C:\\Users\\a\\AppData\\Local\\Temp\\dropper.exe");
+        assert_eq!(
+            rule_names(&evaluate(&staged, &Facts::default())),
+            vec!["executable_deleted_from_staging_location"]
+        );
+
+        let build = file_delete("C:\\Users\\a\\project\\target\\debug\\app.exe");
+        assert!(
+            evaluate(&build, &Facts::default()).is_empty(),
+            "a build directory is not a staging directory"
+        );
+
+        let document = file_delete("C:\\Users\\a\\AppData\\Local\\Temp\\notes.txt");
+        assert!(
+            evaluate(&document, &Facts::default()).is_empty(),
+            "a deleted document is not a deleted payload"
+        );
+    }
+
+    #[test]
+    fn a_rename_onto_a_ransomware_extension_is_evidence() {
+        let locked = event(EventKind::FileRename(FileRename {
+            pid: ProcessId::new(100),
+            old_path: "invoice.docx".into(),
+            new_path: "invoice.docx.locked".into(),
+            renamed_at: chrono::Utc::now(),
+        }));
+        assert_eq!(
+            rule_names(&evaluate(&locked, &Facts::default())),
+            vec!["ransomware_extension_on_rename"]
+        );
+
+        // The common case, and the reason the rule reads only the tail: an
+        // ordinary rename is a name fragment that says nothing at all.
+        let ordinary = event(EventKind::FileRename(FileRename {
+            pid: ProcessId::new(100),
+            old_path: "notes.txt".into(),
+            new_path: "notes.txt".into(),
+            renamed_at: chrono::Utc::now(),
+        }));
+        assert!(evaluate(&ordinary, &Facts::default()).is_empty());
+    }
+
+    #[test]
+    fn a_connect_to_an_implant_port_needs_a_routable_destination() {
+        let internet = IpAddr::V4(Ipv4Addr::new(185, 199, 108, 153));
+
+        assert_eq!(
+            rule_names(&evaluate(&connect(internet, 4444), &Facts::default())),
+            vec!["connect_to_implant_default_port"]
+        );
+
+        // The same port, three destinations that are not the internet. Each is
+        // a place an implant is not.
+        for local in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+        ] {
+            assert!(
+                evaluate(&connect(local, 4444), &Facts::default()).is_empty(),
+                "{local} is not routable"
+            );
+        }
+
+        assert!(
+            evaluate(&connect(internet, 443), &Facts::default()).is_empty(),
+            "a routable destination on an ordinary port is not evidence"
+        );
+    }
+
+    #[test]
+    fn a_large_transfer_to_an_implant_port_is_evidence() {
+        const MB: u64 = 1024 * 1024;
+
+        assert_eq!(
+            rule_names(&evaluate(&transfer(16 * MB, 4444), &Facts::default())),
+            vec!["large_transfer_to_implant_port"]
+        );
+        assert!(
+            evaluate(&transfer(1024, 4444), &Facts::default()).is_empty(),
+            "a small transfer is not exfiltration"
+        );
+        assert!(
+            evaluate(&transfer(16 * MB, 443), &Facts::default()).is_empty(),
+            "the same volume on an ordinary port is a download"
+        );
+    }
+
+    #[test]
+    fn an_exploitation_crash_is_evidence() {
+        assert_eq!(
+            rule_names(&evaluate(
+                &process_exit(Some(0xC000_0005u32 as i32)),
+                &Facts::default()
+            )),
+            vec!["exploitation_crash_exit_code"]
+        );
+
+        assert!(evaluate(&process_exit(Some(0)), &Facts::default()).is_empty());
+        assert!(
+            evaluate(
+                &process_exit(Some(0xC000_00FDu32 as i32)),
+                &Facts::default()
+            )
+            .is_empty(),
+            "a stack overflow is a recursive bug more often than an exploit"
+        );
+        assert!(
+            evaluate(&process_exit(None), &Facts::default()).is_empty(),
+            "an absent code is not a crash code"
+        );
     }
 }

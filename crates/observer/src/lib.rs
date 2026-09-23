@@ -60,7 +60,7 @@ use std::time::Duration;
 /// [`TelemetryEvent`] implements this, and the runtime never sees a raw byte.
 ///
 /// The Windows implementation wraps `etw::EtwSession` and `etw::Translator`
-/// and looks like this:
+/// and lives in the `etw` crate as `etw::EtwObservation`; the shape is:
 ///
 /// ```ignore
 /// struct EtwObservation { session: etw::EtwSession, translator: etw::Translator }

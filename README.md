@@ -128,8 +128,8 @@ One event, in order:
 1. **Project** into the A1 state space; append to the A2 trace.
 2. **Evaluate** the rules. Each produces a [`Finding`] carrying a likelihood
    ratio, not a verdict.
-3. **Accumulate** as log-odds (A5) — addition, because independent evidence
-   composes additively in that representation.
+3. **Accumulate** as log-odds (A5), decaying with a half-life (A16) — addition,
+   because independent evidence composes additively in that representation.
 4. **Decide** (A8) against a threshold derived by the threshold theorem from
    `C_fp : C_fn`, which defaults to 1 : 20.
 5. **Govern** (A12) the chosen action, recording the outcome whether or not it
@@ -152,6 +152,16 @@ The rules are in `crates/pipeline/src/rules.rs`, each naming its technique:
 | `script_block_obfuscated` | T1140 | a PowerShell script that decodes or assembles itself |
 | `script_block_remote_fetch` | T1105 | a PowerShell script that fetches over the network |
 | `script_block_defence_evasion` | T1562.001 | a PowerShell script that touches AMSI or Defender |
+| `wmi_process_creation` | T1047 | a process created through WMI, keyed on the command line |
+| `wmi_permanent_subscription` | T1546.003 | a permanent WMI subscription whose consumer runs code |
+| `scheduled_task_registered` | T1053.005 | a task registered outside the Windows namespace |
+| `unsigned_image_from_writable_location` | T1574.002 | an unsigned image loaded from a writable location |
+| `executable_dropped_in_writable_location` | T1105 | an executable written to a writable location |
+| `executable_deleted_from_staging_location` | T1070.004 | an executable deleted from a staging directory |
+| `ransomware_extension_on_rename` | T1486 | a rename onto a known ransomware extension |
+| `connect_to_implant_default_port` | T1571 | a connect to an implant's default port on a routable address |
+| `large_transfer_to_implant_port` | T1041 | a large transfer to an implant's default port |
+| `exploitation_crash_exit_code` | T1203 | a process that died of a fault class an exploit produces |
 
 The last four read a PowerShell `4104` script block rather than a command line,
 which is the only way `T1059.001` fires on a live host: the process provider on
@@ -184,9 +194,10 @@ Repeat firings of one rule are folded into one row carrying a count, because a
 queue of two hundred near-identical rows is the same as no queue: the analyst
 stops reading it.
 
-The console has no authentication. That is why it has no acknowledge or close
-button — there is no identity to attribute a write to yet, and adding the button
-first would produce a queue full of claims about who closed what.
+The console is open by default, and `--console-token` closes it. Even closed, it
+has no acknowledge or close button — a shared token says *someone* reached the
+page, not who, and adding the button first would produce a queue full of claims
+about who closed what.
 
 ## Testing
 
@@ -212,15 +223,24 @@ real machine found a bug the suite had been happy with:
 
 Stated plainly, because the alternative is a reader assuming these are done:
 
-- **No TLS.** Enrollment and ingest are cleartext. The client refuses to send a
-  token to anything but loopback for that reason; the server refuses a
-  non-loopback bind without `--allow-cleartext`. A bearer token over a network
-  without TLS is not a security boundary.
-- **The store is in memory.** Restarting the server forgets everything,
-  including enrollment.
+- **TLS is the platform's, not a bundled stack.** `--ship https://…` and
+  `--enroll https://…` go over SChannel, Security.framework or OpenSSL — whichever
+  the host already has, with the host's own trust store. There is no bundled
+  crypto to patch, and equally no pinning: a machine with a hostile root CA will
+  accept a name it should not, exactly as every other program on it would.
+  Cleartext remains loopback-only, enforced by the client rather than by
+  convention.
+- **The store is in memory, with a journal behind it.** `--data DIR` writes every
+  enrollment and accepted batch to rotated segments and replays them at startup,
+  so a restart is invisible in the rebuilt state. Without `--data` the old
+  behaviour stands and a restart is a reset. The journal flushes but does not
+  `fsync`: it survives the process dying, not the machine losing power, and the
+  bounded `max_alerts`/`max_batches`/`max_hosts` caps are what bound what it
+  replays.
+- **The console has no authentication** unless `--console-token` is set, in which
+  case it requires that token on every route.
 - **The enrollment token is reusable and cannot be revoked.** It is capped at
   500 hosts and is a shared bootstrap secret, not per-host.
-- **The console has no authentication.**
 - **Response covers suspend only**, on Windows only. No quarantine, no
   isolation, no registry repair.
 - **Response has never suspended a process on real hardware in testing.** The
@@ -233,12 +253,13 @@ Stated plainly, because the alternative is a reader assuming these are done:
   carries the detail.
 - **`crates/config` is not wired to the server** — the server's flags are
   parsed in its own `main`.
-- **`T1218` cannot fire on a live host yet.** It reads a command line, and the
-  process provider does not carry one. The route is Security-Auditing `4688` v2
-  (`CommandLine`, `ParentProcessName`) once `Audit Process Creation` and
-  `ProcessCreationIncludeCmdLine_Enabled` are on; the field names are verified in
-  [`crates/adapters/etw/README.md`](crates/adapters/etw/README.md) and no shape
-  reads them yet.
+- **`T1218` and every `T1059.*` rule need an audit policy, not just a provider.**
+  They read a command line, and the only live source of one is Security-Auditing
+  `4688` v2 (`CommandLine`, `ParentProcessName`). The shape
+  (`process_start_audit`) and the rules that read it are in place; on a host
+  where `Audit Process Creation` and `ProcessCreationIncludeCmdLine_Enabled` are
+  off, the provider is enabled and the command line is simply absent. That is a
+  policy gap rather than a code one, and on such a host these rules cannot fire.
 - **The PowerShell script-block rules have never seen a live 4104.** The decode
   path, the rules and the end-to-end result are covered by tests; the field names
   are verified against this machine's manifest. What is untested is a real script

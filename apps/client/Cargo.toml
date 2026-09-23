@@ -18,10 +18,16 @@ model.workspace = true
 pipeline.workspace = true
 ports.workspace = true
 protocol.workspace = true
+sigma.workspace = true
+supervision.workspace = true
 transport.workspace = true
+# The egress queue. The writer thread is what keeps the network off the
+# collection loop's path, so this is a dependency of correctness, not taste.
+crossbeam-channel.workspace = true
 
 chrono.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 etw.workspace = true
+observer.workspace = true
 respond.workspace = true

@@ -11,6 +11,9 @@ version.workspace = true
 [dependencies]
 model.workspace = true
 ports.workspace = true
+# The `Observe` trait this crate implements for the observer runtime. The
+# dependency is one-way: the runtime knows nothing about ETW.
+observer.workspace = true
 crossbeam-channel.workspace = true
 chrono.workspace = true
 thiserror.workspace = true

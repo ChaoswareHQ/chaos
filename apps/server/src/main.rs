@@ -28,24 +28,27 @@
 
 mod auth;
 mod dashboard;
+mod journal;
 mod store;
 
 use auth::{EnrollmentAuthority, TokenVerifier};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+use journal::{Journal, Record};
 use protocol::{
     API_VERSION, ApiError, ENROLL_PATH, ENROLLMENT_HEADER, EnrollRequest, EnrollResponse,
     HEALTH_PATH, HealthResponse, INGEST_PATH, IngestRequest, IngestResponse,
 };
 use std::net::SocketAddr;
-use std::sync::Arc;
-use store::{HostRecord, IncomingAlert, MemoryStore, Store};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use store::{HostRecord, IncomingAlert, IngestOutcome, MemoryStore, Store};
 
 /// Bodies larger than this are refused before they are read into memory.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -56,6 +59,17 @@ struct AppState {
     enrollment: Arc<EnrollmentAuthority>,
     verifier: Arc<TokenVerifier>,
     max_batch_events: usize,
+    /// The console's shared secret, when one was configured.
+    ///
+    /// `None` leaves the console open, which is the same trust model the rest of
+    /// the product uses for a loopback bind: put it behind something that
+    /// authenticates, or name a token here.
+    console_token: Option<Arc<String>>,
+    /// The durable log, when `--data` asked for one.
+    ///
+    /// `None` means state lives only in memory and a restart is a reset. A
+    /// failure to append is never fatal to a request; see [`append_best_effort`].
+    journal: Option<Arc<Mutex<Journal>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +121,68 @@ fn parse_json<T: serde::de::DeserializeOwned>(body: &Bytes) -> ApiResult<T> {
             eprintln!("warning: rejected a body that did not parse: {e}");
             Failure::client(StatusCode::BAD_REQUEST, "malformed_request")
         })
+}
+
+// ---------------------------------------------------------------------------
+// journaling
+// ---------------------------------------------------------------------------
+
+/// Append to the journal without letting a disk problem fail the request.
+///
+/// By the time this runs the events are already in memory and the host has
+/// already been told they were accepted, so turning a full disk into a 500 would
+/// be a lie about what happened. The honest answer is to say so on stderr and
+/// keep serving: the journal being a few seconds behind is exactly what the
+/// agent's own at-least-once retry covers.
+fn append_best_effort(journal: &Mutex<Journal>, record: &Record) {
+    let result = match journal.lock() {
+        Ok(mut journal) => journal.append(record),
+        // A panic while appending is not a reason to stop journaling forever.
+        Err(poisoned) => poisoned.into_inner().append(record),
+    };
+    if let Err(e) = result {
+        eprintln!("error: could not append to the journal: {e}");
+    }
+}
+
+/// Apply a batch and, unless it was a retry, journal it exactly once.
+///
+/// The clock is read here and used for both the state and the journal. If the
+/// two disagreed, a replay would rebuild rows stamped with a different instant
+/// than the ones they replaced, and "identical after a restart" would be off by
+/// however long the append took.
+fn apply_batch(
+    store: &MemoryStore,
+    journal: Option<&Mutex<Journal>>,
+    host_id: &str,
+    batch_id: &str,
+    events: usize,
+    alerts: Vec<IncomingAlert>,
+) -> IngestOutcome {
+    // Without a journal there is nothing that needs the instant, so this is the
+    // plain store path — the same one a caller that never asked for durability
+    // has always used.
+    let Some(journal) = journal else {
+        return store.record_ingest(host_id, batch_id, events, alerts);
+    };
+
+    let at = Utc::now();
+    let for_journal = alerts.clone();
+    let outcome = store.apply_ingest(host_id, batch_id, events, alerts, at);
+
+    if !outcome.duplicate {
+        append_best_effort(
+            journal,
+            &Record::Ingest {
+                host_id: host_id.to_string(),
+                batch_id: batch_id.to_string(),
+                events,
+                alerts: for_journal,
+                at,
+            },
+        );
+    }
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -170,12 +246,18 @@ async fn enroll(
         alerts: 0,
     };
 
-    if !state.store.insert_host(record) {
+    if !state.store.insert_host(record.clone()) {
         // A collision on a random 64-bit id. Retrying is the right answer.
         return Err(Failure::internal(
             "host_id_collision",
             "rng produced an id already in use",
         ));
+    }
+
+    // Journaled only after the store accepts it: a collision never reached the
+    // store, so writing it down would replay a host this process refused.
+    if let Some(journal) = state.journal.as_deref() {
+        append_best_effort(journal, &Record::Host { record });
     }
 
     // Logged without the secret: this line is audit trail, not a credential
@@ -205,6 +287,34 @@ async fn ingest(
         .verifier
         .verify(authorization, |host_id| store.secret_hash(host_id))
         .ok_or_else(|| Failure::client(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+
+    // A body that would inflate past this is refused while inflating, so the
+    // buffer is never built. Sized well above a full batch of typed events and
+    // well below anything that would matter to the host.
+    const MAX_INFLATED_BYTES: usize = 32 * 1024 * 1024;
+
+    // The wire body may be gzip. Decompressed here rather than in a layer so the
+    // batch limit below is enforced on the *decompressed* request: a layer that
+    // inflated first would let a small compressed body expand into something the
+    // handlers' own limits do not describe.
+    let body = match headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(encoding) if encoding.eq_ignore_ascii_case(protocol::GZIP_ENCODING) => Bytes::from(
+            protocol::gunzip(&body, MAX_INFLATED_BYTES)
+                .map_err(|_| Failure::client(StatusCode::BAD_REQUEST, "bad_gzip"))?,
+        ),
+        // Fail closed on an encoding we do not implement, rather than reading it
+        // as if it were absent and parsing compressed bytes as JSON.
+        Some(_) => {
+            return Err(Failure::client(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_content_encoding",
+            ));
+        }
+        None => body,
+    };
 
     let request: IngestRequest = parse_json(&body)?;
 
@@ -239,7 +349,9 @@ async fn ingest(
         })
         .collect();
 
-    let outcome = state.store.record_ingest(
+    let outcome = apply_batch(
+        &store,
+        state.journal.as_deref(),
         &verified.host_id,
         &request.batch_id,
         request.events.len(),
@@ -316,15 +428,100 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
 // ---------------------------------------------------------------------------
 
 fn app(state: AppState) -> Router {
+    // The console is the only surface a person reaches, so it is the only one
+    // that gets a credential of its own. Enrollment and ingest authenticate with
+    // the protocol's own tokens and have to stay reachable by hosts.
+    let console = Router::new()
+        .route("/", get(console))
+        .route("/static/app.css", get(stylesheet))
+        .layer(middleware::from_fn_with_state(state.clone(), console_auth));
+
     Router::new()
         .route(HEALTH_PATH, get(health))
         .route(ENROLL_PATH, post(enroll))
         .route(INGEST_PATH, post(ingest))
-        .route("/", get(console))
-        .route("/static/app.css", get(stylesheet))
+        .merge(console)
         .layer(middleware::from_fn(security_headers))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
+}
+
+/// Require the console token, when one is configured.
+///
+/// A shared secret rather than a login, deliberately. There is still no notion of
+/// *who* an operator is — which is why the console has no acknowledge button to
+/// attribute a write to — so a login form would be inventing an identity to
+/// justify itself. What this does instead is make the console not-open, which is
+/// the honest description of a token.
+///
+/// The token may arrive in the query string, which is the only way to reach a
+/// page from a browser with no JavaScript and no session. When it does, it is
+/// remembered in a cookie so the page's own stylesheet and every link it renders
+/// work without the token being pasted onto each one.
+async fn console_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let Some(expected) = state.console_token.clone() else {
+        return next.run(request).await;
+    };
+
+    let from_query = token_from_query(request.uri().query());
+    let presented = from_query
+        .clone()
+        .or_else(|| token_from_cookie(request.headers()));
+
+    let authorised = presented
+        .as_ref()
+        .is_some_and(|token| constant_time_eq(token, expected.as_str()));
+    if !authorised {
+        // No body and no detail: a wrong token and a missing one are the same
+        // answer, because telling them apart tells an attacker which half they
+        // got right.
+        return (StatusCode::UNAUTHORIZED, "console: a token is required\n").into_response();
+    }
+
+    let mut response = next.run(request).await;
+    if from_query.is_some() && !response.headers().contains_key("set-cookie") {
+        // `HttpOnly` so a script cannot read it back out; `SameSite=Strict` so a
+        // link from somewhere else cannot carry it. Not `Secure`, because the
+        // server may legitimately be speaking cleartext to a loopback or proxied
+        // caller — the deployment that needs `Secure` is the one terminating TLS
+        // in front, and that is where it belongs.
+        if let Ok(value) = HeaderValue::from_str(&format!(
+            "{CONSOLE_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict",
+            expected.as_str()
+        )) {
+            response.headers_mut().insert("set-cookie", value);
+        }
+    }
+    response
+}
+
+/// The cookie the console remembers its token in.
+const CONSOLE_COOKIE: &str = "chaos_console";
+
+fn token_from_query(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "token" && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn token_from_cookie(headers: &HeaderMap) -> Option<String> {
+    let cookies = headers.get("cookie")?.to_str().ok()?;
+    cookies.split(';').find_map(|pair| {
+        let (name, value) = pair.trim().split_once('=')?;
+        (name == CONSOLE_COOKIE && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Compare two secrets without leaking how much of one matched through timing.
+///
+/// The length check is not constant time, and does not need to be: the length of
+/// a token is not the secret. The byte comparison is, because that is where a
+/// byte-at-a-time oracle would otherwise live.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 struct Args {
@@ -333,6 +530,21 @@ struct Args {
     generated_token: bool,
     max_hosts: usize,
     max_batch_events: usize,
+    /// Shared secret for the console, when one was asked for.
+    console_token: Option<String>,
+    /// Directory for the durable journal, when one was asked for. Without it the
+    /// server keeps everything in memory and a restart is a reset.
+    data_dir: Option<PathBuf>,
+    segment_mb: u64,
+    retain_segments: usize,
+}
+
+impl Args {
+    /// The rotation bound in bytes. At least one, so a nonsensical `--segment-mb`
+    /// rotates on every record rather than dividing by zero.
+    fn segment_bytes(&self) -> u64 {
+        self.segment_mb.saturating_mul(1024 * 1024).max(1)
+    }
 }
 
 fn parse_args() -> std::result::Result<Args, String> {
@@ -340,6 +552,10 @@ fn parse_args() -> std::result::Result<Args, String> {
     let mut token = std::env::var("CHAOS_ENROLLMENT_TOKEN").ok();
     let mut max_hosts = 500usize;
     let mut max_batch_events = protocol::MAX_BATCH_EVENTS;
+    let mut console_token = std::env::var("CHAOS_CONSOLE_TOKEN").ok();
+    let mut data_dir = std::env::var_os("CHAOS_DATA_DIR").map(PathBuf::from);
+    let mut segment_mb = 64u64;
+    let mut retain_segments = 8usize;
 
     let mut args = std::env::args().skip(1);
     let mut allow_cleartext = false;
@@ -366,6 +582,26 @@ fn parse_args() -> std::result::Result<Args, String> {
                     .next()
                     .and_then(|v| v.parse().ok())
                     .ok_or("--max-batch-events needs a number")?;
+            }
+            "--console-token" => {
+                console_token = Some(args.next().ok_or("--console-token needs a value")?);
+            }
+            "--data" => {
+                data_dir = Some(PathBuf::from(
+                    args.next().ok_or("--data needs a directory")?,
+                ));
+            }
+            "--segment-mb" => {
+                segment_mb = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--segment-mb needs a number")?;
+            }
+            "--retain-segments" => {
+                retain_segments = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or("--retain-segments needs a number")?;
             }
             "--allow-cleartext" => allow_cleartext = true,
             "--help" | "-h" => return Err(usage()),
@@ -403,20 +639,31 @@ fn parse_args() -> std::result::Result<Args, String> {
         generated_token,
         max_hosts,
         max_batch_events,
+        console_token,
+        data_dir,
+        segment_mb,
+        retain_segments,
     })
 }
 
 fn usage() -> String {
     "chaos ingest server\n\
      \n\
-     usage: server [--bind ADDR] [--enrollment-token TOKEN] [--max-hosts N]\n\
-     \x20              [--max-batch-events N] [--allow-cleartext]\n\
+     usage: server [--bind ADDR] [--enrollment-token TOKEN] [--max-hosts N]
+     \x20              [--max-batch-events N] [--console-token TOKEN] [--allow-cleartext]
+     \x20              [--data DIR] [--segment-mb N] [--retain-segments N]
      \n\
-     --bind                 default 127.0.0.1:8787\n\
-     --enrollment-token     bootstrap secret; a random one is generated if omitted\n\
-                            (env: CHAOS_ENROLLMENT_TOKEN)\n\
-     --max-hosts            cap on enrolled hosts, default 500\n\
-     --max-batch-events     per-batch event cap, default 5000\n\
+     --bind                 default 127.0.0.1:8787
+     --enrollment-token     bootstrap secret; a random one is generated if omitted
+                            (env: CHAOS_ENROLLMENT_TOKEN)
+     --max-hosts            cap on enrolled hosts, default 500
+     --max-batch-events     per-batch event cap, default 5000
+     --console-token        require this token on the console (env:
+                            CHAOS_CONSOLE_TOKEN); without it the console is open
+     --data                 directory for a journal that survives a restart
+                            (env: CHAOS_DATA_DIR); without it state is memory-only
+     --segment-mb           rotate the journal at this many MiB, default 64
+     --retain-segments      segments to keep, oldest deleted, default 8
      --allow-cleartext      permit a non-loopback bind without TLS"
         .to_string()
 }
@@ -439,14 +686,53 @@ async fn main() {
         }
     };
 
+    let store = Arc::new(MemoryStore::default());
+
+    // Opened and replayed before the listener exists, so the console's first
+    // request already sees the state the last run ended with.
+    let mut journal: Option<Arc<Mutex<Journal>>> = None;
+    let mut journal_summary = "off — in-memory only, nothing survives a restart".to_string();
+    if let Some(dir) = args.data_dir.as_deref() {
+        match Journal::open(dir, args.segment_bytes(), args.retain_segments) {
+            Ok((opened, records)) => {
+                let replayed = store.replay(&records);
+                if replayed.unknown_hosts > 0 {
+                    eprintln!(
+                        "warning: {} journal records named a host that was never enrolled; skipped",
+                        replayed.unknown_hosts
+                    );
+                }
+                let stats = opened.stats();
+                journal_summary = format!(
+                    "{} ({} records replayed, {} skipped, {} segments)",
+                    dir.display(),
+                    stats.replayed,
+                    stats.skipped,
+                    stats.segments
+                );
+                journal = Some(Arc::new(Mutex::new(opened)));
+            }
+            Err(e) => {
+                // Fatal on purpose: the journal is the whole reason state
+                // outlives the process, and starting without it would silently
+                // discard everything it holds.
+                eprintln!("fatal: cannot open the journal at {}: {e}", dir.display());
+                eprintln!("  refusing to start rather than pretending to persist");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let state = AppState {
-        store: Arc::new(MemoryStore::default()),
+        store,
         enrollment: Arc::new(EnrollmentAuthority::new(
             &args.enrollment_token,
             args.max_hosts,
         )),
         verifier,
         max_batch_events: args.max_batch_events,
+        console_token: args.console_token.as_ref().map(|t| Arc::new(t.clone())),
+        journal,
     };
 
     let listener = match tokio::net::TcpListener::bind(args.bind).await {
@@ -491,6 +777,15 @@ async fn main() {
     }
     println!("  max hosts      {}", args.max_hosts);
     println!("  max batch      {} events", args.max_batch_events);
+    println!("  journal        {journal_summary}");
+    println!(
+        "  console        {}",
+        if args.console_token.is_some() {
+            "requires the configured token"
+        } else {
+            "open — reach it over loopback or behind something that authenticates"
+        }
+    );
     println!();
     println!("  enrollment is a shared bootstrap secret: hand it to a host once, over a");
     println!("  channel you trust, and you get a unique host token back.");

@@ -10,6 +10,10 @@ version.workspace = true
 
 [dependencies]
 chrono.workspace = true
+# The body encoding belongs to the wire contract, not to either side of it: a
+# client that compresses and a server that does not is a protocol mismatch, and
+# keeping both halves here is what makes that impossible.
+flate2.workspace = true
 model.workspace = true
 serde.workspace = true
 

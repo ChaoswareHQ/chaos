@@ -10,19 +10,28 @@
 //! tests, and it is fully auditable in one sitting.
 //!
 //! What it deliberately does *not* do is guess. Chunked transfer encoding is
-//! rejected rather than half-supported, and `https://` is rejected rather than
-//! silently downgraded to cleartext. Both failures are loud, because an agent
-//! that believes it is talking to a TLS endpoint and is not is the worst
-//! possible outcome here.
+//! rejected rather than half-supported, and `https://` is either carried over a
+//! real TLS session or it fails — there is no path that quietly sends a
+//! credential in the clear.
+//!
+//! # TLS
+//!
+//! TLS is [`TlsTransport`], and it is the platform's own implementation:
+//! SChannel on Windows, Security.framework on macOS, OpenSSL on Linux. The
+//! alternative — bundling `rustls` and a crypto backend — is a second TLS stack
+//! to patch on every endpoint in the estate, and a trust store that is a copy
+//! rather than the one Windows Update maintains. The cost is that verification
+//! is the platform's, which is exactly the behaviour an operator expects from
+//! every other program on the host.
 //!
 //! # The cleartext rule
 //!
 //! A host token is a bearer credential: whoever holds it can submit telemetry
 //! as that host. So [`Endpoint`] refuses to send one anywhere except loopback
 //! over `http://`. This is not a configuration option, because "we will turn
-//! TLS on later" is how credentials end up on the wire in production. Adding
-//! TLS means adding a [`Transport`] implementation; it does not mean relaxing
-//! this check.
+//! TLS on later" is how credentials end up on the wire in production. TLS
+//! arrives as another [`Transport`] implementation; it does not relax this
+//! check.
 
 use model::{Alert, TelemetryEvent};
 use ports::{EventSink, SinkError};
@@ -37,6 +46,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Largest response we will read. The server never legitimately sends more, and
 /// a client with no cap will happily allocate whatever it is told to.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
+
+/// Largest response *header block* we will buffer while looking for its end.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -59,8 +71,8 @@ pub enum TransportError {
     )]
     CleartextRefused(String),
 
-    #[error("https is not implemented yet; terminate TLS in front of the server")]
-    TlsNotImplemented,
+    #[error("TLS handshake with {endpoint} failed: {detail}")]
+    Tls { endpoint: String, detail: String },
 
     #[error("malformed response: {0}")]
     BadResponse(String),
@@ -128,10 +140,18 @@ impl Endpoint {
     /// Whether this endpoint may carry a credential.
     ///
     /// Loopback over `http` is the development case: the bytes never leave the
-    /// machine, so there is no wire to be on. Anything else must be TLS, and
-    /// since TLS is not implemented yet that means this fails closed.
+    /// machine, so there is no wire to be on. Anything else must be `https`.
     pub fn allows_credential(&self) -> bool {
         self.scheme == "https" || is_loopback_host(&self.host)
+    }
+
+    /// Whether this endpoint must be reached over TLS.
+    ///
+    /// The scheme is what selects the transport, and the transport is what
+    /// decides whether a credential may go on the wire, so this is the one place
+    /// the two are connected.
+    pub fn uses_tls(&self) -> bool {
+        self.scheme == "https"
     }
 
     pub fn host_header(&self) -> String {
@@ -267,7 +287,7 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse> {
 
 /// How requests are carried.
 ///
-/// Exists so TLS is an additive change: a `TlsTransport` slots in beside
+/// Exists so TLS is an additive change: [`TlsTransport`] sits beside
 /// [`CleartextTransport`] and nothing above this line moves.
 pub trait Transport: Send {
     fn post_json(
@@ -279,16 +299,152 @@ pub trait Transport: Send {
     ) -> Result<HttpResponse>;
 }
 
+/// Everything the framing code needs from a byte stream.
+///
+/// A trait object rather than a generic parameter, because the request and
+/// response framing is identical whether the bytes go through a socket or a TLS
+/// session, and making it generic would duplicate the code this client's
+/// correctness rests on. `Debug` is in the bound so a connection can still be
+/// printed when something goes wrong.
+trait Stream: Read + Write + Send + std::fmt::Debug {}
+
+impl<T: Read + Write + Send + std::fmt::Debug> Stream for T {}
+
 /// Plain HTTP/1.1, loopback only.
+///
+/// Holds the connection between calls. The first version opened and closed one
+/// per request, which pays a TCP handshake per batch — on a host producing a
+/// batch every couple of seconds, a handshake every couple of seconds for no
+/// reason. The connection is dropped whenever a response is not framed the way
+/// this client expects, so a protocol surprise costs one request rather than
+/// every request after it.
 #[derive(Debug)]
 pub struct CleartextTransport {
-    pub timeout: Duration,
+    exchange: Exchange,
+}
+
+/// HTTPS/1.1 over the platform's TLS.
+///
+/// Separate from [`CleartextTransport`] rather than a flag on it, because the two
+/// differ in a way that matters: this one is allowed to carry a credential to a
+/// routable host, and the cleartext one is not. A single type with a `secure:
+/// bool` is how the wrong branch gets taken.
+#[derive(Debug)]
+pub struct TlsTransport {
+    exchange: Exchange,
+    connector: native_tls::TlsConnector,
+}
+
+/// One open connection, and whatever arrived on it that a response has not
+/// consumed yet. A TCP read returns what arrived, which is not the same thing as
+/// one response.
+#[derive(Debug)]
+struct Connection {
+    endpoint: Endpoint,
+    stream: Box<dyn Stream>,
+    buffer: Vec<u8>,
+}
+
+/// The request/response dance, independent of what carries the bytes.
+///
+/// Both transports own one of these and hand it a way to open a connection. The
+/// framing, the keep-alive, and the compression are then written once — which
+/// matters more than it sounds, because this is the code that decides where one
+/// response ends and the next begins.
+#[derive(Debug)]
+struct Exchange {
+    timeout: Duration,
+    conn: Option<Connection>,
+}
+
+impl Exchange {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            conn: None,
+        }
+    }
+
+    /// POST `body` to `path`, reusing the held connection when it is already for
+    /// this origin.
+    ///
+    /// `open` is called only when a new connection is needed, so a TLS handshake
+    /// is paid once per origin rather than once per batch.
+    fn post(
+        &mut self,
+        endpoint: &Endpoint,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        open: impl FnOnce(&Endpoint, Duration) -> Result<Box<dyn Stream>>,
+    ) -> Result<HttpResponse> {
+        // A connection is only reusable for the origin it was opened to.
+        if self.conn.as_ref().is_some_and(|c| &c.endpoint != endpoint) {
+            self.conn = None;
+        }
+        if self.conn.is_none() {
+            self.conn = Some(Connection {
+                endpoint: endpoint.clone(),
+                stream: open(endpoint, self.timeout)?,
+                buffer: Vec::with_capacity(1024),
+            });
+        }
+
+        let attempt = self.exchange(path, headers, body);
+        if attempt.is_err() {
+            // Whatever went wrong, this connection's framing can no longer be
+            // trusted. Drop it so the next attempt starts clean rather than
+            // reading a stray body as the next response's headers.
+            self.conn = None;
+        }
+        attempt
+    }
+
+    /// One request and response on the held connection.
+    fn exchange(
+        &mut self,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<HttpResponse> {
+        let conn = self.conn.as_mut().expect("the connection was opened above");
+
+        let mut request = Vec::with_capacity(body.len() + 256);
+        write!(
+            request,
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Content-Encoding: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
+            conn.endpoint.host_header(),
+            protocol::GZIP_ENCODING,
+            body.len()
+        )
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+        for (name, value) in headers {
+            write!(request, "{name}: {value}\r\n")
+                .map_err(|e| TransportError::Io(e.to_string()))?;
+        }
+        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(body);
+
+        conn.stream
+            .write_all(&request)
+            .and_then(|()| conn.stream.flush())
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+
+        read_response(conn)
+    }
 }
 
 impl CleartextTransport {
     pub fn new() -> Self {
         Self {
-            timeout: REQUEST_TIMEOUT,
+            exchange: Exchange::new(REQUEST_TIMEOUT),
+        }
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            exchange: Exchange::new(timeout),
         }
     }
 }
@@ -307,65 +463,183 @@ impl Transport for CleartextTransport {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<HttpResponse> {
+        // The scheme decides the transport, and the caller picked this one.
+        // Using it for an https endpoint would send the credential in the clear,
+        // so it is refused rather than followed.
         if endpoint.scheme == "https" {
-            return Err(TransportError::TlsNotImplemented);
+            return Err(TransportError::CleartextRefused(endpoint.host.clone()));
         }
         if !endpoint.allows_credential() && headers.iter().any(|(k, _)| is_credential_header(k)) {
             return Err(TransportError::CleartextRefused(endpoint.host.clone()));
         }
 
-        let addr = endpoint.socket_addr()?;
-        let mut stream = TcpStream::connect_timeout(&addr, self.timeout).map_err(|source| {
-            TransportError::Connect {
-                endpoint: endpoint.host_header(),
-                source,
-            }
-        })?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
-            .map_err(|e| TransportError::Io(e.to_string()))?;
-
-        let mut request = Vec::with_capacity(body.len() + 256);
-        write!(
-            request,
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n",
-            endpoint.host_header(),
-            body.len()
-        )
-        .map_err(|e| TransportError::Io(e.to_string()))?;
-        for (name, value) in headers {
-            write!(request, "{name}: {value}\r\n")
-                .map_err(|e| TransportError::Io(e.to_string()))?;
-        }
-        request.extend_from_slice(b"\r\n");
-        request.extend_from_slice(body);
-
-        stream
-            .write_all(&request)
-            .and_then(|()| stream.flush())
-            .map_err(|e| TransportError::Io(e.to_string()))?;
-
-        let mut raw = Vec::with_capacity(1024);
-        let mut chunk = [0u8; 8192];
-        loop {
-            let read = stream
-                .read(&mut chunk)
-                .map_err(|e| TransportError::Io(e.to_string()))?;
-            if read == 0 {
-                break;
-            }
-            raw.extend_from_slice(&chunk[..read]);
-            if raw.len() > MAX_RESPONSE_BYTES {
-                return Err(TransportError::BadResponse(
-                    "response exceeded the client's limit".to_string(),
-                ));
-            }
-        }
-
-        parse_response(&raw)
+        let compressed = protocol::gzip(body).map_err(|e| TransportError::Io(e.to_string()))?;
+        self.exchange
+            .post(endpoint, path, headers, &compressed, connect_plain)
     }
+}
+
+/// A TCP connection with this client's timeouts applied.
+///
+/// The timeouts are set on the socket before any TLS handshake, so they cover
+/// the handshake as well as everything after it: a server that accepts a
+/// connection and then never speaks must not hold the agent's writer thread for
+/// longer than any other kind of request would.
+fn connect_tcp(endpoint: &Endpoint, timeout: Duration) -> Result<TcpStream> {
+    let addr = endpoint.socket_addr()?;
+    let stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|source| TransportError::Connect {
+            endpoint: endpoint.host_header(),
+            source,
+        })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    Ok(stream)
+}
+
+fn connect_plain(endpoint: &Endpoint, timeout: Duration) -> Result<Box<dyn Stream>> {
+    Ok(Box::new(connect_tcp(endpoint, timeout)?))
+}
+
+impl TlsTransport {
+    /// The platform's verifier, with the platform's trust store.
+    pub fn new() -> Result<Self> {
+        Self::with_timeout(REQUEST_TIMEOUT)
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Result<Self> {
+        let connector = native_tls::TlsConnector::new().map_err(|e| TransportError::Tls {
+            endpoint: "the platform verifier".to_string(),
+            detail: e.to_string(),
+        })?;
+        Ok(Self {
+            exchange: Exchange::new(timeout),
+            connector,
+        })
+    }
+}
+
+impl Transport for TlsTransport {
+    fn post_json(
+        &mut self,
+        endpoint: &Endpoint,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<HttpResponse> {
+        if endpoint.scheme != "https" {
+            return Err(TransportError::BadEndpoint(format!(
+                "`http://{}` needs a cleartext transport, not a TLS one",
+                endpoint.host
+            )));
+        }
+
+        let compressed = protocol::gzip(body).map_err(|e| TransportError::Io(e.to_string()))?;
+        let connector = self.connector.clone();
+        self.exchange.post(
+            endpoint,
+            path,
+            headers,
+            &compressed,
+            move |endpoint, timeout| {
+                let socket = connect_tcp(endpoint, timeout)?;
+                // The handshake happens here, before the request is written, so a
+                // certificate that does not verify fails this request rather than
+                // a later one — and the body never reaches a server that has not
+                // proved who it is.
+                let session =
+                    connector
+                        .connect(&endpoint.host, socket)
+                        .map_err(|e| TransportError::Tls {
+                            endpoint: endpoint.host_header(),
+                            detail: e.to_string(),
+                        })?;
+                Ok(Box::new(session) as Box<dyn Stream>)
+            },
+        )
+    }
+}
+
+/// Read one length-delimited response, leaving anything past it in the buffer.
+///
+/// `Content-Length` is required rather than optional. On a connection that stays
+/// open there is no end of stream to read to, so a response framed any other way
+/// cannot be bounded — and guessing where one response ends is how a client
+/// starts reading the next response's headers as this one's body.
+fn read_response(conn: &mut Connection) -> Result<HttpResponse> {
+    let header_end = loop {
+        if let Some(position) = find_subslice(&conn.buffer, b"\r\n\r\n") {
+            break position;
+        }
+        if conn.buffer.len() > MAX_HEADER_BYTES {
+            return Err(TransportError::BadResponse(
+                "response headers exceeded the client's limit".to_string(),
+            ));
+        }
+        read_more(conn)?;
+    };
+
+    let length = content_length_of(&conn.buffer[..header_end])?;
+    if length > MAX_RESPONSE_BYTES {
+        return Err(TransportError::BadResponse(
+            "response exceeded the client's limit".to_string(),
+        ));
+    }
+
+    // Read until the whole response is present, then hand it to the one parser —
+    // the same one the framing tests exercise, so an unparseable response is
+    // rejected in exactly one place.
+    let total = header_end + 4 + length;
+    while conn.buffer.len() < total {
+        read_more(conn)?;
+    }
+    let complete: Vec<u8> = conn.buffer[..total].to_vec();
+    conn.buffer.drain(..total);
+
+    parse_response(&complete)
+}
+
+/// The `Content-Length` a header block declares.
+///
+/// Separate from the parser because *this* caller needs it before the response
+/// is complete: without it there is no way to tell how many more bytes belong to
+/// this response rather than to the next one.
+fn content_length_of(head: &[u8]) -> Result<usize> {
+    let head = String::from_utf8_lossy(head);
+    for line in head.split("\r\n").skip(1) {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+            && let Ok(length) = value.trim().parse::<usize>()
+        {
+            return Ok(length);
+        }
+    }
+    Err(TransportError::BadResponse(
+        "response carried no Content-Length, so its end cannot be found on a \
+         connection that stays open"
+            .to_string(),
+    ))
+}
+
+fn read_more(conn: &mut Connection) -> Result<()> {
+    let mut chunk = [0u8; 8192];
+    let read = conn
+        .stream
+        .read(&mut chunk)
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    if read == 0 {
+        return Err(TransportError::Io(
+            "the server closed the connection mid-response".to_string(),
+        ));
+    }
+    conn.buffer.extend_from_slice(&chunk[..read]);
+    Ok(())
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Whether a URL host is loopback.
@@ -779,7 +1053,10 @@ mod tests {
 
     #[test]
     fn cleartext_to_a_routable_host_is_refused_even_with_a_token() {
-        let mut transport = CleartextTransport::new();
+        // A short timeout on purpose: the second half of this test connects to a
+        // routable address that will not answer, and there is nothing to learn
+        // from waiting out the production timeout to find that out.
+        let mut transport = CleartextTransport::with_timeout(Duration::from_millis(500));
         let endpoint = Endpoint::parse("http://10.0.0.5:8787").unwrap();
 
         let error = transport
@@ -807,15 +1084,101 @@ mod tests {
     }
 
     #[test]
-    fn https_fails_closed_rather_than_downgrading() {
+    fn cleartext_refuses_an_https_endpoint_rather_than_downgrading() {
+        // The scheme chose the transport, so the cleartext one must not follow an
+        // https URL down to port 443 and send a token over it.
         let mut transport = CleartextTransport::new();
         let endpoint = Endpoint::parse("https://siem.example.com").unwrap();
         let error = transport
             .post_json(&endpoint, INGEST_PATH, &[], b"{}")
             .unwrap_err();
         assert!(
-            matches!(error, TransportError::TlsNotImplemented),
+            matches!(error, TransportError::CleartextRefused(_)),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_tls_transport_refuses_a_plaintext_endpoint() {
+        // And the converse: naming a TLS transport for an http:// endpoint is a
+        // configuration mistake, and quietly treating it as cleartext is how the
+        // mistake survives.
+        let mut transport = TlsTransport::new().expect("the platform verifier");
+        let endpoint = Endpoint::parse("http://127.0.0.1:8787").unwrap();
+        let error = transport
+            .post_json(&endpoint, INGEST_PATH, &[], b"{}")
+            .unwrap_err();
+        assert!(matches!(error, TransportError::BadEndpoint(_)), "{error:?}");
+    }
+
+    /// A server that is not speaking TLS must fail the handshake, and must never
+    /// receive the request.
+    ///
+    /// This is the property the cleartext rule exists for: an agent that believes
+    /// it is talking to a TLS endpoint and is not is the worst outcome available
+    /// here, so the failure has to happen before the body — which carries the host
+    /// token — is written.
+    #[test]
+    fn tls_against_a_plaintext_server_fails_before_the_request_is_written() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        let recorder = Arc::clone(&seen);
+        let server = std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            // Read whatever is offered, answering the first read with a plaintext
+            // HTTP response: exactly what a cleartext server on the TLS port looks
+            // like.
+            for turn in 0..2 {
+                match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        recorder.lock().unwrap().extend_from_slice(&buf[..n]);
+                        if turn == 0 {
+                            let _ =
+                                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                            let _ = socket.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let endpoint = Endpoint::parse(&format!("https://127.0.0.1:{port}")).unwrap();
+        let mut transport =
+            TlsTransport::with_timeout(Duration::from_secs(5)).expect("the platform verifier");
+        let error = transport
+            .post_json(
+                &endpoint,
+                INGEST_PATH,
+                &[("Authorization", "Bearer a.b.secret")],
+                b"{\"telemetry\":\"must-not-be-sent\"}",
+            )
+            .unwrap_err();
+        server.join().expect("the recorder thread");
+
+        assert!(matches!(error, TransportError::Tls { .. }), "{error:?}");
+        let seen = String::from_utf8_lossy(&seen.lock().unwrap()).to_string();
+        assert!(
+            !seen.contains("must-not-be-sent"),
+            "the body reached a server that never proved who it was: {seen:?}"
+        );
+        assert!(
+            !seen.contains("secret"),
+            "the credential reached a server that never proved who it was: {seen:?}"
         );
     }
 
@@ -827,6 +1190,107 @@ mod tests {
         out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
         out.extend_from_slice(body);
         out
+    }
+
+    /// A loopback server that serves `responses` on the first connection it
+    /// accepts, recording every request header block it saw.
+    fn serve_one_connection(
+        responses: usize,
+    ) -> (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<String>>,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let headers = Arc::new(Mutex::new(String::new()));
+
+        let counter = Arc::clone(&accepts);
+        let seen = Arc::clone(&headers);
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut reader = BufReader::new(stream.try_clone().expect("clones the socket"));
+
+            for _ in 0..responses {
+                let mut length = 0usize;
+                let mut block = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(rest) = lower.strip_prefix("content-length:") {
+                        length = rest.trim().parse().unwrap_or(0);
+                    }
+                    block.push_str(&lower);
+                }
+                if let Ok(mut seen) = seen.lock() {
+                    seen.push_str(&block);
+                }
+
+                let mut body = vec![0u8; length];
+                if reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+
+                let payload = b"{\"ok\":true}";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(payload);
+                let _ = stream.flush();
+            }
+        });
+
+        (port, accepts, headers)
+    }
+
+    #[test]
+    fn two_posts_reuse_one_connection_and_carry_gzip() {
+        // The two properties keep-alive depends on: the second request goes down
+        // the same socket, and the body is declared as gzip so the server knows
+        // to inflate it. A client that opened a connection per batch would pass
+        // every other test in this file and fail this one.
+        let (port, accepts, headers) = serve_one_connection(2);
+        let endpoint =
+            Endpoint::parse(&format!("http://127.0.0.1:{port}")).expect("a valid endpoint");
+        let mut transport = CleartextTransport::new();
+
+        for _ in 0..2 {
+            let response = transport
+                .post_json(&endpoint, INGEST_PATH, &[], b"{\"events\":[]}")
+                .expect("the request succeeds");
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, b"{\"ok\":true}");
+        }
+
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second post must reuse the connection rather than open another"
+        );
+        assert!(
+            headers
+                .lock()
+                .expect("not poisoned")
+                .contains("content-encoding: gzip"),
+            "the body must be declared as gzip"
+        );
     }
 
     #[test]

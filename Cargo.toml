@@ -13,6 +13,7 @@ members = [
     "crates/pipeline",
     "crates/ports",
     "crates/protocol",
+    "crates/sigma",
     "crates/supervision",
     "crates/transport", "crates/observer",
 ]
@@ -32,13 +33,26 @@ ebpf = { path = "crates/adapters/linux/ebpf" }
 es = { path = "crates/adapters/mac/es" }
 etw = { path = "crates/adapters/windows/etw" }
 model = { path = "crates/model" }
+observer = { path = "crates/observer" }
 pipeline = { path = "crates/pipeline" }
 ports = { path = "crates/ports" }
 protocol = { path = "crates/protocol" }
 respond = { path = "crates/adapters/respond" }
+sigma = { path = "crates/sigma" }
+supervision = { path = "crates/supervision" }
 transport = { path = "crates/transport" }
 
+# TLS is the platform's own: SChannel on Windows, Security.framework on macOS,
+# OpenSSL on Linux. The agent runs on every endpoint in the estate, and a
+# security product that bundles its own TLS stack has bundled itself a second
+# thing to patch on all of them. It also means the trust store is the machine's
+# rather than a copy that has to be refreshed.
+native-tls = "0.2.14"
+
 crossbeam-channel = "0.5.17"
+# Wire-body compression. Pure Rust (miniz_oxide), no C toolchain, and the same
+# crate on both sides of the protocol so the framing cannot drift.
+flate2 = "1"
 goblin = { version = "0.10.7", default-features = false, features = [
     "std",
     "alloc",

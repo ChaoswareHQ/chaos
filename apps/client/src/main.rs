@@ -12,17 +12,21 @@
 //! * `--ship URL` collects, scores and ships. With no duration the agent runs
 //!   until it is stopped, which is how it is meant to be deployed; `--etw
 //!   SECONDS` bounds the run and prints a full report, which is how it is meant
-//!   to be diagnosed.
+//!   to be diagnosed. An `https://` URL is carried over the platform's TLS; an
+//!   `http://` one is only allowed on loopback, because the host token is a
+//!   bearer credential.
 
 mod credential;
+mod egress;
 
+use egress::{Batch, Egress, SendOutcome};
 use mimalloc::MiMalloc;
 use model::{Alert, HostId, TelemetryEvent};
 use pipeline::{AutonomyLevel, Config, Engine, Response};
 use ports::{ActionError, Actuator};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use transport::{CleartextTransport, Endpoint, IngestSink};
+use transport::{CleartextTransport, Endpoint, IngestSink, TlsTransport, Transport};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -65,7 +69,7 @@ fn main() {
 
 fn run_enroll(url: &str, args: &Args) -> Result<(), String> {
     let endpoint = Endpoint::parse(url).map_err(|e| e.to_string())?;
-    let mut transport = CleartextTransport::new();
+    let mut transport = transport_for(&endpoint)?;
 
     let request = protocol::EnrollRequest {
         hostname: hostname(),
@@ -74,8 +78,13 @@ fn run_enroll(url: &str, args: &Args) -> Result<(), String> {
     };
 
     println!("enrolling with {url}");
-    let credential = transport::enroll(&mut transport, &endpoint, &args.enrollment_token, &request)
-        .map_err(|e| e.to_string())?;
+    let credential = transport::enroll(
+        transport.as_mut(),
+        &endpoint,
+        &args.enrollment_token,
+        &request,
+    )
+    .map_err(|e| e.to_string())?;
 
     credential::save(&args.token_file, &credential).map_err(|e| e.to_string())?;
 
@@ -99,7 +108,13 @@ fn run_enroll(url: &str, args: &Args) -> Result<(), String> {
 /// `--follow` a flag rather than a second implementation of the same run.
 struct Shipper {
     engine: Engine,
-    sink: Option<IngestSink>,
+    /// The shipping queue. The sink itself lives on the writer thread, so the
+    /// collection loop only ever hands batches over — see `egress` for why.
+    egress: Option<Egress>,
+    /// Scored events waiting for the next batch out.
+    pending_events: Vec<TelemetryEvent>,
+    /// Alerts waiting to ride with them.
+    pending_alerts: Vec<Alert>,
     /// Present only when this run was allowed to act. Absent means every proposal
     /// is surfaced and nothing is touched, which is the default: an agent that
     /// changes the machine because someone started it is not a thing anyone
@@ -127,7 +142,7 @@ struct Shipper {
 impl Shipper {
     fn new(
         config: Config,
-        sink: Option<IngestSink>,
+        egress: Option<Egress>,
         actuator: Option<Box<dyn Actuator>>,
         interval: Duration,
         verbose: bool,
@@ -135,7 +150,9 @@ impl Shipper {
         let now = Instant::now();
         Self {
             engine: Engine::new(config),
-            sink,
+            egress,
+            pending_events: Vec::with_capacity(SHIP_BATCH),
+            pending_alerts: Vec::new(),
             actuator,
             applied: Vec::new(),
             proposed: 0,
@@ -165,21 +182,19 @@ impl Shipper {
         // the detector look slower than it is.
         self.act_on_responses();
 
-        if let Some(sink) = self.sink.as_mut() {
+        if self.egress.is_some() {
             // The event is moved, not cloned: it has already been scored, and the
             // wire copy is the only one still needed.
-            if let Err(e) = sink.enqueue(event) {
-                self.ship_errors += 1;
-                if self.ship_errors <= 3 {
-                    eprintln!("  ship error: {e}");
-                }
+            self.pending_events.push(event);
+            if self.pending_events.len() >= SHIP_BATCH {
+                self.ship_batch();
             }
         }
 
         if let Some(alert) = alert {
             self.alerts += 1;
-            if let Some(sink) = self.sink.as_mut() {
-                sink.enqueue_alert(alert.clone());
+            if self.egress.is_some() {
+                self.pending_alerts.push(alert.clone());
             }
             if self.verbose {
                 print_alert(self.alerts, &alert);
@@ -201,18 +216,48 @@ impl Shipper {
     /// minutes.
     fn push(&mut self) {
         self.last_push = Instant::now();
-        let Some(sink) = self.sink.as_mut() else {
+        if self.egress.is_none() {
+            return;
+        }
+        for alert in self.engine.flush_suppressed() {
+            self.pending_alerts.push(alert);
+        }
+        self.ship_batch();
+    }
+
+    /// Hand what has accumulated to the writer thread.
+    ///
+    /// Never blocks: a full queue drops the batch and counts it. That trade is
+    /// the point of `egress` — losing a batch under overload beats stalling the
+    /// thread that drains ETW, which loses more and hides it.
+    fn ship_batch(&mut self) {
+        let Some(egress) = self.egress.as_ref() else {
             return;
         };
-        for alert in self.engine.flush_suppressed() {
-            sink.enqueue_alert(alert);
-        }
-        if let Err(e) = sink.submit() {
-            self.ship_errors += 1;
-            if self.ship_errors <= 3 {
-                eprintln!("  ship error: {e}");
+        let batch = Batch {
+            // Replaced rather than taken, so the next batch starts with the
+            // allocation already made and the hot path does not reallocate.
+            events: std::mem::replace(&mut self.pending_events, Vec::with_capacity(SHIP_BATCH)),
+            alerts: std::mem::take(&mut self.pending_alerts),
+        };
+        match egress.send(batch) {
+            SendOutcome::Queued | SendOutcome::Empty => {}
+            SendOutcome::Dropped => {
+                self.ship_errors += 1;
+                if self.ship_errors <= 3 {
+                    eprintln!("  ship error: the egress queue is full; a batch was dropped");
+                }
+            }
+            SendOutcome::Closed => {
+                self.ship_errors += 1;
+                eprintln!("  ship error: the egress writer has stopped; nothing is delivered");
             }
         }
+    }
+
+    /// Stop the writer, let it drain, and report what it delivered.
+    fn shutdown_egress(&mut self) -> Option<egress::EgressReport> {
+        self.egress.take().map(Egress::shutdown)
     }
 
     /// Push if the interval has elapsed.
@@ -241,11 +286,13 @@ impl Shipper {
              abstained {:>7}",
             self.alerts, metrics.suppressed, metrics.abstained
         );
-        if let Some(sink) = self.sink.as_ref() {
+        if let Some(egress) = self.egress.as_ref() {
+            let stats = egress.stats();
             print!(
-                "  shipped {:>10}  pending {:>6}",
-                sink.shipped(),
-                sink.pending()
+                "  shipped {:>10}  pending {:>6}  dropped {:>6}",
+                stats.shipped(),
+                stats.queued_events(),
+                stats.dropped_events()
             );
         }
         if self.actuator.is_some() {
@@ -393,8 +440,27 @@ impl Shipper {
     }
 }
 
-/// Build the shipping sink, if the caller asked for one.
-fn open_sink(args: &Args) -> Result<Option<IngestSink>, String> {
+/// The transport the endpoint's scheme asks for.
+///
+/// The scheme decides, and the transport decides whether a credential may be
+/// sent. Keeping that choice in one function is what stops an `https://` server
+/// being reached over cleartext because one call site constructed the wrong
+/// transport: the cleartext one refuses a TLS endpoint rather than downgrading
+/// it, and this is the only place that picks.
+fn transport_for(endpoint: &Endpoint) -> Result<Box<dyn Transport>, String> {
+    if !endpoint.uses_tls() {
+        return Ok(Box::new(CleartextTransport::new()));
+    }
+    TlsTransport::new()
+        .map(|t| Box::new(t) as Box<dyn Transport>)
+        .map_err(|e| e.to_string())
+}
+
+/// Build the shipping queue, if the caller asked for one.
+///
+/// The sink is constructed here and immediately moved onto the writer thread, so
+/// from this point on nothing in the run touches the network directly.
+fn open_egress(args: &Args) -> Result<Option<Egress>, String> {
     let Some(url) = &args.ship_url else {
         return Ok(None);
     };
@@ -409,13 +475,11 @@ fn open_sink(args: &Args) -> Result<Option<IngestSink>, String> {
         })?;
     let endpoint = Endpoint::parse(url).map_err(|e| e.to_string())?;
 
+    let transport = transport_for(&endpoint)?;
+
     println!("shipping to {url} as host {}", credential.host_id);
-    Ok(Some(IngestSink::new(
-        endpoint,
-        Box::new(CleartextTransport::new()),
-        &credential,
-        SHIP_BATCH,
-    )))
+    let sink = IngestSink::new(endpoint, transport, &credential, SHIP_BATCH);
+    Ok(Some(Egress::spawn(sink)))
 }
 
 /// Close a bounded run: release what was held, push the last batch, then report.
@@ -441,17 +505,21 @@ fn finish(
     );
     shipper.print_response_report();
 
-    if let Some(sink) = shipper.sink.as_ref() {
+    // Stop the writer and let it drain before reporting, so the numbers below
+    // are what actually left the host rather than what was queued when the loop
+    // ended.
+    if let Some(report) = shipper.shutdown_egress() {
         println!("  shipping (A19-minimised batch ingest)");
-        println!("    host id                {:>12}", sink.host_id());
-        println!("    events accepted        {:>12}", sink.shipped());
-        println!("    batches failed         {:>12}", sink.failed());
+        println!("    host id                {:>12}", report.host_id);
+        println!("    events accepted        {:>12}", report.shipped);
+        println!("    batches failed         {:>12}", report.failed);
+        println!("    batches dropped        {:>12}", report.dropped_batches);
+        println!("    events dropped         {:>12}", report.dropped_events);
         println!("    ship errors            {:>12}", shipper.ship_errors);
-        println!("    still pending          {:>12}", sink.pending());
-        if let Some(error) = sink.last_error() {
+        if let Some(error) = report.last_error {
             println!("    last error             {error}");
         }
-        if sink.shipped() == 0 && shipper.ship_errors > 0 {
+        if report.shipped == 0 && shipper.ship_errors > 0 {
             eprintln!("\nthe server rejected everything; is it running and is this host enrolled?");
             return Err("no events were accepted".to_string());
         }
@@ -463,6 +531,49 @@ fn finish(
 fn print_alert(count: u64, alert: &Alert) {
     println!("  ALERT [{count:>5}] {} | {}", alert.severity, alert.title);
     println!("          {}", alert.description);
+}
+
+/// Publish this process's liveness where a supervisor can see it.
+///
+/// Written to a temporary path and renamed into place, because a reader that
+/// catches a half-written record sees a truncated one, and a truncated record is
+/// indistinguishable from a restart. The rename is atomic on both platforms this
+/// is meant for.
+///
+/// A failure here is deliberately not fatal: a sensor that cannot publish its
+/// own liveness is still a sensor, and the supervisor will notice the silence
+/// the way it notices any other.
+fn publish_heartbeat(path: &std::path::Path, seq: u64) {
+    let at_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0);
+    let record = supervision::Heartbeat { seq, at_millis }.encode();
+
+    let temporary = path.with_extension("tmp");
+    if std::fs::write(&temporary, record).is_ok() {
+        let _ = std::fs::rename(&temporary, path);
+    }
+}
+
+/// Say what loaded, and which rules this sensor can never feed.
+///
+/// The second half is the one that matters. A rule whose fields this sensor
+/// never emits loads, looks healthy, and can never fire — the failure mode the
+/// SIGMA engine exists to make visible, and one an operator has no other way to
+/// see than watching a ruleset be quiet and guessing.
+fn report_sigma(rules: &sigma::RuleSet) {
+    println!("  sigma     {} rule(s) loaded", rules.len());
+    for problem in rules.problems() {
+        println!("            skipped: {problem}");
+    }
+    for rule in rules.rules_that_cannot_fire() {
+        println!(
+            "            cannot fire: {} (this sensor never emits {})",
+            rule.title,
+            rule.unmapped_fields.join(", ")
+        );
+    }
 }
 
 /// Say, before collection starts, which of the three response gates are open.
@@ -542,7 +653,8 @@ fn gate_report(
 
 #[cfg(windows)]
 fn run_etw(args: &Args, host: HostId) -> Result<(), String> {
-    use etw::{EtwSession, SessionConfig};
+    use etw::{EtwObservation, SessionConfig};
+    use observer::Observe;
 
     let session_config = SessionConfig {
         name: format!("chaos-{}", std::process::id()),
@@ -551,9 +663,9 @@ fn run_etw(args: &Args, host: HostId) -> Result<(), String> {
     };
 
     // The failure an operator actually hits, so it gets a real explanation
-    // rather than a bare OS code. `EtwSession::start` is the only place we still
-    // hold the typed error; by the time it is a `String` the code is gone.
-    let (mut session, reports) = match EtwSession::start(session_config) {
+    // rather than a bare OS code. `EtwObservation::start` is the only place we
+    // still hold the typed error; by the time it is a `String` the code is gone.
+    let (mut source, reports) = match EtwObservation::start(host.clone(), session_config) {
         Ok(started) => started,
         Err(e) => {
             eprintln!("  {e}");
@@ -588,6 +700,16 @@ fn run_etw(args: &Args, host: HostId) -> Result<(), String> {
         ..config.policy
     };
 
+    // SIGMA rules, if the operator pointed at a directory. Loaded here rather
+    // than inside the engine so the run can say what loaded, and — the part
+    // worth printing — which rules this sensor can never feed.
+    if let Some(dir) = &args.sigma_dir {
+        let rules = sigma::RuleSet::from_directory(dir)
+            .map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        report_sigma(&rules);
+        config.sigma = Some(rules);
+    }
+
     let actuator: Option<Box<dyn Actuator>> = if args.respond {
         Some(Box::new(respond::WindowsActuator::new(args.dry_run)))
     } else {
@@ -595,24 +717,26 @@ fn run_etw(args: &Args, host: HostId) -> Result<(), String> {
     };
     print_gates(args, actuator.as_deref());
 
-    // Without this, a stop ends the process in the kernel and no Rust code runs
-    // afterwards, which would leave every process this run suspended held by an
-    // agent that no longer exists. Installed only when this run can act: with no
-    // actuator there is nothing to release, and letting the default handler have
-    // the signal is the behaviour an operator already expects.
-    if args.respond && !respond::install_stop_handler() {
-        eprintln!("  warning: could not catch a stop signal; a hard stop would leave");
-        eprintln!("  anything this run suspends suspended. Consider --dry-run first.");
+    // A stop ends the process inside the kernel unless Windows is asked to
+    // report it instead, and nothing this run was doing gets a chance to finish.
+    // The handler only sets a flag the loop polls, so it is installed whether or
+    // not this run may act: without it, Ctrl-C skips the trace session's stop,
+    // the run report, and — when there is an actuator — the release of anything
+    // this run suspended, which would then stay suspended under an agent that no
+    // longer exists.
+    if !respond::install_stop_handler() {
+        eprintln!("  warning: could not catch a stop signal; Ctrl-C would end the process");
+        eprintln!("  without stopping the trace session, printing the report, or releasing");
+        eprintln!("  anything this run suspends. Consider --dry-run first.");
     }
 
     let mut shipper = Shipper::new(
         config,
-        open_sink(args)?,
+        open_egress(args)?,
         actuator,
         args.interval(),
         args.verbose,
     );
-    let mut translator = etw::Translator::new(host);
 
     let deadline = args
         .duration
@@ -623,9 +747,14 @@ fn run_etw(args: &Args, host: HostId) -> Result<(), String> {
     }
 
     let started = Instant::now();
-    let mut raw_batch: Vec<etw::EtwRaw> = Vec::new();
+    let mut batch: Vec<TelemetryEvent> = Vec::new();
     let mut latencies: Vec<u64> = Vec::with_capacity(LATENCY_SAMPLES);
     let mut events = 0u64;
+    // The liveness sequence, and when it was last published. `seq` only ever
+    // increases within a run, which is what lets a supervisor tell a restart from
+    // a stall.
+    let mut beat = 0u64;
+    let mut last_beat = Instant::now();
 
     loop {
         if let Some(deadline) = deadline {
@@ -640,24 +769,34 @@ fn run_etw(args: &Args, host: HostId) -> Result<(), String> {
             break;
         }
 
-        session.drain(&mut raw_batch, 4096, Duration::from_millis(250));
-        for raw in raw_batch.drain(..) {
-            if let Some(event) = translator.translate(&raw) {
-                let scored_ns = shipper.feed(event);
-                events += 1;
-                if latencies.len() < LATENCY_SAMPLES {
-                    latencies.push(scored_ns);
-                }
+        batch.clear();
+        if let Err(e) = source.next_batch(&mut batch, 4096, Duration::from_millis(250)) {
+            eprintln!("\nsource failed: {e}");
+            break;
+        }
+        for event in batch.drain(..) {
+            let scored_ns = shipper.feed(event);
+            events += 1;
+            if latencies.len() < LATENCY_SAMPLES {
+                latencies.push(scored_ns);
             }
         }
 
         shipper.tick();
         shipper.report_live(events, started);
+
+        if let Some(path) = &args.heartbeat
+            && last_beat.elapsed() >= args.interval()
+        {
+            last_beat = Instant::now();
+            beat += 1;
+            publish_heartbeat(path, beat);
+        }
     }
 
-    let stats = session.stats();
-    session.shutdown().map_err(|e| e.to_string())?;
-    let (events_lost, buffers_lost) = session.kernel_lost();
+    let stats = source.stats();
+    source.shutdown().map_err(|e| e.to_string())?;
+    let (events_lost, buffers_lost) = source.kernel_lost();
 
     // Sensor first, then what the pipeline made of it, then what left the host.
     // A gap anywhere in that chain should read in the order it happened.
@@ -671,14 +810,14 @@ fn run_etw(args: &Args, host: HostId) -> Result<(), String> {
         u64::from(events_lost) + u64::from(buffers_lost)
     );
     println!("  coverage               {:>12.6}", stats.coverage());
-    println!("  scored                 {:>12}", translator.mapped());
-    println!("  undecodable            {:>12}", translator.undecodable());
+    println!("  scored                 {:>12}", source.mapped());
+    println!("  undecodable            {:>12}", source.undecodable());
 
-    if translator.undecodable() > 0 {
+    if source.undecodable() > 0 {
         println!("\n  Events arrived in a shape this sensor scores but could not be decoded.");
         println!("  That means a property name in etw::translate is wrong for this build of");
         println!("  Windows, not that the machine was quiet:");
-        for failure in translator.failures() {
+        for failure in source.failures() {
             println!("    {failure}");
         }
     }
@@ -815,6 +954,12 @@ struct Args {
     interval_secs: u64,
     enroll_url: Option<String>,
     ship_url: Option<String>,
+    /// Where SIGMA rules live, when this run uses them. `None` runs on the
+    /// native rules only.
+    sigma_dir: Option<PathBuf>,
+    /// Where to publish this process's liveness for a supervisor to read.
+    /// `None` means nothing is watching, which is the default.
+    heartbeat: Option<PathBuf>,
     enrollment_token: String,
     token_file: PathBuf,
     /// The lowest severity that earns its own row. Everything below it is
@@ -881,6 +1026,8 @@ impl Args {
             interval_secs: 2,
             enroll_url: None,
             ship_url: None,
+            sigma_dir: None,
+            heartbeat: None,
             enrollment_token: std::env::var("CHAOS_ENROLLMENT_TOKEN").unwrap_or_default(),
             token_file: credential::default_path(),
             min_row_severity: model::Severity::Medium,
@@ -924,6 +1071,16 @@ impl Args {
                 }
                 "--enroll" => args.enroll_url = Some(it.next().unwrap_or_default()),
                 "--ship" => args.ship_url = Some(it.next().unwrap_or_default()),
+                "--sigma" => {
+                    if let Some(path) = it.next() {
+                        args.sigma_dir = Some(PathBuf::from(path));
+                    }
+                }
+                "--heartbeat" => {
+                    if let Some(path) = it.next() {
+                        args.heartbeat = Some(PathBuf::from(path));
+                    }
+                }
                 "--enrollment-token" => {
                     args.enrollment_token = it.next().unwrap_or_default();
                 }
@@ -978,7 +1135,12 @@ impl Args {
                             "--min-severity SEV    lowest severity that earns a row, default\n",
                             "                      medium; below it firings are counted and held\n",
                             "                      until the evidence justifies them\n",
-                            "--ship URL            ship telemetry and alerts to the server\n",
+                            "--ship URL            ship telemetry and alerts to the server;\n",
+                            "                      https:// uses the platform's TLS, http:// is\n",
+                            "                      loopback only",
+                            "--sigma DIR           load SIGMA rules from DIR; a rule this sensor\n",
+                            "                      cannot feed is reported at startup\n",
+                            "--heartbeat PATH      publish a liveness record for a supervisor\n",
                             "--enroll URL          enroll and store this host's credential\n",
                             "--enrollment-token T  bootstrap secret (env: CHAOS_ENROLLMENT_TOKEN)\n",
                             "--token-file PATH     credential location\n",

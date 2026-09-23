@@ -12,6 +12,10 @@
 //!   diagnostics/↔ Operator-facing checks. Never on the hot path.
 //! ```
 //!
+//! [`observe`] is the sixth module and not a layer: it joins a session and a
+//! translator into one [`observer::Observe`] source, which is what a runtime
+//! drives. It sits on top of the five rather than between any of them.
+//!
 //! # Reading order
 //!
 //! 1. [`boundary::callback::on_event`] — the hot path.
@@ -35,6 +39,7 @@ pub mod decode;
 pub mod diagnostics;
 pub mod enrich;
 pub mod error;
+pub mod observe;
 pub mod provider;
 pub mod util;
 pub mod wire;
@@ -75,6 +80,8 @@ pub use error::{EtwError, hint, remedy};
 pub use provider::{
     DNS_CLIENT, KERNEL_FILE, KERNEL_NETWORK, KERNEL_PROCESS, KERNEL_REGISTRY, default_providers,
 };
+
+pub use observe::EtwObservation;
 
 pub use util::format_guid;
 

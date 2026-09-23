@@ -11,3 +11,8 @@ version.workspace = true
 [dependencies]
 model.workspace = true
 ports.workspace = true
+
+[dev-dependencies]
+# The runtime's tests build synthetic wire events, and a wire event carries a
+# timestamp. Nothing in the library reads a clock, so this is test-only.
+chrono.workspace = true
