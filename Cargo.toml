@@ -42,16 +42,9 @@ sigma = { path = "crates/sigma" }
 supervision = { path = "crates/supervision" }
 transport = { path = "crates/transport" }
 
-# TLS is the platform's own: SChannel on Windows, Security.framework on macOS,
-# OpenSSL on Linux. The agent runs on every endpoint in the estate, and a
-# security product that bundles its own TLS stack has bundled itself a second
-# thing to patch on all of them. It also means the trust store is the machine's
-# rather than a copy that has to be refreshed.
 native-tls = "0.2.14"
 
 crossbeam-channel = "0.5.17"
-# Wire-body compression. Pure Rust (miniz_oxide), no C toolchain, and the same
-# crate on both sides of the protocol so the framing cannot drift.
 flate2 = "1"
 goblin = { version = "0.10.7", default-features = false, features = [
     "std",
@@ -65,7 +58,13 @@ mimalloc = "0.1.52"
 windows = "0.62.2"
 
 axum = "0.8.9"
+leptos = { version = "0.8.21" }
+leptos_axum = "0.8.10"
+leptos_meta = "0.8.7"
+leptos_router = { version = "0.8.16" }
+console_error_panic_hook = "0.1.7"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+wasm_bindgen = { version = "0.2.129", package = "wasm-bindgen" }
 
 indexmap = { version = "2.14.2", features = ["serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }

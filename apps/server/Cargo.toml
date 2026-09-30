@@ -1,6 +1,5 @@
 [package]
 name = "server"
-description = "Chaos ingest server: enrollment, batched ingest, and a zero-JavaScript console."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,20 +7,55 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [[bin]]
-name = "cserver"
+name = "server"
 path = "src/main.rs"
 
 [dependencies]
-model.workspace = true
-protocol.workspace = true
+axum = { workspace = true, optional = true }
+leptos.workspace = true
+leptos_axum = { workspace = true, optional = true }
+leptos_config = { version = "0.8.10", optional = true }
+leptos_meta.workspace = true
+leptos_router.workspace = true
+console_error_panic_hook = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+wasm_bindgen = { workspace = true, optional = true }
 
-axum.workspace = true
-tokio.workspace = true
+[features]
+hydrate = [
+    "leptos/hydrate",
+    "dep:console_error_panic_hook",
+    "dep:wasm_bindgen",
+]
+ssr = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:leptos_axum",
+    "dep:leptos_config",
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+]
 
-chrono.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-sha2 = "0.10"
-getrandom = "0.2"
+[package.metadata.leptos]
+output-name = "server"
+bin-name = "server"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+style-file = "style/style.css"
+assets-dir = "public"
+site-addr = "127.0.0.1:3000"
+reload-port = 3001
+end2end-cmd = "npx playwright test"
+end2end-dir = "end2end"
+browserquery = "defaults"
+env = "DEV"
+bin-features = ["ssr"]
+bin-default-features = false
+lib-features = ["hydrate"]
+lib-default-features = false
+lib-profile-release = "wasm-release"
